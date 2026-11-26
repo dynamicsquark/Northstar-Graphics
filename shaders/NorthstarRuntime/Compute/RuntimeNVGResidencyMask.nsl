@@ -1,0 +1,86 @@
+// =====================================================================
+//  RuntimeNVGResidencyMask.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — Crack-Free Group Active-Chain Mask
+//
+//  For every ClusterGroup g in [0 .. groupCount - 1], computes:
+//    OutGroupActiveMask[g] = 1 iff g's virtual page AND every ancestor group's
+//    virtual page up to the pinned root group are currently resident.
+//  Guarantees mathematically watertight, crack-free LOD cuts & ancestor fallback.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGResidencyMaskParams {
+    Buffer Config {
+        Add(groupCount)       : UInt = 0
+        Add(virtualPageCount) : UInt = 0
+    }
+    StructuredBuffer InClusterGroups {
+        Add(meshId)             : UInt
+        Add(lodLevel)           : UInt
+        Add(clusterStart)       : UInt
+        Add(clusterCount)       : UInt
+        Add(parentGroupIndex)   : UInt
+        Add(childGroupStart)    : UInt
+        Add(childGroupCount)    : UInt
+        Add(firstVirtualPageId) : UInt
+        Add(groupSphere)        : Vec4
+    }
+    StructuredBuffer InVirtualPageTable {
+        Add(stateAndFlags)     : UInt
+        Add(physicalPageIndex) : UInt
+        Add(pageGeneration)    : UInt
+        Add(meshIdAndLod)      : UInt
+    }
+    RWStructuredBuffer OutGroupActiveMask {
+        Add(active) : UInt
+    }
+}
+
+SHADER {
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt totalGroups = NVGResidencyMaskParams.Config.groupCount;
+        UInt totalVPages = NVGResidencyMaskParams.Config.virtualPageCount;
+        UInt invalidIdx  = ~0u;
+
+        for (UInt g = dtid.x; g < totalGroups; g = g + 4194240u) {
+            UInt cur     = g;
+            UInt chainOk = 1u;
+
+            // Walk up strict residency tree (depth bounded by kNVGMaxLODLevels = 16)
+            for (UInt step = 0u; step < 16u; step = step + 1u) {
+                if (cur == invalidIdx || cur >= totalGroups) {
+                    break;
+                }
+                UInt vp      = NVGResidencyMaskParams.InClusterGroups[cur].firstVirtualPageId;
+                UInt lodMeta = NVGResidencyMaskParams.InClusterGroups[cur].lodLevel;
+                UInt pageCnt = Max((lodMeta >> 16u) & 65535u, 1u);
+                if (vp == invalidIdx || vp >= totalVPages || pageCnt > (totalVPages - vp)) {
+                    chainOk = 0u;
+                    break;
+                }
+                for (UInt p = 0u; p < pageCnt; p = p + 1u) {
+                    UInt curVP   = vp + p;
+                    UInt vpFlags = NVGResidencyMaskParams.InVirtualPageTable[curVP].stateAndFlags;
+                    UInt physIdx = NVGResidencyMaskParams.InVirtualPageTable[curVP].physicalPageIndex;
+                    // Must be VALID (bit 2) and RESIDENT (bit 0) with valid physical slot
+                    if ((vpFlags & 5u) != 5u || physIdx == invalidIdx) {
+                        chainOk = 0u;
+                        break;
+                    }
+                }
+                if (chainOk == 0u) {
+                    break;
+                }
+                UInt parentG = NVGResidencyMaskParams.InClusterGroups[cur].parentGroupIndex;
+                if (parentG == cur) {
+                    break;
+                }
+                cur = parentG;
+            }
+
+            NVGResidencyMaskParams.OutGroupActiveMask[g].active = chainOk;
+        }
+    }
+}

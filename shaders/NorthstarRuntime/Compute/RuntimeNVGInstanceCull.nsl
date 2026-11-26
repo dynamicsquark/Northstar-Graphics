@@ -1,0 +1,488 @@
+// =====================================================================
+//  RuntimeNVGInstanceCull.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — GPU Object Culling & Dispatch Prep
+//
+//  Dispatch Modes:
+//    Mode 0 (RESET_FRAME):
+//      Clears OutQueueCounters, OutBucketCounts, OutTelemetry,
+//      OutDecodedCounters, and optionally zeroes OutPageRequests.
+//    Mode 1 (CULL_OBJECTS_PHASE1):
+//      Scans InGPUSceneObjects[0 .. sceneSlotCount - 1], selects active
+//      GPU_SCENE_OBJ_VIRTUAL_GEOMETRY objects matching camera culling mask &
+//      pass eligibility, performs frustum culling + optional Phase-1 HZB
+//      occlusion culling (saving occluded objects to OutOccludedObjects),
+//      and enqueues surviving (objectSlot, rootNodeIndex) items into OutNodeQueue.
+//    Mode 2 (PREPARE_DISPATCH_ARGS):
+//      Computes DispatchIndirect threadgroup counts ceil(count / 64) from
+//      OutQueueCounters[srcCounterIndex] into OutDispatchArgs[dstArgsOffset].
+//    Mode 3 (PHASE2_OBJECT_RETEST):
+//      Re-tests OutOccludedObjects against fresh current-frame HZB using
+//      current viewProj and enqueues newly disoccluded objects into OutNodeQueue.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGInstanceCullParams {
+    Buffer Config {
+        Add(dispatchMode)            : UInt  = 0
+        Add(sceneSlotCount)          : UInt  = 0
+        Add(meshTableCount)          : UInt  = 0
+        Add(materialTableCount)      : UInt  = 0
+        Add(virtualPageCount)        : UInt  = 0
+        Add(bucketCount)             : UInt  = 256
+        Add(maxNodeQueueCapacity)    : UInt  = 131072
+        Add(maxOccludedObjCapacity)  : UInt  = 65536
+        Add(cameraCullingMask)       : UInt  = 0xFFFFFFFF
+        Add(passKind)                : UInt  = 0 // 0=MainOpaque+Trans, 1=DepthPrepassOnly, 2=OpaqueOnly
+        Add(enableHZBOcclusion)      : UInt  = 1
+        Add(enableTwoPhase)          : UInt  = 1
+        Add(hasPrevHZB)              : UInt  = 0
+        Add(isReversedZ)             : UInt  = 0
+        Add(hzbWidth)                : UInt  = 1
+        Add(hzbHeight)               : UInt  = 1
+        Add(hzbMipCount)             : UInt  = 1
+        Add(clearPageRequests)       : UInt  = 1
+        Add(srcCounterIndex)         : UInt  = 0
+        Add(dstArgsWordOffset)       : UInt  = 0
+        Add(groupSizeDivisor)        : UInt  = 64
+        Add(maxDispatchGroups)       : UInt  = 65535
+        Add(resetNodeCounterIdx)     : UInt  = 0
+        Add(resetFlags)              : UInt  = 0
+        Add(frustumPlane0)           : Vec4
+        Add(frustumPlane1)           : Vec4
+        Add(frustumPlane2)           : Vec4
+        Add(frustumPlane3)           : Vec4
+        Add(frustumPlane4)           : Vec4
+        Add(frustumPlane5)           : Vec4
+        Add(prevViewProj)            : Mat4
+        Add(currViewProj)            : Mat4
+    }
+    Texture2D InTextures {
+        Add(HZBTexture)
+    }
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : Int
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldMatrix)         : Mat4
+    }
+    StructuredBuffer InMeshTable {
+        Add(meshId)           : UInt
+        Add(flags)            : UInt
+        Add(rootNodeIndex)    : UInt
+        Add(nodeCount)        : UInt
+        Add(clusterBaseIndex) : UInt
+        Add(clusterCount)     : UInt
+        Add(groupBaseIndex)   : UInt
+        Add(groupCount)       : UInt
+        Add(localBoundsMin)   : Vec3
+        Add(virtualPageBase)  : UInt
+        Add(localBoundsMax)   : Vec3
+        Add(virtualPageCount) : UInt
+    }
+    StructuredBuffer InMaterialTable {
+        Add(materialId)               : UInt
+        Add(nvgFlags)                 : UInt
+        Add(opaqueBucketIndex)        : UInt
+        Add(depthBucketIndex)         : UInt
+        Add(transparentBucketIndex)   : UInt
+        Add(shadowBucketIndex)        : UInt
+        Add(opaqueInstBucketIndex)    : UInt
+        Add(shadowInstBucketIndex)    : UInt
+        Add(maxWorldDisplacement)     : Float
+        Add(lodErrorScale)            : Float
+        Add(shadowLodErrorScale)      : Float
+        Add(compatStatus)             : UInt
+        Add(depthInstBucketIndex)     : UInt
+        Add(transInstBucketIndex)     : UInt
+        Add(skinnedOpaqueBucketIndex) : UInt
+        Add(skinnedShadowBucketIndex) : UInt
+    }
+    RWStructuredBuffer OutNodeQueue {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutOccludedObjects {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutQueueCounters {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutBucketCounts {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutDispatchArgs {
+        Add(arg) : UInt
+    }
+    RWStructuredBuffer OutPageRequests {
+        Add(priority) : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+    Bool TestAABBFrustum(Vec3 bMin, Vec3 bMax) {
+        Vec4 planes[6];
+        planes[0] = NVGInstanceCullParams.Config.frustumPlane0;
+        planes[1] = NVGInstanceCullParams.Config.frustumPlane1;
+        planes[2] = NVGInstanceCullParams.Config.frustumPlane2;
+        planes[3] = NVGInstanceCullParams.Config.frustumPlane3;
+        planes[4] = NVGInstanceCullParams.Config.frustumPlane4;
+        planes[5] = NVGInstanceCullParams.Config.frustumPlane5;
+
+        for (UInt i = 0u; i < 6u; i = i + 1u) {
+            Vec3 n = planes[i].xyz;
+            Vec3 pVertex = Vec3(
+                (n.x >= 0.0) ? bMax.x : bMin.x,
+                (n.y >= 0.0) ? bMax.y : bMin.y,
+                (n.z >= 0.0) ? bMax.z : bMin.z);
+            if (Dot(n, pVertex) + planes[i].w < 0.0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    Bool TestAABBIsOccludedByHZB(Vec3 bMin, Vec3 bMax, Mat4 vpMatrix) {
+        Float minX = 1.0;
+        Float minY = 1.0;
+        Float maxX = 0.0;
+        Float maxY = 0.0;
+        UInt isRevZ = NVGInstanceCullParams.Config.isReversedZ;
+        Float closestZ = (isRevZ != 0u) ? 0.0 : 1.0;
+
+        for (UInt ci = 0u; ci < 8u; ci = ci + 1u) {
+            Vec3 corner = Vec3(
+                ((ci & 1u) != 0u) ? bMax.x : bMin.x,
+                ((ci & 2u) != 0u) ? bMax.y : bMin.y,
+                ((ci & 4u) != 0u) ? bMax.z : bMin.z);
+            Vec4 clip = Mul(vpMatrix, Vec4(corner, 1.0));
+            // Any corner behind near plane -> conservatively visible (never HZB-cull)
+            if (clip.w <= 0.0001) {
+                return false;
+            }
+            Float invW = 1.0 / clip.w;
+            Float ndcX = clip.x * invW;
+            Float ndcY = clip.y * invW;
+            Float ndcZ = clip.z * invW;
+            Float uvX  = ndcX * 0.5 + 0.5;
+            Float uvY  = 0.5 - ndcY * 0.5;
+
+            minX = Min(minX, uvX);
+            minY = Min(minY, uvY);
+            maxX = Max(maxX, uvX);
+            maxY = Max(maxY, uvY);
+            if (isRevZ != 0u) {
+                closestZ = Max(closestZ, ndcZ);
+            } else {
+                closestZ = Min(closestZ, ndcZ);
+            }
+        }
+
+        minX = Clamp(minX, 0.0, 1.0);
+        minY = Clamp(minY, 0.0, 1.0);
+        maxX = Clamp(maxX, 0.0, 1.0);
+        maxY = Clamp(maxY, 0.0, 1.0);
+        if (maxX <= minX || maxY <= minY) {
+            return false;
+        }
+
+        Int baseW = Int(Max(NVGInstanceCullParams.Config.hzbWidth, 1u));
+        Int baseH = Int(Max(NVGInstanceCullParams.Config.hzbHeight, 1u));
+        Int ix0   = Clamp(Int(Floor(minX * Float(baseW))), 0, baseW - 1);
+        Int iy0   = Clamp(Int(Floor(minY * Float(baseH))), 0, baseH - 1);
+        Int ix1   = Clamp(Int(Floor(maxX * Float(baseW))), 0, baseW - 1);
+        Int iy1   = Clamp(Int(Floor(maxY * Float(baseH))), 0, baseH - 1);
+
+        Float spanPx = Float(Max(ix1 - ix0, iy1 - iy0));
+        Float mipF   = (spanPx > 1.0) ? Ceil(Log2(spanPx)) : 0.0;
+        UInt  maxMip = (NVGInstanceCullParams.Config.hzbMipCount > 0u) ? (NVGInstanceCullParams.Config.hzbMipCount - 1u) : 0u;
+        UInt  mip    = Min(UInt(Max(mipF, 0.0)), maxMip);
+
+        for (UInt step = 0u; step < 16u; step = step + 1u) {
+            if (mip >= maxMip) {
+                break;
+            }
+            Int tx0 = ix0 >> Int(mip);
+            Int tx1 = ix1 >> Int(mip);
+            Int ty0 = iy0 >> Int(mip);
+            Int ty1 = iy1 >> Int(mip);
+            if ((tx1 - tx0) <= 1 && (ty1 - ty0) <= 1) {
+                break;
+            }
+            mip = mip + 1u;
+        }
+
+        Int mipMaxX = Int(Max(NVGInstanceCullParams.Config.hzbWidth >> mip, 1u)) - 1;
+        Int mipMaxY = Int(Max(NVGInstanceCullParams.Config.hzbHeight >> mip, 1u)) - 1;
+        Int x0 = Clamp(ix0 >> Int(mip), 0, mipMaxX);
+        Int y0 = Clamp(iy0 >> Int(mip), 0, mipMaxY);
+        Int x1 = Clamp(ix1 >> Int(mip), 0, mipMaxX);
+        Int y1 = Clamp(iy1 >> Int(mip), 0, mipMaxY);
+
+        if (isRevZ != 0u) {
+            Float farOccZ = 1.0;
+            for (Int sy = y0; sy <= y1; sy = sy + 1) {
+                for (Int sx = x0; sx <= x1; sx = sx + 1) {
+                    Float d = NVGInstanceCullParams.InTextures.HZBTexture.Load(Int3(sx, sy, Int(mip))).x;
+                    farOccZ = Min(farOccZ, d);
+                }
+            }
+            return (closestZ + 0.00001) < farOccZ;
+        } else {
+            Float farOccZ = 0.0;
+            for (Int sy = y0; sy <= y1; sy = sy + 1) {
+                for (Int sx = x0; sx <= x1; sx = sx + 1) {
+                    Float d = NVGInstanceCullParams.InTextures.HZBTexture.Load(Int3(sx, sy, Int(mip))).x;
+                    farOccZ = Max(farOccZ, d);
+                }
+            }
+            return (closestZ - 0.00001) > farOccZ;
+        }
+    }
+
+    UInt ResolveObjectBucket(UInt matId, UInt objFlags, UInt passKind) {
+        UInt invalidIdx = ~0u;
+        UInt matFlags   = NVGInstanceCullParams.InMaterialTable[matId].nvgFlags;
+        if ((matFlags & 1u) == 0u) {
+            return invalidIdx;
+        }
+        Bool isTrans   = ((matFlags & 32u) != 0u);
+        Bool isSkinned = ((objFlags & 1024u) != 0u);
+
+        if (passKind == 1u) {
+            // Depth prepass: opaque & alpha-test only (skip transparent)
+            if (isTrans || (matFlags & 512u) == 0u) {
+                return invalidIdx;
+            }
+            if (isSkinned) {
+                UInt sb = NVGInstanceCullParams.InMaterialTable[matId].skinnedOpaqueBucketIndex;
+                // Depth bucket preferred when valid
+                UInt db = NVGInstanceCullParams.InMaterialTable[matId].depthBucketIndex;
+                return (db != invalidIdx) ? db : sb;
+            }
+            return NVGInstanceCullParams.InMaterialTable[matId].depthBucketIndex;
+        }
+        if (passKind == 2u) {
+            // Opaque-only pass
+            if (isTrans) {
+                return invalidIdx;
+            }
+            if (isSkinned) {
+                UInt sb = NVGInstanceCullParams.InMaterialTable[matId].skinnedOpaqueBucketIndex;
+                return (sb != invalidIdx) ? sb : NVGInstanceCullParams.InMaterialTable[matId].opaqueBucketIndex;
+            }
+            return NVGInstanceCullParams.InMaterialTable[matId].opaqueBucketIndex;
+        }
+        // Main pass: both opaque and transparent buckets routed independently
+        if (isTrans) {
+            return NVGInstanceCullParams.InMaterialTable[matId].transparentBucketIndex;
+        }
+        if (isSkinned) {
+            UInt sb = NVGInstanceCullParams.InMaterialTable[matId].skinnedOpaqueBucketIndex;
+            return (sb != invalidIdx) ? sb : NVGInstanceCullParams.InMaterialTable[matId].opaqueBucketIndex;
+        }
+        return NVGInstanceCullParams.InMaterialTable[matId].opaqueBucketIndex;
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt tid  = dtid.x;
+        UInt mode = NVGInstanceCullParams.Config.dispatchMode;
+        UInt invalidIdx = ~0u;
+        UInt prev = 0u;
+
+        // MODE 0: Reset counters, buckets, telemetry, and optionally page requests
+        //   resetFlags == 0: Full Phase-1 frame reset (counters 0..15, buckets, telemetry, page requests)
+        //   resetFlags == 1: Fast single-dispatch Phase-2 reset (counters 0..3, buckets, + OutDispatchArgs[0..2] for counter 6)
+        if (mode == 0u) {
+            UInt rFlags = NVGInstanceCullParams.Config.resetFlags;
+            if ((rFlags == 0u && tid < 16u) || (rFlags != 0u && tid < 4u)) {
+                NVGInstanceCullParams.OutQueueCounters[tid].count = 0u;
+            }
+            if (tid < NVGInstanceCullParams.Config.bucketCount) {
+                NVGInstanceCullParams.OutBucketCounts[tid].count = 0u;
+            }
+            if (rFlags != 0u && tid == 0u) {
+                UInt occCnt  = NVGInstanceCullParams.OutQueueCounters[6u].count;
+                UInt groupsX = (occCnt + 63u) / 64u;
+                if (groupsX > 65535u) { groupsX = 65535u; }
+                NVGInstanceCullParams.OutDispatchArgs[0u].arg = groupsX;
+                NVGInstanceCullParams.OutDispatchArgs[1u].arg = 1u;
+                NVGInstanceCullParams.OutDispatchArgs[2u].arg = 1u;
+            }
+            if (tid < 40u && rFlags == 0u) {
+                NVGInstanceCullParams.OutTelemetry[tid].word = 0u;
+            }
+            if (NVGInstanceCullParams.Config.clearPageRequests != 0u) {
+                UInt vpCnt = NVGInstanceCullParams.Config.virtualPageCount;
+                for (UInt vpIdx = dtid.x; vpIdx < vpCnt; vpIdx = vpIdx + 4194240u) {
+                    NVGInstanceCullParams.OutPageRequests[vpIdx].priority = 0u;
+                }
+            }
+            return;
+        }
+
+        // MODE 2: Prepare DispatchIndirect args (ceil(count / divisor), 1, 1)
+        if (mode == 2u) {
+            if (tid == 0u) {
+                UInt srcIdx   = NVGInstanceCullParams.Config.srcCounterIndex;
+                UInt dstOff   = NVGInstanceCullParams.Config.dstArgsWordOffset;
+                UInt divVal   = Max(NVGInstanceCullParams.Config.groupSizeDivisor, 1u);
+                UInt maxGrps  = Max(NVGInstanceCullParams.Config.maxDispatchGroups, 1u);
+                UInt itemCnt  = NVGInstanceCullParams.OutQueueCounters[srcIdx].count;
+                UInt groupsX  = (itemCnt + divVal - 1u) / divVal;
+                if (groupsX > maxGrps) { groupsX = maxGrps; }
+                NVGInstanceCullParams.OutDispatchArgs[dstOff + 0u].arg = groupsX;
+                NVGInstanceCullParams.OutDispatchArgs[dstOff + 1u].arg = 1u;
+                NVGInstanceCullParams.OutDispatchArgs[dstOff + 2u].arg = 1u;
+
+                // Optionally clear target queue counter for next ping-pong traversal step
+                UInt rstIdx = NVGInstanceCullParams.Config.resetNodeCounterIdx;
+                if (rstIdx != invalidIdx && rstIdx < 16u) {
+                    NVGInstanceCullParams.OutQueueCounters[rstIdx].count = 0u;
+                }
+            }
+            return;
+        }
+
+        // MODE 1: Phase-1 GPU Scene Virtual Object Culling (Grid-Stride Unlimited)
+        if (mode == 1u) {
+            if (NVGInstanceCullParams.Config.cameraCullingMask == 0u) {
+                return;
+            }
+            UInt slotCount = NVGInstanceCullParams.Config.sceneSlotCount;
+            for (UInt curSlot = dtid.x; curSlot < slotCount; curSlot = curSlot + 4194240u) {
+                UInt recSlot = NVGInstanceCullParams.InGPUSceneObjects[curSlot].slotIndex;
+                UInt gen     = NVGInstanceCullParams.InGPUSceneObjects[curSlot].generation;
+                UInt flags   = NVGInstanceCullParams.InGPUSceneObjects[curSlot].objectFlags;
+                // Require OCCUPIED (1), VISIBLE (2), VIRTUAL_GEOMETRY (1<<20 = 1048576)
+                if (recSlot != curSlot || gen == 0u || (flags & 1048579u) != 1048579u) {
+                    continue;
+                }
+
+                UInt meshId = NVGInstanceCullParams.InGPUSceneObjects[curSlot].meshId;
+                UInt matId  = NVGInstanceCullParams.InGPUSceneObjects[curSlot].materialId;
+                if (meshId == 0u || meshId >= NVGInstanceCullParams.Config.meshTableCount ||
+                    matId == 0u  || matId  >= NVGInstanceCullParams.Config.materialTableCount) {
+                    continue;
+                }
+                if ((NVGInstanceCullParams.InMeshTable[meshId].flags & 1u) == 0u) {
+                    continue;
+                }
+
+                UInt bucketIdx = ResolveObjectBucket(matId, flags, NVGInstanceCullParams.Config.passKind);
+                if (bucketIdx == invalidIdx) {
+                    continue;
+                }
+
+                InterlockedAdd(NVGInstanceCullParams.OutTelemetry[0u].word, 1u, prev); // objectsEvaluated
+
+                Float disp = Max(NVGInstanceCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                Vec3 bMin  = NVGInstanceCullParams.InGPUSceneObjects[curSlot].aabbMin - Vec3(disp, disp, disp);
+                Vec3 bMax  = NVGInstanceCullParams.InGPUSceneObjects[curSlot].aabbMax + Vec3(disp, disp, disp);
+
+                // Frustum culling (respect GPU_SCENE_OBJ_FRUSTUM_CULL = 1 << 5 = 32)
+                if ((flags & 32u) != 0u) {
+                    if (!TestAABBFrustum(bMin, bMax)) {
+                        InterlockedAdd(NVGInstanceCullParams.OutTelemetry[1u].word, 1u, prev); // objectsFrustumCulled
+                        continue;
+                    }
+                }
+
+                UInt rootNode = NVGInstanceCullParams.InMeshTable[meshId].rootNodeIndex;
+                UInt auxFlags = ((NVGInstanceCullParams.InMaterialTable[matId].nvgFlags & 32u) != 0u) ? 8u : 0u;
+                if ((flags & 1024u) != 0u) { auxFlags = auxFlags | 16u; }
+
+                // Phase-1 HZB Occlusion Culling using previous-frame HZB & prevViewProj
+                if (NVGInstanceCullParams.Config.enableHZBOcclusion != 0u &&
+                    NVGInstanceCullParams.Config.hasPrevHZB != 0u &&
+                    (auxFlags & 8u) == 0u) {
+                    if (TestAABBIsOccludedByHZB(bMin, bMax, NVGInstanceCullParams.Config.prevViewProj)) {
+                        if (NVGInstanceCullParams.Config.enableTwoPhase != 0u) {
+                            UInt occIdx = 0u;
+                            InterlockedAdd(NVGInstanceCullParams.OutQueueCounters[6u].count, 1u, occIdx);
+                            if (occIdx < NVGInstanceCullParams.Config.maxOccludedObjCapacity) {
+                                InterlockedAdd(NVGInstanceCullParams.OutTelemetry[2u].word, 1u, prev); // objectsHZBCulled
+                                NVGInstanceCullParams.OutOccludedObjects[occIdx].objectSlotIndex = curSlot;
+                                NVGInstanceCullParams.OutOccludedObjects[occIdx].nodeOrClusterId = rootNode;
+                                NVGInstanceCullParams.OutOccludedObjects[occIdx].drawBucketHint  = bucketIdx;
+                                NVGInstanceCullParams.OutOccludedObjects[occIdx].auxData         = auxFlags;
+                                continue;
+                            }
+                            // Queue full: conservatively fall through to Phase-1 traversal (zero disocclusion holes!)
+                        } else {
+                            InterlockedAdd(NVGInstanceCullParams.OutTelemetry[2u].word, 1u, prev); // objectsHZBCulled
+                            continue;
+                        }
+                    }
+                }
+
+                UInt dstIdx = 0u;
+                InterlockedAdd(NVGInstanceCullParams.OutQueueCounters[0u].count, 1u, dstIdx);
+                if (dstIdx < NVGInstanceCullParams.Config.maxNodeQueueCapacity) {
+                    NVGInstanceCullParams.OutNodeQueue[dstIdx].objectSlotIndex = curSlot;
+                    NVGInstanceCullParams.OutNodeQueue[dstIdx].nodeOrClusterId = rootNode;
+                    NVGInstanceCullParams.OutNodeQueue[dstIdx].drawBucketHint  = bucketIdx;
+                    NVGInstanceCullParams.OutNodeQueue[dstIdx].auxData         = auxFlags;
+                } else {
+                    InterlockedAdd(NVGInstanceCullParams.OutTelemetry[15u].word, 1u, prev);
+                }
+            }
+            return;
+        }
+
+        // MODE 3: Phase-2 Disoccluded Object Recovery (Grid-Stride Unlimited)
+        if (mode == 3u) {
+            UInt occCount = Min(NVGInstanceCullParams.OutQueueCounters[6u].count,
+                                NVGInstanceCullParams.Config.maxOccludedObjCapacity);
+            for (UInt curIdx = dtid.x; curIdx < occCount; curIdx = curIdx + 4194240u) {
+                UInt objSlot   = NVGInstanceCullParams.OutOccludedObjects[curIdx].objectSlotIndex;
+                UInt rootNode  = NVGInstanceCullParams.OutOccludedObjects[curIdx].nodeOrClusterId;
+                UInt bucketIdx = NVGInstanceCullParams.OutOccludedObjects[curIdx].drawBucketHint;
+                UInt auxFlags  = NVGInstanceCullParams.OutOccludedObjects[curIdx].auxData;
+
+                UInt matId = NVGInstanceCullParams.InGPUSceneObjects[objSlot].materialId;
+                Float disp = (matId < NVGInstanceCullParams.Config.materialTableCount)
+                    ? Max(NVGInstanceCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0)
+                    : 0.0;
+                Vec3 bMin  = NVGInstanceCullParams.InGPUSceneObjects[objSlot].aabbMin - Vec3(disp, disp, disp);
+                Vec3 bMax  = NVGInstanceCullParams.InGPUSceneObjects[objSlot].aabbMax + Vec3(disp, disp, disp);
+
+                if (!TestAABBIsOccludedByHZB(bMin, bMax, NVGInstanceCullParams.Config.currViewProj)) {
+                    UInt dstIdx = 0u;
+                    InterlockedAdd(NVGInstanceCullParams.OutQueueCounters[0u].count, 1u, dstIdx);
+                    if (dstIdx < NVGInstanceCullParams.Config.maxNodeQueueCapacity) {
+                        NVGInstanceCullParams.OutNodeQueue[dstIdx].objectSlotIndex = objSlot;
+                        NVGInstanceCullParams.OutNodeQueue[dstIdx].nodeOrClusterId = rootNode;
+                        NVGInstanceCullParams.OutNodeQueue[dstIdx].drawBucketHint  = bucketIdx;
+                        NVGInstanceCullParams.OutNodeQueue[dstIdx].auxData         = auxFlags | 2u; // NVG_VIS_FLAG_DISOCCLUDED
+                    } else {
+                        InterlockedAdd(NVGInstanceCullParams.OutTelemetry[15u].word, 1u, prev);
+                    }
+                }
+            }
+        }
+    }
+}

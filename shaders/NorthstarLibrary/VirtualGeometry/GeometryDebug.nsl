@@ -1,0 +1,80 @@
+// =====================================================================
+//  GeometryDebug.nsl — Northstar NSL Standard Library: Virtual Geometry Debug Visualization
+//
+//  Provides deterministic false-color visualization modes driven by Get(NVG_DEBUG_MODE):
+//    1 : CLUSTER_ID
+//    2 : LOD_LEVEL
+//    3 : VIRTUAL_PAGE
+//    4 : PHYSICAL_PAGE
+//    5 : GEOMETRIC_ERROR
+//    6 : RESIDENCY_FALLBACK
+//    7 : NORMAL_CONE
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/GeometryCluster.nsl")
+}
+
+LIBRARY
+{
+    Vec3 NVGHashColorUInt(UInt seed)
+    {
+        UInt h = seed * 747796405u + 2891336453u;
+        h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+        h = (h >> 22u) ^ h;
+        Float r = Float(h & 255u) / 255.0;
+        Float g = Float((h >> 8u) & 255u) / 255.0;
+        Float b = Float((h >> 16u) & 255u) / 255.0;
+        return Vec3(0.22 + r * 0.78, 0.22 + g * 0.78, 0.22 + b * 0.78);
+    }
+
+    Vec3 NVGLodLevelColor(UInt lodLevel)
+    {
+        if (lodLevel == 0u) return Vec3(0.10, 0.85, 0.25); // LOD 0: Vivid Green
+        if (lodLevel == 1u) return Vec3(0.15, 0.75, 0.90); // LOD 1: Cyan
+        if (lodLevel == 2u) return Vec3(0.20, 0.40, 0.95); // LOD 2: Blue
+        if (lodLevel == 3u) return Vec3(0.85, 0.80, 0.15); // LOD 3: Yellow
+        if (lodLevel == 4u) return Vec3(0.95, 0.50, 0.10); // LOD 4: Orange
+        if (lodLevel == 5u) return Vec3(0.92, 0.18, 0.18); // LOD 5: Red
+        return Vec3(0.85, 0.20, 0.85);                     // LOD 6+: Magenta
+    }
+
+    Vec3 NVGComputeDebugColor(NVGVisibleCluster vc, Vec3 worldNormal)
+    {
+        UInt mode = NVGGetDebugMode();
+        if (mode == 1u)
+        {
+            return NVGHashColorUInt(vc.clusterId + 1u);
+        }
+        if (mode == 2u)
+        {
+            return NVGLodLevelColor(vc.lodLevel);
+        }
+        if (mode == 3u)
+        {
+            return NVGHashColorUInt(vc.virtualPageId * 13u + 7u);
+        }
+        if (mode == 4u)
+        {
+            return NVGHashColorUInt(vc.physicalPageIndex * 29u + 3u);
+        }
+        if (mode == 5u)
+        {
+            Float maxErr = Max(NVGResources.Params.NVG_MAX_SCREEN_ERROR_PX, 0.05);
+            Float ratio  = vc.geometricError / maxErr;
+            Float t      = Clamp(ratio * 0.72, 0.0, 1.0);
+            return Vec3(t, 1.0 - Abs(t * 2.0 - 1.0), 1.0 - t);
+        }
+        if (mode == 6u)
+        {
+            Bool isFallback = ((vc.flags & 1u) != 0u);
+            return isFallback ? Vec3(1.0, 0.15, 0.15) : Vec3(0.15, 0.85, 0.35);
+        }
+        if (mode == 7u)
+        {
+            return worldNormal * 0.5 + Vec3(0.5, 0.5, 0.5);
+        }
+        return Vec3(1.0, 1.0, 1.0);
+    }
+}

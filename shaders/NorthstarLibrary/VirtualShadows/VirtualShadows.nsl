@@ -1,0 +1,20 @@
+// =====================================================================
+//  VirtualShadows.nsl — Northstar NSL Standard Library: Virtual Shadows
+//
+//  Umbrella library module re-exporting the full Northstar Virtual Shadows
+//  shading suite:
+//    - ShadowPageLookup.nsl (sparse virtual page hierarchy & clipmap/cube lookup)
+//    - ShadowSampling.nsl   (physical Texture2DArray & hardware compare sampling)
+//    - ShadowFiltering.nsl  (RPDB, tent PCF, Vogel disk, PCSS & diagnostics)
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualShadows/ShadowPageLookup.nsl")
+    Add("NorthstarLibrary/VirtualShadows/ShadowSampling.nsl")
+    Add("NorthstarLibrary/VirtualShadows/ShadowFiltering.nsl")
+}
+
+LIBRARY
+{
+}

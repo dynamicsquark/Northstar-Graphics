@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Northstar Graphics Documentation — NSL Shading Language</title>
+    <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="brand">Northstar <span>Graphics</span></div>
+        <div class="version-tag">NSL Compiler v3.2 &bull; HLSL12</div>
+
+        <div class="nav-section">Documentation</div>
+        <ul class="nav-links">
+            <li><a href="index.html">Overview &amp; Quick Start</a></li>
+            <li><a href="architecture.html">Engine Architecture</a></li>
+            <li><a href="api-reference.html">C++20 User API Reference</a></li>
+            <li><a href="nsl-language.html" class="active">NSL Shading Language</a></li>
+        </ul>
+    </aside>
+
+    <main class="content">
+        <h1>Northstar Shading Language (NSL)</h1>
+        <p class="lead">
+            A structured, reflection-first shading language compiled by <code>NSLCompiler</code> into
+            target-aligned HLSL and self-describing binary <code>.nsc</code> shader containers.
+        </p>
+
+        <h2>1. Anatomy of an NSL Shader</h2>
+        <p>Every standalone NSL shader file declares its stage, optional library imports, stage I/O contracts, resource property blocks, and entry function:</p>
+        <pre><code>STAGE PIXEL
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualShadows/VirtualShadows.nsl")
+}
+
+INPUT_LAYOUT
+{
+    Get(CLIP_POSITION)
+    Get(WORLD_POSITION)
+    Get(WORLD_NORMAL)
+    Get(UV0)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(COLOR_TARGET0)
+}
+
+PROPERTY Material
+{
+    Buffer Params
+    {
+        Add(baseColor) : Vec4  = 1.0 1.0 1.0 1.0
+        Add(roughness) : Float = 0.5
+    }
+
+    Texture2D Textures
+    {
+        Add(BaseColorMap)
+    }
+
+    SamplerState Samplers
+    {
+        Add(LinearWrapSampler)
+    }
+}
+
+PROPERTY Frame
+{
+    Buffer CameraData
+    {
+        Get(CAMERA_POSITION)
+    }
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+        Vec4 tex = Sample(Material.Textures.BaseColorMap, Material.Samplers.LinearWrapSampler, input.UV0);
+        o.COLOR_TARGET0 = tex * Material.Params.baseColor;
+        return o;
+    }
+}</code></pre>
+
+        <h2>2. <code>Get(...)</code> vs. <code>Add(...)</code> Binding Semantics</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Directive</th>
+                    <th>Owner</th>
+                    <th>Runtime Behavior</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>Get(SEMANTIC)</code></td>
+                    <td>Engine</td>
+                    <td>Automatically populated by <code>NorthstarCore</code> from active camera, transform, light array, NVS shadow tables, or NVG cluster buffers. Immutable from host material setters.</td>
+                </tr>
+                <tr>
+                    <td><code>Add(name)</code></td>
+                    <td>Host Application</td>
+                    <td>Exposed on <code>Material</code> and <code>ComputeKernel</code> for host C++ configuration via <code>SetFloat</code>, <code>SetVec4</code>, <code>SetTexture</code>, <code>SetSampler</code>, and <code>SetGPUBuffer</code>.</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h2>3. Standard Shader Libraries (<code>shaders/NorthstarLibrary/</code>)</h2>
+        <ul>
+            <li><code>NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl</code> — Umbrella library for decoding compressed virtual geometry cluster headers, vertex attributes, world transforms, and debug visualization modes.</li>
+            <li><code>NorthstarLibrary/VirtualShadows/VirtualShadows.nsl</code> — Virtual shadow view resolution, toroidal/sparse page lookup, Receiver-Plane Depth Bias, tent PCF, and 16-tap Vogel disk soft shadow sampling.</li>
+        </ul>
+
+        <h2>4. Command-Line Compilation (<code>NSLCompiler</code>)</h2>
+        <p>During <code>build.bat</code>, CMake invokes <code>NSLCompiler</code> automatically. You can also invoke it directly:</p>
+        <pre><code>build\bin\win64-release\NSLCompiler.exe ^
+    --input shaders\StandardLit\StandardLitPS.nsl ^
+    --target hlsl12 ^
+    --output build\generated\shaders\StandardLit\StandardLitPS_hlsl12.nsc ^
+    -I shaders</code></pre>
+
+        <footer>
+            Copyright &copy; 2026 DynamicsQuark. All Rights Reserved.
+        </footer>
+    </main>
+</body>
+</html>

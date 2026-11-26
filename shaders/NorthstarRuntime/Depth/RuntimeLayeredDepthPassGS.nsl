@@ -1,0 +1,35 @@
+// =====================================================================
+//  RuntimeLayeredDepthPassGS.nsl — NorthstarRuntime Internal Depth GS
+//  Pass-through Geometry Shader fallback for adapters where
+//  VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation
+//  is FALSE (forwards CLIP_POSITION and RENDER_TARGET_ARRAY_INDEX to
+//  the rasterizer stage).
+// =====================================================================
+
+STAGE GEOMETRY
+
+INPUT_LAYOUT {
+    Get(CLIP_POSITION)
+    Get(RENDER_TARGET_ARRAY_INDEX)
+}
+
+OUTPUT_LAYOUT {
+    Add(CLIP_POSITION)
+    Add(RENDER_TARGET_ARRAY_INDEX)
+}
+
+SHADER {
+    [maxvertexcount(3)]
+    [inputtopology("triangle")]
+    [outputtopology("triangle")]
+    void Main(STAGE_INPUT input[3], inout TriangleStream<STAGE_OUTPUT> stream) {
+        for (UInt i = 0u; i < 3u; i = i + 1u) {
+            STAGE_OUTPUT o;
+            o.CLIP_POSITION = input[i].CLIP_POSITION;
+            o.RENDER_TARGET_ARRAY_INDEX = input[i].RENDER_TARGET_ARRAY_INDEX;
+            Append(stream, o);
+        }
+        RestartStrip(stream);
+    }
+}
+

@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Northstar Graphics Documentation — Architecture</title>
+    <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="brand">Northstar <span>Graphics</span></div>
+        <div class="version-tag">SDK v0.6.0 &bull; D3D12</div>
+
+        <div class="nav-section">Documentation</div>
+        <ul class="nav-links">
+            <li><a href="index.html">Overview &amp; Quick Start</a></li>
+            <li><a href="architecture.html" class="active">Engine Architecture</a></li>
+            <li><a href="api-reference.html">C++20 User API Reference</a></li>
+            <li><a href="nsl-language.html">NSL Shading Language</a></li>
+        </ul>
+    </aside>
+
+    <main class="content">
+        <h1>Engine &amp; GPU Pipeline Architecture</h1>
+        <p class="lead">
+            Strict separation between high-level scene/resource orchestration (<code>NorthstarCore</code>)
+            and low-level Direct3D 12 command execution (<code>NorthstarD3D12</code>).
+        </p>
+
+        <h2>1. Modular Runtime Boundary</h2>
+        <p>
+            Northstar Graphics splits execution across two dynamically loaded shared libraries verified at startup via
+            <code>NORTHSTAR_ENGINE_API_VERSION</code>:
+        </p>
+        <ul>
+            <li><strong><code>NorthstarCore.dll</code>:</strong> Owns scene graphs, O(1) incremental GPU Scene dirty tracking, reflection-driven constant/structured buffer materialization, NVG cluster hierarchy building and page residency, and NVS virtual shadow orchestration.</li>
+            <li><strong><code>NorthstarD3D12.dll</code>:</strong> Implements <code>NorthstarBackend</code> over Direct3D 12, managing descriptor heaps, resource state tracking and barrier batching, pipeline state caching, upload rings, and <code>ExecuteIndirect</code> command submission.</li>
+        </ul>
+
+        <h2>2. Persistent GPU Scene</h2>
+        <p>
+            Every <code>RenderObject</code> attached to a <code>Scene</code> maintains an inline O(1) dirty link.
+            During <code>RenderFrame()</code>, <code>CoreGPUSceneManager</code> coalesces contiguous dirty object slots
+            and uploads 160-byte <code>GPUSceneObjectData</code> records and skinning bone palettes to persistent GPU buffers,
+            avoiding redundant CPU-to-GPU traffic for static or unmutated objects.
+        </p>
+
+        <h2>3. Northstar Virtual Geometry (NVG)</h2>
+        <p>When a mesh is created with <code>GeometryMode::Virtualized</code>:</p>
+        <ol>
+            <li><strong>Cluster DAG Construction:</strong> <code>NVGBuilder</code> partitions input triangles into clusters of up to 128 vertices/triangles, builds boundary-locked simplification groups across LOD levels, and packs quantized vertex attributes into 32 KiB virtual pages.</li>
+            <li><strong>Elastic Streaming Pool:</strong> Root LOD pages remain pinned in VRAM so coarse fallback geometry is always resident, while finer streaming pages are uploaded on demand within the configured <code>NVGMemoryBudget</code>.</li>
+            <li><strong>Two-Phase GPU Culling:</strong> Compute passes perform instance frustum/HZB culling and persistent BVH hierarchy traversal against the previous frame's HZB, rasterize visible clusters, rebuild the current HZB, and re-test newly disoccluded clusters in Phase 2 to prevent popping.</li>
+        </ol>
+
+        <h2>4. Northstar Virtual Shadows (NVS)</h2>
+        <p>NVS replaces fixed cascade shadow maps with a unified GPU-driven virtual shadow page pool:</p>
+        <ul>
+            <li><strong>2-Level Sparse Page Hierarchy:</strong> Maps directional toroidal clipmaps, spot perspective mip pyramids, and 6-face point light cubemaps onto physical 128&times;128 depth tiles.</li>
+            <li><strong>Screen-Space Depth Feedback:</strong> Analyzes camera scene depth each frame to request only the virtual shadow pages actually visible on screen.</li>
+            <li><strong>Indirect Caster Culling &amp; Commit:</strong> Culls both standard and NVG virtualized shadow casters on the GPU, selectively clears dirty physical array slices, executes multi-bucket indirect draws, and promotes pages to <code>VALID_SHADOW_DATA</code> only after verified completion.</li>
+        </ul>
+
+        <footer>
+            Copyright &copy; 2026 DynamicsQuark. All Rights Reserved.
+        </footer>
+    </main>
+</body>
+</html>

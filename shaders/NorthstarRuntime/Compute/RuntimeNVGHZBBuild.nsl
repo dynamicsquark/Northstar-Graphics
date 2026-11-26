@@ -1,0 +1,116 @@
+// =====================================================================
+//  RuntimeNVGHZBBuild.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — Hierarchical-Z Depth Pyramid Builder
+//
+//  Dispatch Modes:
+//    Mode 0 (INIT_FROM_DEPTH):
+//      Conservatively reduces SceneDepth (srcWidth x srcHeight) into HZB Mip 0
+//      (dstWidth x dstHeight). Supports both Standard-Z (conservative max)
+//      and Reversed-Z (conservative min) across arbitrary non-POT viewports.
+//    Mode 1 (DOWNSAMPLE_MIP):
+//      Conservatively reduces HZB Mip[k-1] into HZB Mip[k] using 2x2 taps
+//      plus odd-dimension border tap protection so no occluder depth is skipped.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGHZBBuildParams {
+    Buffer Config {
+        Add(dispatchMode) : UInt  = 0
+        Add(srcWidth)     : UInt  = 1
+        Add(srcHeight)    : UInt  = 1
+        Add(dstWidth)     : UInt  = 1
+        Add(dstHeight)    : UInt  = 1
+        Add(isReversedZ)  : UInt  = 0
+        Add(srcOffsetX)   : UInt  = 0
+        Add(srcOffsetY)   : UInt  = 0
+    }
+    Texture2D InTextures {
+        Add(SrcDepth)
+    }
+    RWTexture2D OutTextures {
+        Add(DstHZB) : Float
+    }
+}
+
+SHADER {
+    Float CombineConservativeDepth(Float a, Float b, UInt isReversedZ) {
+        return (isReversedZ != 0u) ? Min(a, b) : Max(a, b);
+    }
+
+    [numthreads(8, 8, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt dstW = NVGHZBBuildParams.Config.dstWidth;
+        UInt dstH = NVGHZBBuildParams.Config.dstHeight;
+        if (dtid.x >= dstW || dtid.y >= dstH) {
+            return;
+        }
+
+        UInt mode        = NVGHZBBuildParams.Config.dispatchMode;
+        UInt srcW        = NVGHZBBuildParams.Config.srcWidth;
+        UInt srcH        = NVGHZBBuildParams.Config.srcHeight;
+        UInt isReversedZ = NVGHZBBuildParams.Config.isReversedZ;
+        UInt offX        = NVGHZBBuildParams.Config.srcOffsetX;
+        UInt offY        = NVGHZBBuildParams.Config.srcOffsetY;
+
+        if (mode == 0u) {
+            // Conservative rectangular footprint covering [x0..x1] x [y0..y1] in SceneDepth
+            UInt x0 = (dtid.x * srcW) / dstW;
+            UInt y0 = (dtid.y * srcH) / dstH;
+            UInt x1 = ((dtid.x + 1u) * srcW + dstW - 1u) / dstW;
+            UInt y1 = ((dtid.y + 1u) * srcH + dstH - 1u) / dstH;
+            if (x1 <= x0) { x1 = x0 + 1u; }
+            if (y1 <= y0) { y1 = y0 + 1u; }
+            if (x1 > srcW) { x1 = srcW; }
+            if (y1 > srcH) { y1 = srcH; }
+            // Cap loop span defensively for extreme downscale ratios
+            if (x1 - x0 > 4u) { x1 = x0 + 4u; }
+            if (y1 - y0 > 4u) { y1 = y0 + 4u; }
+
+            Float d = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(offX + x0), Int(offY + y0), 0)).x;
+            for (UInt sy = y0; sy < y1; sy = sy + 1u) {
+                for (UInt sx = x0; sx < x1; sx = sx + 1u) {
+                    Float sampleD = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(offX + sx), Int(offY + sy), 0)).x;
+                    d = CombineConservativeDepth(d, sampleD, isReversedZ);
+                }
+            }
+            NVGHZBBuildParams.OutTextures.DstHZB[dtid.xy] = d;
+        } else {
+            // Exact 2x2 downsample with extra odd-edge texel protection
+            UInt sx0 = dtid.x * 2u;
+            UInt sy0 = dtid.y * 2u;
+            UInt sx1 = Min(sx0 + 1u, srcW - 1u);
+            UInt sy1 = Min(sy0 + 1u, srcH - 1u);
+
+            Float d00 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx0), Int(sy0), 0)).x;
+            Float d10 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx1), Int(sy0), 0)).x;
+            Float d01 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx0), Int(sy1), 0)).x;
+            Float d11 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx1), Int(sy1), 0)).x;
+
+            Float d = CombineConservativeDepth(
+                CombineConservativeDepth(d00, d10, isReversedZ),
+                CombineConservativeDepth(d01, d11, isReversedZ),
+                isReversedZ);
+
+            // Handle odd source width or height at the rightmost / bottommost destination texel
+            Bool extraX = ((srcW & 1u) != 0u) && (dtid.x == dstW - 1u) && (sx0 + 2u < srcW);
+            Bool extraY = ((srcH & 1u) != 0u) && (dtid.y == dstH - 1u) && (sy0 + 2u < srcH);
+            if (extraX) {
+                Float dx0 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx0 + 2u), Int(sy0), 0)).x;
+                Float dx1 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx0 + 2u), Int(sy1), 0)).x;
+                d = CombineConservativeDepth(d, CombineConservativeDepth(dx0, dx1, isReversedZ), isReversedZ);
+            }
+            if (extraY) {
+                Float dy0 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx0), Int(sy0 + 2u), 0)).x;
+                Float dy1 = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx1), Int(sy0 + 2u), 0)).x;
+                d = CombineConservativeDepth(d, CombineConservativeDepth(dy0, dy1, isReversedZ), isReversedZ);
+                if (extraX) {
+                    Float dxy = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(sx0 + 2u), Int(sy0 + 2u), 0)).x;
+                    d = CombineConservativeDepth(d, dxy, isReversedZ);
+                }
+            }
+
+            NVGHZBBuildParams.OutTextures.DstHZB[dtid.xy] = d;
+        }
+    }
+}

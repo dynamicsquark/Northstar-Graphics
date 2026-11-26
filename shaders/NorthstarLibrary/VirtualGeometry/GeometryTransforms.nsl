@@ -1,0 +1,83 @@
+// =====================================================================
+//  GeometryTransforms.nsl — Northstar NSL Standard Library: Shadow Views & Projection
+//
+//  Provides world-to-clip and physical shadow page projection helpers for
+//  Virtual Geometry, depth prepass, and shadow caster shaders.
+//  Consolidated under PROPERTY NVGResources to share a single logical block.
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/GeometryCluster.nsl")
+    Add("NorthstarLibrary/VirtualGeometry/GeometryInstance.nsl")
+}
+
+PROPERTY NVGResources
+{
+    StructuredBuffer ShadowPageViews
+    {
+        Get(NVG_SHADOW_PAGE_VP_MATRIX)
+        Get(NVG_SHADOW_PAGE_SLICE)
+        Get(NVG_SHADOW_PAGE_DEPTH_BIAS)
+        Get(NVG_SHADOW_PAGE_NORMAL_BIAS)
+        Get(NVG_SHADOW_PAGE_TEXEL_SIZE)
+    }
+}
+
+LIBRARY
+{
+    struct NVGShadowPageView
+    {
+        Mat4  worldToPageClip;
+        UInt  physicalPageSlice;
+        Float depthBiasNdc;
+        Float normalBiasWorld;
+        Float texelWorldSize;
+    };
+
+    Bool NVGIsShadowPageViewAvailable(UInt shadowPageViewIndex)
+    {
+        UInt viewCount  = 0u;
+        UInt viewStride = 0u;
+        GetDimensions(NVGResources.ShadowPageViews, viewCount, viewStride);
+        return shadowPageViewIndex < viewCount;
+    }
+
+    NVGShadowPageView NVGLoadShadowPageView(UInt shadowPageViewIndex)
+    {
+        NVGShadowPageView v;
+        if (!NVGIsShadowPageViewAvailable(shadowPageViewIndex))
+        {
+            v.worldToPageClip   = Mat4(1.0, 0.0, 0.0, 0.0,
+                                       0.0, 1.0, 0.0, 0.0,
+                                       0.0, 0.0, 1.0, 0.0,
+                                       0.0, 0.0, 0.0, 1.0);
+            v.physicalPageSlice = 0u;
+            v.depthBiasNdc      = 0.0;
+            v.normalBiasWorld   = 0.0;
+            v.texelWorldSize    = 0.0;
+            return v;
+        }
+        v.worldToPageClip   = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_VP_MATRIX;
+        v.physicalPageSlice = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_SLICE;
+        v.depthBiasNdc      = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_DEPTH_BIAS;
+        v.normalBiasWorld   = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_NORMAL_BIAS;
+        v.texelWorldSize    = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_TEXEL_SIZE;
+        return v;
+    }
+
+    Vec4 NVGProjectToShadowPage(NVGShadowPageView pageView, Vec3 worldPos, Vec3 worldNormal)
+    {
+        Vec3 biasedWorld = worldPos - worldNormal * pageView.normalBiasWorld;
+        Vec4 clipPos     = Mul(pageView.worldToPageClip, Vec4(biasedWorld, 1.0));
+        clipPos.z        = clipPos.z + pageView.depthBiasNdc * clipPos.w;
+        return clipPos;
+    }
+
+    // Produces an off-screen degenerate clip position for inactive padding vertices
+    // when vertexId >= header.triangleCount * 3u.
+    Vec4 NVGDegenerateClipPosition()
+    {
+        return Vec4(0.0, 0.0, 0.0, 0.0);
+    }
+}

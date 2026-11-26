@@ -1,0 +1,719 @@
+// =====================================================================
+//  GeometryVertex.nsl — Northstar NSL Standard Library: Virtual Geometry Vertex Decode
+//
+//  Bit-exact GPU vertex decompression from 32 KiB compressed virtual geometry pages.
+//  Matches Northstar::NVGBuilder::DecodeClusterCPU across positions, octahedral normals,
+//  orthonormal tangent frames, UV0/UV1, half4 vertex colors, and optional 4-bone skinning.
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/GeometryCluster.nsl")
+}
+
+PROPERTY NVGResources
+{
+    StructuredBuffer BonePalette
+    {
+        Get(GLOBAL_BONE_MATRIX)
+    }
+}
+
+LIBRARY
+{
+    struct NVGDecodedVertex
+    {
+        Vec3  position;
+        Vec3  normal;
+        Vec3  tangent;
+        Vec3  bitangent;
+        Vec2  uv0;
+        Vec2  uv1;
+        Vec4  color;
+        UInt4 boneIndices;
+        Vec4  boneWeights;
+        Bool  hasSkinning;
+        Bool  isValid;
+    };
+
+    void NVGApplyLinearBlendSkinningPosNormal(
+        UInt      bonePaletteOffset,
+        UInt      boneCount,
+        UInt4     boneIndices,
+        Vec4      boneWeights,
+        inout Vec3 ioPosition,
+        inout Vec3 ioNormal)
+    {
+        Float weightSum = boneWeights.x + boneWeights.y + boneWeights.z + boneWeights.w;
+        if (boneCount == 0u || weightSum <= 0.00001)
+        {
+            return;
+        }
+
+        UInt palCount  = 0u;
+        UInt palStride = 0u;
+        GetDimensions(NVGResources.BonePalette, palCount, palStride);
+        if (palCount == 0u || bonePaletteOffset >= palCount)
+        {
+            return;
+        }
+
+        UInt  maxLocalBone = Min(boneCount - 1u, (palCount - 1u) - bonePaletteOffset);
+        Float invWSum      = 1.0 / weightSum;
+        Vec4  w            = boneWeights * invWSum;
+
+        Mat4 bone0 = NVGResources.BonePalette[bonePaletteOffset + Min(boneIndices.x, maxLocalBone)].GLOBAL_BONE_MATRIX;
+        Mat4 bone1 = NVGResources.BonePalette[bonePaletteOffset + Min(boneIndices.y, maxLocalBone)].GLOBAL_BONE_MATRIX;
+        Mat4 bone2 = NVGResources.BonePalette[bonePaletteOffset + Min(boneIndices.z, maxLocalBone)].GLOBAL_BONE_MATRIX;
+        Mat4 bone3 = NVGResources.BonePalette[bonePaletteOffset + Min(boneIndices.w, maxLocalBone)].GLOBAL_BONE_MATRIX;
+
+        Vec4 p4 = Vec4(ioPosition, 1.0);
+        Vec4 n4 = Vec4(ioNormal, 0.0);
+
+        ioPosition =
+            (Mul(bone0, p4).xyz * w.x) +
+            (Mul(bone1, p4).xyz * w.y) +
+            (Mul(bone2, p4).xyz * w.z) +
+            (Mul(bone3, p4).xyz * w.w);
+
+        Vec3 skinnedN =
+            (Mul(bone0, n4).xyz * w.x) +
+            (Mul(bone1, n4).xyz * w.y) +
+            (Mul(bone2, n4).xyz * w.z) +
+            (Mul(bone3, n4).xyz * w.w);
+        Float nSq = Dot(skinnedN, skinnedN);
+        ioNormal  = (nSq > 1.0e-10) ? (skinnedN * Rsqrt(nSq)) : ioNormal;
+    }
+
+    void NVGApplyVertexSkinning(UInt bonePaletteOffset, UInt boneCount, inout NVGDecodedVertex ioVertex)
+    {
+        if (!ioVertex.hasSkinning || boneCount == 0u)
+        {
+            return;
+        }
+        Float weightSum = ioVertex.boneWeights.x + ioVertex.boneWeights.y + ioVertex.boneWeights.z + ioVertex.boneWeights.w;
+        if (weightSum <= 0.00001)
+        {
+            return;
+        }
+
+        UInt palCount  = 0u;
+        UInt palStride = 0u;
+        GetDimensions(NVGResources.BonePalette, palCount, palStride);
+        if (palCount == 0u || bonePaletteOffset >= palCount)
+        {
+            return;
+        }
+
+        UInt  maxLocalBone = Min(boneCount - 1u, (palCount - 1u) - bonePaletteOffset);
+        Float invWSum      = 1.0 / weightSum;
+        Vec4  w            = ioVertex.boneWeights * invWSum;
+
+        Mat4 bone0 = NVGResources.BonePalette[bonePaletteOffset + Min(ioVertex.boneIndices.x, maxLocalBone)].GLOBAL_BONE_MATRIX;
+        Mat4 bone1 = NVGResources.BonePalette[bonePaletteOffset + Min(ioVertex.boneIndices.y, maxLocalBone)].GLOBAL_BONE_MATRIX;
+        Mat4 bone2 = NVGResources.BonePalette[bonePaletteOffset + Min(ioVertex.boneIndices.z, maxLocalBone)].GLOBAL_BONE_MATRIX;
+        Mat4 bone3 = NVGResources.BonePalette[bonePaletteOffset + Min(ioVertex.boneIndices.w, maxLocalBone)].GLOBAL_BONE_MATRIX;
+
+        Vec4 p4 = Vec4(ioVertex.position, 1.0);
+        Vec4 n4 = Vec4(ioVertex.normal, 0.0);
+        Vec4 t4 = Vec4(ioVertex.tangent, 0.0);
+        Vec4 b4 = Vec4(ioVertex.bitangent, 0.0);
+
+        ioVertex.position =
+            (Mul(bone0, p4).xyz * w.x) +
+            (Mul(bone1, p4).xyz * w.y) +
+            (Mul(bone2, p4).xyz * w.z) +
+            (Mul(bone3, p4).xyz * w.w);
+
+        Vec3 skN = (Mul(bone0, n4).xyz * w.x) + (Mul(bone1, n4).xyz * w.y) + (Mul(bone2, n4).xyz * w.z) + (Mul(bone3, n4).xyz * w.w);
+        Vec3 skT = (Mul(bone0, t4).xyz * w.x) + (Mul(bone1, t4).xyz * w.y) + (Mul(bone2, t4).xyz * w.z) + (Mul(bone3, t4).xyz * w.w);
+        Vec3 skB = (Mul(bone0, b4).xyz * w.x) + (Mul(bone1, b4).xyz * w.y) + (Mul(bone2, b4).xyz * w.z) + (Mul(bone3, b4).xyz * w.w);
+
+        Float nSq = Dot(skN, skN);
+        Float tSq = Dot(skT, skT);
+        Float bSq = Dot(skB, skB);
+        if (nSq > 1.0e-10) { ioVertex.normal    = skN * Rsqrt(nSq); }
+        if (tSq > 1.0e-10) { ioVertex.tangent   = skT * Rsqrt(tSq); }
+        if (bSq > 1.0e-10) { ioVertex.bitangent = skB * Rsqrt(bSq); }
+    }
+
+    Vec3 NVGUnpackOctahedralNormal(UInt packed)
+    {
+        Int ix = Int(packed & 65535u);
+        Int iy = Int((packed >> 16u) & 65535u);
+        if (ix >= 32768) { ix = ix - 65536; }
+        if (iy >= 32768) { iy = iy - 65536; }
+
+        Float ox = Clamp(Float(ix) / 32767.0, -1.0, 1.0);
+        Float oy = Clamp(Float(iy) / 32767.0, -1.0, 1.0);
+        Float oz = 1.0 - Abs(ox) - Abs(oy);
+        if (oz < 0.0)
+        {
+            Float oldX = ox;
+            Float oldY = oy;
+            Float sx = (oldX >= 0.0) ? 1.0 : -1.0;
+            Float sy = (oldY >= 0.0) ? 1.0 : -1.0;
+            ox = (1.0 - Abs(oldY)) * sx;
+            oy = (1.0 - Abs(oldX)) * sy;
+        }
+        Vec3 rawN = Vec3(ox, oy, oz);
+        Float nSq = Dot(rawN, rawN);
+        return (nSq > 1.0e-12) ? (rawN * Rsqrt(nSq)) : Vec3(0.0, 1.0, 0.0);
+    }
+
+    void NVGUnpackTangentFrame(Vec3 unitNormal, UInt packed16, out Vec3 outTangent, out Vec3 outBitangent)
+    {
+        // Matches Northstar::NVGBuilder::PackTangentFrame / UnpackTangentFrame bit-for-bit:
+        //   bits [0..14] = quantized tangent angle in [-pi, +pi]
+        //   bit  15      = bitangent handedness sign (1 -> -1.0, 0 -> +1.0)
+        //   reference up = (0, 1, 0) when |N.y| < 0.999 else (1, 0, 0)
+        UInt  qAngle     = packed16 & 32767u;
+        Float handedness = ((packed16 & 32768u) != 0u) ? -1.0 : 1.0;
+        Float angle      = (Float(qAngle) / 32767.0) * 6.28318530718 - 3.14159265359;
+
+        Vec3 refAxis = (Abs(unitNormal.y) < 0.999) ? Vec3(0.0, 1.0, 0.0) : Vec3(1.0, 0.0, 0.0);
+        Vec3 b0 = Normalize(Cross(refAxis, unitNormal));
+        Vec3 b1 = Cross(unitNormal, b0);
+
+        outTangent   = Normalize(b0 * Cos(angle) + b1 * Sin(angle));
+        outBitangent = Normalize(Cross(unitNormal, outTangent)) * handedness;
+    }
+
+    NVGDecodedVertex NVGDecodeLocalVertex(NVGClusterHeader header, UInt localVertexIndex)
+    {
+        NVGDecodedVertex v;
+        UInt base = header.pageBaseWord + header.vertexWordOffset + localVertexIndex * header.vertexStrideWords;
+
+        UInt w0 = NVGReadPageWord(base + 0u);
+        UInt w1 = NVGReadPageWord(base + 1u);
+        UInt w2 = NVGReadPageWord(base + 2u);
+        UInt w3 = NVGReadPageWord(base + 3u);
+        UInt w4 = NVGReadPageWord(base + 4u);
+        UInt w5 = NVGReadPageWord(base + 5u);
+        UInt w6 = NVGReadPageWord(base + 6u);
+
+        Float qx = Float(w0 & 65535u);
+        Float qy = Float((w0 >> 16u) & 65535u);
+        Float qz = Float(w1 & 65535u);
+        UInt tanPack = (w1 >> 16u) & 65535u;
+
+        Vec3 posStep = header.posExtent * (1.0 / 65535.0);
+        v.position = header.posOrigin + Vec3(qx, qy, qz) * posStep;
+        v.normal   = NVGUnpackOctahedralNormal(w2);
+
+        Vec3 t = Vec3(1.0, 0.0, 0.0);
+        Vec3 b = Vec3(0.0, 0.0, 1.0);
+        NVGUnpackTangentFrame(v.normal, tanPack, t, b);
+        v.tangent   = t;
+        v.bitangent = b;
+
+        Float u0 = Float(w3 & 65535u) / 65535.0;
+        Float v0 = Float((w3 >> 16u) & 65535u) / 65535.0;
+        v.uv0    = header.uv0Origin + Vec2(u0, v0) * header.uv0Extent;
+
+        Float u1 = Float(w4 & 65535u) / 65535.0;
+        Float v1 = Float((w4 >> 16u) & 65535u) / 65535.0;
+        v.uv1    = header.uv1Origin + Vec2(u1, v1) * header.uv1Extent;
+
+        v.color = Vec4(
+            F16ToF32(w5 & 65535u),
+            F16ToF32((w5 >> 16u) & 65535u),
+            F16ToF32(w6 & 65535u),
+            F16ToF32((w6 >> 16u) & 65535u));
+
+        v.hasSkinning = ((header.attrFlags & 4u) != 0u);
+        if (v.hasSkinning)
+        {
+            UInt w7  = NVGReadPageWord(base + 7u);
+            UInt w8  = NVGReadPageWord(base + 8u);
+            UInt w9  = NVGReadPageWord(base + 9u);
+            UInt w10 = NVGReadPageWord(base + 10u);
+
+            v.boneIndices = UInt4(
+                w7 & 65535u,
+                (w7 >> 16u) & 65535u,
+                w8 & 65535u,
+                (w8 >> 16u) & 65535u);
+            v.boneWeights = Vec4(
+                Float(w9 & 65535u) / 65535.0,
+                Float((w9 >> 16u) & 65535u) / 65535.0,
+                Float(w10 & 65535u) / 65535.0,
+                Float((w10 >> 16u) & 65535u) / 65535.0);
+        }
+        else
+        {
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+        }
+        v.isValid = true;
+        return v;
+    }
+
+    NVGDecodedVertex NVGDecodeClusterVertex(NVGClusterHeader header, UInt vertexId)
+    {
+        if (!NVGIsVertexActiveInCluster(header, vertexId))
+        {
+            NVGDecodedVertex emptyV;
+            emptyV.position    = Vec3(0.0, 0.0, 0.0);
+            emptyV.normal      = Vec3(0.0, 1.0, 0.0);
+            emptyV.tangent     = Vec3(1.0, 0.0, 0.0);
+            emptyV.bitangent   = Vec3(0.0, 0.0, 1.0);
+            emptyV.uv0         = Vec2(0.0, 0.0);
+            emptyV.uv1         = Vec2(0.0, 0.0);
+            emptyV.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+            emptyV.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            emptyV.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+            emptyV.hasSkinning = false;
+            emptyV.isValid     = false;
+            return emptyV;
+        }
+        UInt localIdx = NVGLoadClusterVertexIndex(header, vertexId);
+        return NVGDecodeLocalVertex(header, localIdx);
+    }
+
+    NVGDecodedVertex NVGDecodeSkinnedClusterVertex(NVGVisibleCluster vc, NVGClusterHeader header, UInt vertexId)
+    {
+        NVGDecodedVertex v = NVGDecodeClusterVertex(header, vertexId);
+        if (v.isValid && v.hasSkinning && vc.boneCount > 0u)
+        {
+            NVGApplyVertexSkinning(vc.bonePaletteOffset, vc.boneCount, v);
+        }
+        return v;
+    }
+
+    // Fast path for vertex-pulling shaders that only require position, normal, uv0, and color.
+    // Performs 1-word triangle-count early-out for padding vertices BEFORE loading quantization headers,
+    // and skips unused tangent-frame trigonometry (Sin/Cos), uv1, and unskinned bone loads.
+    NVGDecodedVertex NVGDecodeClusterVertexFast(NVGVisibleCluster vc, UInt vertexId)
+    {
+        NVGDecodedVertex v;
+        if (vc.physicalPageIndex == NVGInvalidIndex())
+        {
+            v.position    = Vec3(0.0, 0.0, 0.0);
+            v.normal      = Vec3(0.0, 1.0, 0.0);
+            v.tangent     = Vec3(1.0, 0.0, 0.0);
+            v.bitangent   = Vec3(0.0, 0.0, 1.0);
+            v.uv0         = Vec2(0.0, 0.0);
+            v.uv1         = Vec2(0.0, 0.0);
+            v.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+            v.hasSkinning = false;
+            v.isValid     = false;
+            return v;
+        }
+        UInt wordsPerPage   = NVGResources.Params.NVG_PAGE_WORD_COUNT;
+        UInt baseWord       = vc.physicalPageIndex * wordsPerPage + vc.clusterWordOffset;
+        UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt triCount       = (countsAndFlags >> 8u) & 255u;
+
+        if (vertexId >= (triCount * 3u))
+        {
+            v.position    = Vec3(0.0, 0.0, 0.0);
+            v.normal      = Vec3(0.0, 1.0, 0.0);
+            v.tangent     = Vec3(1.0, 0.0, 0.0);
+            v.bitangent   = Vec3(0.0, 0.0, 1.0);
+            v.uv0         = Vec2(0.0, 0.0);
+            v.uv1         = Vec2(0.0, 0.0);
+            v.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+            v.hasSkinning = false;
+            v.isValid     = false;
+            return v;
+        }
+
+        UInt offsets     = NVGReadPageWord(baseWord + 15u);
+        UInt vtxWordOff  = offsets & 65535u;
+        UInt idxWordOff  = (offsets >> 16u) & 65535u;
+        UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
+        Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        UInt strideWords = hasSkin ? 11u : 7u;
+
+        UInt triIdx      = vertexId / 3u;
+        UInt cornerIdx   = vertexId - triIdx * 3u;
+        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
+
+        Vec3 posOrigin = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 0u)),
+            AsFloat(NVGReadPageWord(baseWord + 1u)),
+            AsFloat(NVGReadPageWord(baseWord + 2u)));
+        Vec3 posExtent = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 3u)),
+            AsFloat(NVGReadPageWord(baseWord + 4u)),
+            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        Vec2 uv0Origin = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 6u)),
+            AsFloat(NVGReadPageWord(baseWord + 7u)));
+        Vec2 uv0Extent = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 8u)),
+            AsFloat(NVGReadPageWord(baseWord + 9u)));
+
+        UInt w0 = NVGReadPageWord(vBase + 0u);
+        UInt w1 = NVGReadPageWord(vBase + 1u);
+        UInt w2 = NVGReadPageWord(vBase + 2u);
+        UInt w3 = NVGReadPageWord(vBase + 3u);
+        UInt w5 = NVGReadPageWord(vBase + 5u);
+        UInt w6 = NVGReadPageWord(vBase + 6u);
+
+        Float qx = Float(w0 & 65535u);
+        Float qy = Float((w0 >> 16u) & 65535u);
+        Float qz = Float(w1 & 65535u);
+        Vec3 posStep = posExtent * (1.0 / 65535.0);
+        v.position  = posOrigin + Vec3(qx, qy, qz) * posStep;
+        v.normal    = NVGUnpackOctahedralNormal(w2);
+        v.tangent   = Vec3(1.0, 0.0, 0.0);
+        v.bitangent = Vec3(0.0, 0.0, 1.0);
+
+        Float u0 = Float(w3 & 65535u) * (1.0 / 65535.0);
+        Float v0 = Float((w3 >> 16u) & 65535u) * (1.0 / 65535.0);
+        v.uv0 = uv0Origin + Vec2(u0, v0) * uv0Extent;
+        v.uv1 = Vec2(0.0, 0.0);
+
+        v.color = Vec4(
+            F16ToF32(w5 & 65535u),
+            F16ToF32((w5 >> 16u) & 65535u),
+            F16ToF32(w6 & 65535u),
+            F16ToF32((w6 >> 16u) & 65535u));
+
+        v.hasSkinning = hasSkin;
+        if (hasSkin)
+        {
+            UInt w7  = NVGReadPageWord(vBase + 7u);
+            UInt w8  = NVGReadPageWord(vBase + 8u);
+            UInt w9  = NVGReadPageWord(vBase + 9u);
+            UInt w10 = NVGReadPageWord(vBase + 10u);
+            v.boneIndices = UInt4(w7 & 65535u, (w7 >> 16u) & 65535u, w8 & 65535u, (w8 >> 16u) & 65535u);
+            v.boneWeights = Vec4(
+                Float(w9 & 65535u) * (1.0 / 65535.0),
+                Float((w9 >> 16u) & 65535u) * (1.0 / 65535.0),
+                Float(w10 & 65535u) * (1.0 / 65535.0),
+                Float((w10 >> 16u) & 65535u) * (1.0 / 65535.0));
+            if (vc.boneCount > 0u)
+            {
+                NVGApplyLinearBlendSkinningPosNormal(
+                    vc.bonePaletteOffset, vc.boneCount, v.boneIndices, v.boneWeights, v.position, v.normal);
+            }
+        }
+        else
+        {
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+        }
+        v.isValid = true;
+        return v;
+    }
+
+    // Ultra-fast shadow/depth-only vertex decode: position + normal + optional skinning, 1-word early-out.
+    NVGDecodedVertex NVGDecodeClusterPositionNormalFast(NVGVisibleCluster vc, UInt vertexId)
+    {
+        NVGDecodedVertex v;
+        if (vc.physicalPageIndex == NVGInvalidIndex())
+        {
+            v.position    = Vec3(0.0, 0.0, 0.0);
+            v.normal      = Vec3(0.0, 1.0, 0.0);
+            v.tangent     = Vec3(1.0, 0.0, 0.0);
+            v.bitangent   = Vec3(0.0, 0.0, 1.0);
+            v.uv0         = Vec2(0.0, 0.0);
+            v.uv1         = Vec2(0.0, 0.0);
+            v.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+            v.hasSkinning = false;
+            v.isValid     = false;
+            return v;
+        }
+        UInt wordsPerPage   = NVGResources.Params.NVG_PAGE_WORD_COUNT;
+        UInt baseWord       = vc.physicalPageIndex * wordsPerPage + vc.clusterWordOffset;
+        UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt triCount       = (countsAndFlags >> 8u) & 255u;
+
+        if (vertexId >= (triCount * 3u))
+        {
+            v.position    = Vec3(0.0, 0.0, 0.0);
+            v.normal      = Vec3(0.0, 1.0, 0.0);
+            v.tangent     = Vec3(1.0, 0.0, 0.0);
+            v.bitangent   = Vec3(0.0, 0.0, 1.0);
+            v.uv0         = Vec2(0.0, 0.0);
+            v.uv1         = Vec2(0.0, 0.0);
+            v.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+            v.hasSkinning = false;
+            v.isValid     = false;
+            return v;
+        }
+
+        UInt offsets     = NVGReadPageWord(baseWord + 15u);
+        UInt vtxWordOff  = offsets & 65535u;
+        UInt idxWordOff  = (offsets >> 16u) & 65535u;
+        UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
+        Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        UInt strideWords = hasSkin ? 11u : 7u;
+
+        UInt triIdx      = vertexId / 3u;
+        UInt cornerIdx   = vertexId - triIdx * 3u;
+        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
+
+        Vec3 posOrigin = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 0u)),
+            AsFloat(NVGReadPageWord(baseWord + 1u)),
+            AsFloat(NVGReadPageWord(baseWord + 2u)));
+        Vec3 posExtent = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 3u)),
+            AsFloat(NVGReadPageWord(baseWord + 4u)),
+            AsFloat(NVGReadPageWord(baseWord + 5u)));
+
+        UInt w0 = NVGReadPageWord(vBase + 0u);
+        UInt w1 = NVGReadPageWord(vBase + 1u);
+        UInt w2 = NVGReadPageWord(vBase + 2u);
+
+        Float qx = Float(w0 & 65535u);
+        Float qy = Float((w0 >> 16u) & 65535u);
+        Float qz = Float(w1 & 65535u);
+        Vec3 posStep = posExtent * (1.0 / 65535.0);
+        v.position    = posOrigin + Vec3(qx, qy, qz) * posStep;
+        v.normal      = NVGUnpackOctahedralNormal(w2);
+        v.tangent     = Vec3(1.0, 0.0, 0.0);
+        v.bitangent   = Vec3(0.0, 0.0, 1.0);
+        v.uv0         = Vec2(0.0, 0.0);
+        v.uv1         = Vec2(0.0, 0.0);
+        v.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+        v.hasSkinning = hasSkin;
+        if (hasSkin)
+        {
+            UInt w7  = NVGReadPageWord(vBase + 7u);
+            UInt w8  = NVGReadPageWord(vBase + 8u);
+            UInt w9  = NVGReadPageWord(vBase + 9u);
+            UInt w10 = NVGReadPageWord(vBase + 10u);
+            v.boneIndices = UInt4(w7 & 65535u, (w7 >> 16u) & 65535u, w8 & 65535u, (w8 >> 16u) & 65535u);
+            v.boneWeights = Vec4(
+                Float(w9 & 65535u) * (1.0 / 65535.0),
+                Float((w9 >> 16u) & 65535u) * (1.0 / 65535.0),
+                Float(w10 & 65535u) * (1.0 / 65535.0),
+                Float((w10 >> 16u) & 65535u) * (1.0 / 65535.0));
+            if (vc.boneCount > 0u)
+            {
+                NVGApplyLinearBlendSkinningPosNormal(
+                    vc.bonePaletteOffset, vc.boneCount, v.boneIndices, v.boneWeights, v.position, v.normal);
+            }
+        }
+        else
+        {
+            v.boneIndices = UInt4(0u, 0u, 0u, 0u);
+            v.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+        }
+        v.isValid = true;
+        return v;
+    }
+
+    // Ultra-lean direct vertex pull: reads only physicalPageIndex + clusterWordOffset + countsAndFlags (4 loads)
+    // before rejecting padding vertices, then loads objectSlot + minimal vertex attributes on active corners only.
+    Bool NVGDecodeClusterVertexDirect(
+        UInt instanceId,
+        UInt vertexId,
+        out UInt outObjectSlot,
+        out NVGDecodedVertex outVert)
+    {
+        outObjectSlot       = 0u;
+        outVert.position    = Vec3(0.0, 0.0, 0.0);
+        outVert.normal      = Vec3(0.0, 1.0, 0.0);
+        outVert.tangent     = Vec3(1.0, 0.0, 0.0);
+        outVert.bitangent   = Vec3(0.0, 0.0, 1.0);
+        outVert.uv0         = Vec2(0.0, 0.0);
+        outVert.uv1         = Vec2(0.0, 0.0);
+        outVert.color       = Vec4(1.0, 1.0, 1.0, 1.0);
+        outVert.boneIndices = UInt4(0u, 0u, 0u, 0u);
+        outVert.boneWeights = Vec4(0.0, 0.0, 0.0, 0.0);
+        outVert.hasSkinning = false;
+        outVert.isValid     = false;
+
+        UInt visIdx       = NVGGetVisibleClusterIndexFast(instanceId);
+        if (visIdx == NVGInvalidIndex())
+        {
+            return false;
+        }
+        UInt physPage     = NVGResources.VisibleClusters[visIdx].NVG_VIS_PHYSICAL_PAGE_INDEX;
+        UInt wordOff      = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_WORD_OFFSET;
+        UInt wordsPerPage = NVGResources.Params.NVG_PAGE_WORD_COUNT;
+        UInt baseWord     = physPage * wordsPerPage + wordOff;
+
+        UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt triCount       = (countsAndFlags >> 8u) & 255u;
+        if (vertexId >= (triCount * 3u))
+        {
+            return false;
+        }
+
+        outObjectSlot    = NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
+        UInt offsets     = NVGReadPageWord(baseWord + 15u);
+        UInt vtxWordOff  = offsets & 65535u;
+        UInt idxWordOff  = (offsets >> 16u) & 65535u;
+        UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
+        Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        UInt strideWords = hasSkin ? 11u : 7u;
+
+        UInt triIdx      = vertexId / 3u;
+        UInt cornerIdx   = vertexId - triIdx * 3u;
+        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
+
+        Vec3 posOrigin = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 0u)),
+            AsFloat(NVGReadPageWord(baseWord + 1u)),
+            AsFloat(NVGReadPageWord(baseWord + 2u)));
+        Vec3 posExtent = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 3u)),
+            AsFloat(NVGReadPageWord(baseWord + 4u)),
+            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        Vec2 uv0Origin = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 6u)),
+            AsFloat(NVGReadPageWord(baseWord + 7u)));
+        Vec2 uv0Extent = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 8u)),
+            AsFloat(NVGReadPageWord(baseWord + 9u)));
+
+        UInt w0 = NVGReadPageWord(vBase + 0u);
+        UInt w1 = NVGReadPageWord(vBase + 1u);
+        UInt w2 = NVGReadPageWord(vBase + 2u);
+        UInt w3 = NVGReadPageWord(vBase + 3u);
+        UInt w5 = NVGReadPageWord(vBase + 5u);
+        UInt w6 = NVGReadPageWord(vBase + 6u);
+
+        Float qx = Float(w0 & 65535u);
+        Float qy = Float((w0 >> 16u) & 65535u);
+        Float qz = Float(w1 & 65535u);
+        Vec3 posStep = posExtent * (1.0 / 65535.0);
+        outVert.position = posOrigin + Vec3(qx, qy, qz) * posStep;
+        outVert.normal   = NVGUnpackOctahedralNormal(w2);
+
+        Float u0 = Float(w3 & 65535u) * (1.0 / 65535.0);
+        Float v0 = Float((w3 >> 16u) & 65535u) * (1.0 / 65535.0);
+        outVert.uv0 = uv0Origin + Vec2(u0, v0) * uv0Extent;
+
+        outVert.color = Vec4(
+            F16ToF32(w5 & 65535u),
+            F16ToF32((w5 >> 16u) & 65535u),
+            F16ToF32(w6 & 65535u),
+            F16ToF32((w6 >> 16u) & 65535u));
+
+        outVert.hasSkinning = hasSkin;
+        if (hasSkin)
+        {
+            UInt w7  = NVGReadPageWord(vBase + 7u);
+            UInt w8  = NVGReadPageWord(vBase + 8u);
+            UInt w9  = NVGReadPageWord(vBase + 9u);
+            UInt w10 = NVGReadPageWord(vBase + 10u);
+            outVert.boneIndices = UInt4(w7 & 65535u, (w7 >> 16u) & 65535u, w8 & 65535u, (w8 >> 16u) & 65535u);
+            outVert.boneWeights = Vec4(
+                Float(w9 & 65535u) * (1.0 / 65535.0),
+                Float((w9 >> 16u) & 65535u) * (1.0 / 65535.0),
+                Float(w10 & 65535u) * (1.0 / 65535.0),
+                Float((w10 >> 16u) & 65535u) * (1.0 / 65535.0));
+            UInt boneCnt = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_COUNT;
+            if (boneCnt > 0u)
+            {
+                UInt boneOff = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_OFFSET;
+                NVGApplyLinearBlendSkinningPosNormal(
+                    boneOff, boneCnt, outVert.boneIndices, outVert.boneWeights, outVert.position, outVert.normal);
+            }
+        }
+        outVert.isValid = true;
+        return true;
+    }
+
+    // Ultra-lean direct shadow/depth vertex pull (4 loads for padding rejection, 12 loads active + optional skinning).
+    Bool NVGDecodeClusterShadowDirect(
+        UInt instanceId,
+        UInt vertexId,
+        out UInt outObjectSlot,
+        out UInt outShadowPageViewIndex,
+        out Vec3 outPosition,
+        out Vec3 outNormal)
+    {
+        outObjectSlot          = 0u;
+        outShadowPageViewIndex = 0u;
+        outPosition            = Vec3(0.0, 0.0, 0.0);
+        outNormal              = Vec3(0.0, 1.0, 0.0);
+
+        UInt visIdx       = NVGGetVisibleClusterIndexFast(instanceId);
+        if (visIdx == NVGInvalidIndex())
+        {
+            return false;
+        }
+        UInt physPage     = NVGResources.VisibleClusters[visIdx].NVG_VIS_PHYSICAL_PAGE_INDEX;
+        UInt wordOff      = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_WORD_OFFSET;
+        UInt wordsPerPage = NVGResources.Params.NVG_PAGE_WORD_COUNT;
+        UInt baseWord     = physPage * wordsPerPage + wordOff;
+
+        UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt triCount       = (countsAndFlags >> 8u) & 255u;
+        if (vertexId >= (triCount * 3u))
+        {
+            return false;
+        }
+
+        outObjectSlot          = NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
+        UInt lodAndFlags       = NVGResources.VisibleClusters[visIdx].NVG_VIS_LOD_AND_FLAGS;
+        outShadowPageViewIndex = (lodAndFlags >> 16u) & 65535u;
+
+        UInt offsets     = NVGReadPageWord(baseWord + 15u);
+        UInt vtxWordOff  = offsets & 65535u;
+        UInt idxWordOff  = (offsets >> 16u) & 65535u;
+        UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
+        Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        UInt strideWords = hasSkin ? 11u : 7u;
+
+        UInt triIdx      = vertexId / 3u;
+        UInt cornerIdx   = vertexId - triIdx * 3u;
+        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
+
+        Vec3 posOrigin = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 0u)),
+            AsFloat(NVGReadPageWord(baseWord + 1u)),
+            AsFloat(NVGReadPageWord(baseWord + 2u)));
+        Vec3 posExtent = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 3u)),
+            AsFloat(NVGReadPageWord(baseWord + 4u)),
+            AsFloat(NVGReadPageWord(baseWord + 5u)));
+
+        UInt w0 = NVGReadPageWord(vBase + 0u);
+        UInt w1 = NVGReadPageWord(vBase + 1u);
+        UInt w2 = NVGReadPageWord(vBase + 2u);
+
+        Float qx = Float(w0 & 65535u);
+        Float qy = Float((w0 >> 16u) & 65535u);
+        Float qz = Float(w1 & 65535u);
+        Vec3 posStep = posExtent * (1.0 / 65535.0);
+        outPosition = posOrigin + Vec3(qx, qy, qz) * posStep;
+        outNormal   = NVGUnpackOctahedralNormal(w2);
+
+        if (hasSkin)
+        {
+            UInt boneCnt = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_COUNT;
+            if (boneCnt > 0u)
+            {
+                UInt boneOff = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_OFFSET;
+                UInt w7  = NVGReadPageWord(vBase + 7u);
+                UInt w8  = NVGReadPageWord(vBase + 8u);
+                UInt w9  = NVGReadPageWord(vBase + 9u);
+                UInt w10 = NVGReadPageWord(vBase + 10u);
+                UInt4 bIdx = UInt4(w7 & 65535u, (w7 >> 16u) & 65535u, w8 & 65535u, (w8 >> 16u) & 65535u);
+                Vec4  bWgt = Vec4(
+                    Float(w9 & 65535u) * (1.0 / 65535.0),
+                    Float((w9 >> 16u) & 65535u) * (1.0 / 65535.0),
+                    Float(w10 & 65535u) * (1.0 / 65535.0),
+                    Float((w10 >> 16u) & 65535u) * (1.0 / 65535.0));
+                NVGApplyLinearBlendSkinningPosNormal(boneOff, boneCnt, bIdx, bWgt, outPosition, outNormal);
+            }
+        }
+        return true;
+    }
+}

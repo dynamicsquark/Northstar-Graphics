@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Northstar Graphics Documentation — C++20 User API Reference</title>
+    <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="brand">Northstar <span>Graphics</span></div>
+        <div class="version-tag">SDK v0.6.0 &bull; D3D12</div>
+
+        <div class="nav-section">Documentation</div>
+        <ul class="nav-links">
+            <li><a href="index.html">Overview &amp; Quick Start</a></li>
+            <li><a href="architecture.html">Engine Architecture</a></li>
+            <li><a href="api-reference.html" class="active">C++20 User API Reference</a></li>
+            <li><a href="nsl-language.html">NSL Shading Language</a></li>
+        </ul>
+    </aside>
+
+    <main class="content">
+        <h1>C++20 Host User API Reference</h1>
+        <p class="lead">
+            Include <code>&lt;northstar.h&gt;</code> for full access to runtime session management,
+            RAII resource handles, math types, scene entities, NVG, and NVS configuration.
+        </p>
+
+        <h2>1. Session Bootstrap (<code>RuntimeSession</code>)</h2>
+        <p>
+            <code>Northstar::RuntimeSession</code> eliminates manual <code>LoadLibrary</code> / <code>GetProcAddress</code>
+            boilerplate, automatically selects Debug (<code>d</code> suffix) or Release DLLs, validates
+            <code>Northstar_GetAPIVersion()</code> against <code>NORTHSTAR_ENGINE_API_VERSION</code>, and tears down the GPU
+            session deterministically on scope exit.
+        </p>
+        <pre><code>Northstar::RuntimeConfig cfg{};
+cfg.backend                  = Northstar::BackendAPI::D3D12;
+cfg.renderTarget             = Northstar::NativeRenderTarget::FromWindow(hwnd);
+cfg.vsync                    = true;
+cfg.enableValidationLayer    = false;
+
+Northstar::RuntimeSession runtime;
+if (!runtime.Initialize(cfg))
+{
+    std::cerr &lt;&lt; runtime.GetLastError() &lt;&lt; "\n";
+    return 1;
+}
+Northstar::NorthstarEngine&amp; engine = runtime.GetEngine();</code></pre>
+
+        <h2>2. RAII Smart Handles (<code>api/northstar_handles.h</code>)</h2>
+        <p>Every engine-owned resource provides a corresponding <code>Unique*</code> alias and <code>MakeUnique*</code> factory:</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>RAII Type</th>
+                    <th>Factory Function</th>
+                    <th>Underlying Engine Destroy Call</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td><code>UniqueShader</code></td><td><code>MakeUniqueShader(engine, desc)</code></td><td><code>DestroyShader</code></td></tr>
+                <tr><td><code>UniqueShaderSet</code></td><td><code>MakeUniqueShaderSet(engine, desc)</code></td><td><code>DestroyShaderSet</code></td></tr>
+                <tr><td><code>UniqueMesh</code></td><td><code>MakeUniqueMesh(engine, desc)</code></td><td><code>DestroyMesh</code></td></tr>
+                <tr><td><code>UniqueMaterial</code></td><td><code>MakeUniqueMaterial(engine, desc)</code></td><td><code>DestroyMaterial</code></td></tr>
+                <tr><td><code>UniqueTexture</code></td><td><code>MakeUniqueTexture(engine, desc)</code></td><td><code>DestroyTexture</code></td></tr>
+                <tr><td><code>UniqueSampler</code></td><td><code>MakeUniqueSampler(engine, desc)</code></td><td><code>DestroySamplerState</code></td></tr>
+                <tr><td><code>UniqueGPUBuffer</code></td><td><code>MakeUniqueGPUBuffer(engine, desc)</code></td><td><code>DestroyGPUBuffer</code></td></tr>
+                <tr><td><code>UniqueComputeKernel</code></td><td><code>MakeUniqueComputeKernel(engine, desc)</code></td><td><code>DestroyComputeKernel</code></td></tr>
+                <tr><td><code>UniqueScene</code></td><td><code>MakeUniqueScene(engine, desc)</code></td><td><code>DestroyScene</code></td></tr>
+                <tr><td><code>UniqueCamera</code></td><td><code>MakeUniqueCamera(engine, desc)</code></td><td><code>DestroyCamera</code></td></tr>
+                <tr><td><code>UniqueLight</code></td><td><code>MakeUniqueLight(engine, desc)</code></td><td><code>DestroyLight</code></td></tr>
+                <tr><td><code>UniqueRenderObject</code></td><td><code>MakeUniqueRenderObject(engine, desc)</code></td><td><code>DestroyRenderObject</code></td></tr>
+            </tbody>
+        </table>
+
+        <h2>3. Geometry &amp; Virtual Geometry (<code>Mesh</code>)</h2>
+        <p>Opting into Northstar Virtual Geometry requires setting a single enum field on <code>MeshDesc</code>:</p>
+        <pre><code>Northstar::MeshDesc meshDesc{};
+meshDesc.vertices     = vertices.data();
+meshDesc.vertexCount  = static_cast&lt;Northstar::UINT32&gt;(vertices.size());
+meshDesc.indices      = indices.data();
+meshDesc.indexCount   = static_cast&lt;Northstar::UINT32&gt;(indices.size());
+meshDesc.geometryMode = Northstar::GeometryMode::Virtualized; // Or GeometryMode::Standard
+
+auto mesh = Northstar::MakeUniqueMesh(engine, meshDesc);</code></pre>
+
+        <h2>4. Reflection-Driven Materials (<code>Material</code>)</h2>
+        <p>
+            <code>Material</code> inspects the reflection payload of attached <code>ShaderSet</code> objects across
+            <code>PassType::Geometry</code>, <code>PassType::Shadow</code>, and <code>PassType::Depth</code>, exposing
+            direct by-name setters that automatically write into aligned constant buffer slots:
+        </p>
+        <pre><code>Northstar::MaterialDesc matDesc{};
+matDesc.geometryShaderSet = geomSet.get();
+matDesc.shadowShaderSet   = shadowSet.get();
+matDesc.cullMode          = Northstar::CullMode::Back;
+matDesc.blendMode         = Northstar::BlendMode::Opaque;
+
+auto mat = Northstar::MakeUniqueMaterial(engine, matDesc);
+mat-&gt;SetVec4("baseColor", { 0.9f, 0.75f, 0.35f, 1.0f });
+mat-&gt;SetFloat("metallic", 0.9f);
+mat-&gt;SetFloat("roughness", 0.2f);
+mat-&gt;SetTexture("BaseColorMap", albedoTex.get());
+mat-&gt;SetSampler("LinearWrapSampler", anisoSampler.get());</code></pre>
+
+        <h2>5. Scene, Camera &amp; Light Ergonomics</h2>
+        <p>All spatial types follow a Left-Handed coordinate convention (<code>+X</code> Right, <code>+Y</code> Up, <code>+Z</code> Forward):</p>
+        <pre><code>camera-&gt;SetPosition({ 0.0f, 5.0f, -12.0f });
+camera-&gt;LookAt({ 0.0f, 1.0f, 0.0f });
+
+sunLight-&gt;SetDirection({ -0.5f, -0.8f, 0.4f });
+sunLight-&gt;SetShadowResolution(Northstar::LightShadowResolution::Res16384);
+sunLight-&gt;SetShadowSoftness(Northstar::LightShadowSoftness::MediumSoft);
+
+renderObject-&gt;SetTransform(position, rotation, scale);</code></pre>
+
+        <footer>
+            Copyright &copy; 2026 DynamicsQuark. All Rights Reserved.
+        </footer>
+    </main>
+</body>
+</html>

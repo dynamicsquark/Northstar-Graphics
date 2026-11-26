@@ -1,0 +1,575 @@
+// =====================================================================
+//  RuntimeNVGCompactionAndDecode.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — GPU Bucket Compaction, Back-to-Front
+//  Transparent Cluster Sorting, Path-A Indirect Args & Deduplicated Path-B
+//  Cluster Decompression (112B Northstar::Vertex + UINT32 Index Stream)
+//
+//  Dispatch Modes:
+//    Mode 0 (PREFIX_SUM_BUCKETS):
+//      Computes prefix sum of InBucketCounts[0 .. bucketCount-1] into
+//      OutBucketRanges, resets OutBucketWriteCursors, and writes 16-byte
+//      Path-A GPUIndirectDrawArgs (DrawInstanced(128*3, clusterCount, 0, 0)).
+//    Mode 1 (SCATTER_COMPACT):
+//      Scatters InRawVisibleClusters into contiguous per-bucket ranges in
+//      OutCompactedVisibleClusters.
+//    Mode 2 (BITONIC_SORT_BUCKET):
+//      Performs one GPU bitonic merge-sort comparison stage on a transparent
+//      bucket range sorting descending by viewDepthKey (back-to-front).
+//    Mode 3 (CLAIM_UNIQUE_DECODE_JOBS):
+//      Deduplicates unique clusters across all Path-B (IA-stream) compacted
+//      visible clusters via atomic InterlockedExchange(frameTag), allocating
+//      transient DecodedVertexPool & DecodedIndexPool ranges once per cluster.
+//    Mode 4 (DECOMPRESS_UNIQUE_CLUSTERS):
+//      Dispatched 1 threadgroup (128 threads) per unique decode job:
+//      bit-exact GPU decompression writing 112B Northstar::Vertex (28 UINT32)
+//      into OutDecodedVertexWords and UINT32 indices into OutDecodedIndexPool.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGCompactionParams {
+    Buffer Config {
+        Add(dispatchMode)           : UInt = 0
+        Add(bucketCount)            : UInt = 256
+        Add(maxVisibleCapacity)     : UInt = 262144
+        Add(rawVisibleCounterIdx)   : UInt = 3
+        Add(frameTag)               : UInt = 1
+        Add(pageWordCount)          : UInt = 8192
+        Add(maxDecodedVertices)     : UInt = 1048576
+        Add(maxDecodedIndices)      : UInt = 3145728
+        Add(maxUniqueDecodeJobs)    : UInt = 32768
+        Add(decodedTableCapacity)   : UInt = 65536
+        Add(sortBucketIndex)        : UInt = 0
+        Add(sortK)                  : UInt = 2
+        Add(sortJ)                  : UInt = 1
+        Add(sortMaxElements)        : UInt = 4096
+        Add(decodeJobCounterIdx)    : UInt = 5
+        Add(shadowCommitRecordCap)  : UInt = 0
+    }
+    StructuredBuffer InPagePool {
+        Add(word) : UInt
+    }
+    StructuredBuffer InBucketCounts {
+        Add(count) : UInt
+    }
+    StructuredBuffer InBucketFlags {
+        Add(flags) : UInt // bit 0 = isIAStream (Path-B), bit 1 = isTransparent
+    }
+    StructuredBuffer InRawVisibleClusters {
+        Add(objectSlotIndex)   : UInt
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(virtualPageId)     : UInt
+        Add(lodAndFlags)       : UInt
+        Add(geometricError)    : Float
+        Add(materialId)        : UInt
+        Add(bonePaletteOffset) : UInt
+        Add(boneCount)         : UInt
+        Add(drawBucketIndex)   : UInt
+        Add(viewDepthKey)      : Float
+    }
+    RWStructuredBuffer OutBucketRanges {
+        Add(firstVisibleCluster) : UInt
+        Add(visibleClusterCount) : UInt
+        Add(maxTriangleCount)    : UInt
+        Add(bucketFlags)         : UInt
+    }
+    RWStructuredBuffer OutBucketWriteCursors {
+        Add(cursor) : UInt
+    }
+    RWStructuredBuffer OutPathAIndirectArgs {
+        Add(vertexCountPerInstance) : UInt
+        Add(instanceCount)          : UInt
+        Add(startVertexLocation)    : UInt
+        Add(startInstanceLocation)  : UInt
+    }
+    RWStructuredBuffer OutCompactedVisibleClusters {
+        Add(objectSlotIndex)   : UInt
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(virtualPageId)     : UInt
+        Add(lodAndFlags)       : UInt
+        Add(geometricError)    : Float
+        Add(materialId)        : UInt
+        Add(bonePaletteOffset) : UInt
+        Add(boneCount)         : UInt
+        Add(drawBucketIndex)   : UInt
+        Add(viewDepthKey)      : Float
+    }
+    RWStructuredBuffer OutDecodedClusterTable {
+        Add(decodedFrameMarker) : UInt
+        Add(vertexStartIndex)   : UInt
+        Add(indexStartOffset)   : UInt
+        Add(indexCount)         : UInt
+    }
+    RWStructuredBuffer OutUniqueDecodeJobs {
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(vertexStartIndex)  : UInt
+        Add(indexStartOffset)  : UInt
+        Add(vertexCount)       : UInt
+        Add(triangleCount)     : UInt
+        Add(reserved)          : UInt
+    }
+    RWStructuredBuffer OutDecodedVertexWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutDecodedIndexPool {
+        Add(indexVal) : UInt
+    }
+    RWStructuredBuffer OutQueueCounters {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer InOutPageCommitRecords {
+        Add(physicalPageIndex)          : UInt
+        Add(resultFlags)                : UInt
+        Add(expectedPhysicalGeneration) : UInt
+        Add(expectedVirtualFlatIndex)   : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+    Vec3 UnpackOctNormal(UInt packed) {
+        Int ix = Int(packed & 65535u);
+        Int iy = Int((packed >> 16u) & 65535u);
+        if (ix >= 32768) { ix = ix - 65536; }
+        if (iy >= 32768) { iy = iy - 65536; }
+
+        Float ox = Clamp(Float(ix) / 32767.0, -1.0, 1.0);
+        Float oy = Clamp(Float(iy) / 32767.0, -1.0, 1.0);
+        Float oz = 1.0 - Abs(ox) - Abs(oy);
+        if (oz < 0.0) {
+            Float oldX = ox;
+            Float oldY = oy;
+            Float sx = (oldX >= 0.0) ? 1.0 : -1.0;
+            Float sy = (oldY >= 0.0) ? 1.0 : -1.0;
+            ox = (1.0 - Abs(oldY)) * sx;
+            oy = (1.0 - Abs(oldX)) * sy;
+        }
+        Vec3 rawN = Vec3(ox, oy, oz);
+        Float nSq = Dot(rawN, rawN);
+        return (nSq > 1.0e-12) ? (rawN * Rsqrt(nSq)) : Vec3(0.0, 1.0, 0.0);
+    }
+
+    void UnpackTanFrame(Vec3 unitN, UInt packed16, out Vec3 outT, out Vec3 outB) {
+        // Matches Northstar::NVGBuilder::PackTangentFrame bit-for-bit:
+        //   bits [0..14] = quantized tangent angle in [-pi, +pi]
+        //   bit  15      = bitangent handedness sign (1 -> -1.0, 0 -> +1.0)
+        //   reference up = (0, 1, 0) when |N.y| < 0.999 else (1, 0, 0)
+        UInt  qAngle = packed16 & 32767u;
+        Float handed = ((packed16 & 32768u) != 0u) ? -1.0 : 1.0;
+        Float angle  = (Float(qAngle) / 32767.0) * 6.28318530718 - 3.14159265359;
+
+        Vec3 refAxis = (Abs(unitN.y) < 0.999) ? Vec3(0.0, 1.0, 0.0) : Vec3(1.0, 0.0, 0.0);
+        Vec3 b0 = Normalize(Cross(refAxis, unitN));
+        Vec3 b1 = Cross(unitN, b0);
+
+        outT = Normalize(b0 * Cos(angle) + b1 * Sin(angle));
+        outB = Normalize(Cross(unitN, outT)) * handed;
+    }
+
+    [numthreads(128, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt tid  = dtid.x;
+        UInt mode = NVGCompactionParams.Config.dispatchMode;
+        UInt prev = 0u;
+
+        // =================================================================
+        //  MODE 0: Bucket Prefix Sum + Path-A ExecuteIndirect Arg Generation
+        // =================================================================
+        if (mode == 0u) {
+            if (tid == 0u) {
+                UInt bCount = Min(NVGCompactionParams.Config.bucketCount, 256u);
+                UInt running = 0u;
+                for (UInt b = 0u; b < bCount; b = b + 1u) {
+                    UInt cnt   = NVGCompactionParams.InBucketCounts[b].count;
+                    UInt flags = NVGCompactionParams.InBucketFlags[b].flags;
+                    UInt avail = (running < NVGCompactionParams.Config.maxVisibleCapacity)
+                        ? (NVGCompactionParams.Config.maxVisibleCapacity - running) : 0u;
+                    UInt clampedCnt = Min(cnt, avail);
+
+                    NVGCompactionParams.OutBucketRanges[b].firstVisibleCluster = running;
+                    NVGCompactionParams.OutBucketRanges[b].visibleClusterCount = clampedCnt;
+                    NVGCompactionParams.OutBucketRanges[b].maxTriangleCount    = 128u;
+                    NVGCompactionParams.OutBucketRanges[b].bucketFlags         = flags;
+                    NVGCompactionParams.OutBucketWriteCursors[b].cursor        = 0u;
+
+                    // Path-A Vertex-Pulling DrawInstanced(maxClusterTrisInBucket * 3, clampedCnt, 0, 0)
+                    // Mode 1 scatter tightens vertexCountPerInstance via InterlockedMax to exact max triangle count!
+                    NVGCompactionParams.OutPathAIndirectArgs[b].vertexCountPerInstance = 0u;
+                    NVGCompactionParams.OutPathAIndirectArgs[b].instanceCount          = clampedCnt;
+                    NVGCompactionParams.OutPathAIndirectArgs[b].startVertexLocation    = 0u;
+                    NVGCompactionParams.OutPathAIndirectArgs[b].startInstanceLocation  = 0u;
+
+                    running = running + clampedCnt;
+                }
+                // Reset decode counters cleanly for this pass
+                NVGCompactionParams.OutQueueCounters[5u].count = 0u; // uniqueDecodeJobCount
+                NVGCompactionParams.OutQueueCounters[7u].count = 0u; // decodedVertexCursor
+                NVGCompactionParams.OutQueueCounters[8u].count = 0u; // decodedIndexCursor
+            }
+        }
+        // =================================================================
+        //  MODE 1: Scatter Raw Visible Clusters into Contiguous Bucket Ranges (Grid-Stride Unlimited)
+        // =================================================================
+        else if (mode == 1u) {
+            UInt cntIdx = NVGCompactionParams.Config.rawVisibleCounterIdx;
+            UInt rawCnt = Min(NVGCompactionParams.OutQueueCounters[cntIdx].count,
+                              NVGCompactionParams.Config.maxVisibleCapacity);
+            for (UInt curTid = dtid.x; curTid < rawCnt; curTid = curTid + 8388480u) {
+                UInt b = NVGCompactionParams.InRawVisibleClusters[curTid].drawBucketIndex;
+                if (b >= NVGCompactionParams.Config.bucketCount) {
+                    continue;
+                }
+
+                UInt first   = NVGCompactionParams.OutBucketRanges[b].firstVisibleCluster;
+                UInt maxCnt  = NVGCompactionParams.OutBucketRanges[b].visibleClusterCount;
+                UInt localOf = 0u;
+                InterlockedAdd(NVGCompactionParams.OutBucketWriteCursors[b].cursor, 1u, localOf);
+                if (localOf >= maxCnt) {
+                    continue;
+                }
+
+                UInt dst     = first + localOf;
+                UInt physPg  = NVGCompactionParams.InRawVisibleClusters[curTid].physicalPageIndex;
+                UInt wordOff = NVGCompactionParams.InRawVisibleClusters[curTid].clusterWordOffset;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].objectSlotIndex   = NVGCompactionParams.InRawVisibleClusters[curTid].objectSlotIndex;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].clusterId         = NVGCompactionParams.InRawVisibleClusters[curTid].clusterId;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].physicalPageIndex = physPg;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].clusterWordOffset = wordOff;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].virtualPageId     = NVGCompactionParams.InRawVisibleClusters[curTid].virtualPageId;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].lodAndFlags       = NVGCompactionParams.InRawVisibleClusters[curTid].lodAndFlags;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].geometricError    = NVGCompactionParams.InRawVisibleClusters[curTid].geometricError;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].materialId        = NVGCompactionParams.InRawVisibleClusters[curTid].materialId;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].bonePaletteOffset = NVGCompactionParams.InRawVisibleClusters[curTid].bonePaletteOffset;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].boneCount         = NVGCompactionParams.InRawVisibleClusters[curTid].boneCount;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].drawBucketIndex   = b;
+                NVGCompactionParams.OutCompactedVisibleClusters[dst].viewDepthKey      = NVGCompactionParams.InRawVisibleClusters[curTid].viewDepthKey;
+
+                // Tighten Path-A vertexCountPerInstance to exact max cluster triangle count in this bucket
+                UInt hdrWord = NVGCompactionParams.InPagePool[physPg * NVGCompactionParams.Config.pageWordCount + wordOff + 14u].word;
+                UInt triCnt  = Min((hdrWord >> 8u) & 255u, 128u);
+                if (triCnt > 0u) {
+                    InterlockedMax(NVGCompactionParams.OutPathAIndirectArgs[b].vertexCountPerInstance, triCnt * 3u, prev);
+                }
+            }
+        }
+        // =================================================================
+        //  MODE 2: Batcher's Odd-Even Mergesort Step (Back-to-Front Descending)
+        //    Strictly unidirectional comparators (a < b always places larger
+        //    depth at a), making virtual -inf padding beyond count a no-op ->
+        //    mathematically exact for ANY non-power-of-2 count up to sortMaxElements!
+        // =================================================================
+        else if (mode == 2u) {
+            UInt b     = NVGCompactionParams.Config.sortBucketIndex;
+            UInt first = NVGCompactionParams.OutBucketRanges[b].firstVisibleCluster;
+            UInt count = Min(NVGCompactionParams.OutBucketRanges[b].visibleClusterCount,
+                             NVGCompactionParams.Config.sortMaxElements);
+            UInt p     = NVGCompactionParams.Config.sortK;
+            UInt k     = NVGCompactionParams.Config.sortJ;
+            if (count <= 1u || p == 0u || k == 0u || tid >= count) {
+                return;
+            }
+            UInt offset = (k == p) ? 0u : k;
+            if (tid < offset) {
+                return;
+            }
+            UInt rel = tid - offset;
+            if ((rel % (2u * k)) >= k) {
+                return;
+            }
+            UInt partner = tid + k;
+            if (partner >= count || (tid / (2u * p)) != (partner / (2u * p))) {
+                return;
+            }
+
+            UInt idxA = first + tid;
+            UInt idxB = first + partner;
+            Float dA  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].viewDepthKey;
+            Float dB  = NVGCompactionParams.OutCompactedVisibleClusters[idxB].viewDepthKey;
+            if (dA < dB) {
+                UInt  tObj = NVGCompactionParams.OutCompactedVisibleClusters[idxA].objectSlotIndex;
+                UInt  tCl  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].clusterId;
+                UInt  tPp  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].physicalPageIndex;
+                UInt  tWo  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].clusterWordOffset;
+                UInt  tVp  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].virtualPageId;
+                UInt  tLf  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].lodAndFlags;
+                Float tGe  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].geometricError;
+                UInt  tMt  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].materialId;
+                UInt  tBo  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].bonePaletteOffset;
+                UInt  tBc  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].boneCount;
+                UInt  tDb  = NVGCompactionParams.OutCompactedVisibleClusters[idxA].drawBucketIndex;
+
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].objectSlotIndex   = NVGCompactionParams.OutCompactedVisibleClusters[idxB].objectSlotIndex;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].clusterId         = NVGCompactionParams.OutCompactedVisibleClusters[idxB].clusterId;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].physicalPageIndex = NVGCompactionParams.OutCompactedVisibleClusters[idxB].physicalPageIndex;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].clusterWordOffset = NVGCompactionParams.OutCompactedVisibleClusters[idxB].clusterWordOffset;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].virtualPageId     = NVGCompactionParams.OutCompactedVisibleClusters[idxB].virtualPageId;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].lodAndFlags       = NVGCompactionParams.OutCompactedVisibleClusters[idxB].lodAndFlags;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].geometricError    = NVGCompactionParams.OutCompactedVisibleClusters[idxB].geometricError;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].materialId        = NVGCompactionParams.OutCompactedVisibleClusters[idxB].materialId;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].bonePaletteOffset = NVGCompactionParams.OutCompactedVisibleClusters[idxB].bonePaletteOffset;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].boneCount         = NVGCompactionParams.OutCompactedVisibleClusters[idxB].boneCount;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].drawBucketIndex   = NVGCompactionParams.OutCompactedVisibleClusters[idxB].drawBucketIndex;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxA].viewDepthKey      = dB;
+
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].objectSlotIndex   = tObj;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].clusterId         = tCl;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].physicalPageIndex = tPp;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].clusterWordOffset = tWo;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].virtualPageId     = tVp;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].lodAndFlags       = tLf;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].geometricError    = tGe;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].materialId        = tMt;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].bonePaletteOffset = tBo;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].boneCount         = tBc;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].drawBucketIndex   = tDb;
+                NVGCompactionParams.OutCompactedVisibleClusters[idxB].viewDepthKey      = dA;
+            }
+        }
+        // =================================================================
+        //  MODE 3: Deduplicated Path-B Cluster Decode Job Claim (Grid-Stride Unlimited)
+        // =================================================================
+        else if (mode == 3u) {
+            UInt cntIdx   = NVGCompactionParams.Config.rawVisibleCounterIdx;
+            UInt totalVis = Min(NVGCompactionParams.OutQueueCounters[cntIdx].count,
+                                NVGCompactionParams.Config.maxVisibleCapacity);
+            for (UInt curTid = dtid.x; curTid < totalVis; curTid = curTid + 8388480u) {
+                UInt b = NVGCompactionParams.OutCompactedVisibleClusters[curTid].drawBucketIndex;
+                if (b >= NVGCompactionParams.Config.bucketCount) {
+                    continue;
+                }
+                // Only Path-B (IA-stream, bit 0) buckets need cluster decompression into vertex/index pools
+                if ((NVGCompactionParams.OutBucketRanges[b].bucketFlags & 1u) == 0u) {
+                    continue;
+                }
+
+                UInt clusterId = NVGCompactionParams.OutCompactedVisibleClusters[curTid].clusterId;
+                UInt shViewIdx = (NVGCompactionParams.OutCompactedVisibleClusters[curTid].lodAndFlags >> 16u) & 65535u;
+                UInt commitCap = NVGCompactionParams.Config.shadowCommitRecordCap;
+                if (clusterId >= NVGCompactionParams.Config.decodedTableCapacity) {
+                    InterlockedAdd(NVGCompactionParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                    if (shViewIdx < commitCap) {
+                        UInt pFl = 0u;
+                        InterlockedOr(NVGCompactionParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                        if ((pFl & 2u) == 0u) { InterlockedAdd(NVGCompactionParams.OutTelemetry[38u].word, 1u, prev); }
+                    }
+                    continue;
+                }
+
+                UInt frameTag = NVGCompactionParams.Config.frameTag;
+                UInt prevTag  = 0u;
+                InterlockedExchange(NVGCompactionParams.OutDecodedClusterTable[clusterId].decodedFrameMarker, frameTag, prevTag);
+                if (prevTag == frameTag) {
+                    continue; // Already claimed by another visible instance this frame!
+                }
+
+                UInt physPage = NVGCompactionParams.OutCompactedVisibleClusters[curTid].physicalPageIndex;
+                UInt wordOff  = NVGCompactionParams.OutCompactedVisibleClusters[curTid].clusterWordOffset;
+                UInt baseWord = physPage * NVGCompactionParams.Config.pageWordCount + wordOff;
+                UInt cFlags   = NVGCompactionParams.InPagePool[baseWord + 14u].word;
+                UInt vCount   = cFlags & 255u;
+                UInt tCount   = (cFlags >> 8u) & 255u;
+                UInt iCount   = tCount * 3u;
+
+                if (vCount == 0u || tCount == 0u || vCount > 128u || tCount > 128u) {
+                    NVGCompactionParams.OutDecodedClusterTable[clusterId].indexCount = 0u;
+                    continue;
+                }
+
+                UInt vStart = 0u;
+                UInt iStart = 0u;
+                InterlockedAdd(NVGCompactionParams.OutQueueCounters[7u].count, vCount, vStart);
+                InterlockedAdd(NVGCompactionParams.OutQueueCounters[8u].count, iCount, iStart);
+
+                if (vStart + vCount > NVGCompactionParams.Config.maxDecodedVertices ||
+                    iStart + iCount > NVGCompactionParams.Config.maxDecodedIndices)
+                {
+                    NVGCompactionParams.OutDecodedClusterTable[clusterId].indexCount = 0u;
+                    InterlockedAdd(NVGCompactionParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                    if (shViewIdx < commitCap) {
+                        UInt pFl = 0u;
+                        InterlockedOr(NVGCompactionParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                        if ((pFl & 2u) == 0u) { InterlockedAdd(NVGCompactionParams.OutTelemetry[38u].word, 1u, prev); }
+                    }
+                    continue;
+                }
+
+                // Claim decode job slot ONLY after vertex & index pool reservations succeed
+                UInt jobIdx = 0u;
+                InterlockedAdd(NVGCompactionParams.OutQueueCounters[5u].count, 1u, jobIdx);
+                if (jobIdx >= NVGCompactionParams.Config.maxUniqueDecodeJobs)
+                {
+                    NVGCompactionParams.OutDecodedClusterTable[clusterId].indexCount = 0u;
+                    InterlockedAdd(NVGCompactionParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                    if (shViewIdx < commitCap) {
+                        UInt pFl = 0u;
+                        InterlockedOr(NVGCompactionParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                        if ((pFl & 2u) == 0u) { InterlockedAdd(NVGCompactionParams.OutTelemetry[38u].word, 1u, prev); }
+                    }
+                    continue;
+                }
+
+                NVGCompactionParams.OutDecodedClusterTable[clusterId].vertexStartIndex = vStart;
+                NVGCompactionParams.OutDecodedClusterTable[clusterId].indexStartOffset = iStart;
+                NVGCompactionParams.OutDecodedClusterTable[clusterId].indexCount       = (vCount << 16u) | (iCount & 65535u);
+
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].clusterId         = clusterId;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].physicalPageIndex = physPage;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].clusterWordOffset = wordOff;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].vertexStartIndex  = vStart;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].indexStartOffset  = iStart;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].vertexCount       = vCount;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].triangleCount     = tCount;
+                NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].reserved          = 0u;
+
+                InterlockedAdd(NVGCompactionParams.OutTelemetry[13u].word, 1u, prev); // decodedUniqueClusters
+            }
+        }
+        // =================================================================
+        //  MODE 4: Decompress Unique Clusters (Group-Stride Unlimited, 1 Group = 1 Cluster)
+        //  Writes bit-exact 112-byte Northstar::Vertex (28 UINT32) + UINT32 indices
+        // =================================================================
+        else if (mode == 4u) {
+            UInt jobCnt = Min(NVGCompactionParams.OutQueueCounters[5u].count,
+                              NVGCompactionParams.Config.maxUniqueDecodeJobs);
+            UInt lane   = gtid.x;
+            for (UInt jobIdx = gid.x; jobIdx < jobCnt; jobIdx = jobIdx + 65535u) {
+                UInt physPage = NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].physicalPageIndex;
+                UInt wordOff  = NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].clusterWordOffset;
+                UInt vStart   = NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].vertexStartIndex;
+                UInt iStart   = NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].indexStartOffset;
+                UInt vCount   = NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].vertexCount;
+                UInt tCount   = NVGCompactionParams.OutUniqueDecodeJobs[jobIdx].triangleCount;
+
+                UInt baseWord = physPage * NVGCompactionParams.Config.pageWordCount + wordOff;
+                UInt offsets  = NVGCompactionParams.InPagePool[baseWord + 15u].word;
+                UInt vRelOff  = offsets & 65535u;
+                UInt iRelOff  = (offsets >> 16u) & 65535u;
+                UInt cFlags   = NVGCompactionParams.InPagePool[baseWord + 14u].word;
+                UInt attrF    = (cFlags >> 24u) & 255u;
+                Bool hasSkin  = ((attrF & 4u) != 0u);
+                UInt vStride  = hasSkin ? 11u : 7u;
+
+                // Decode vertex [lane] into 28 UINT32 words matching Northstar::Vertex (112 bytes) 1:1
+                if (lane < vCount) {
+                    Vec3 posOrg = Vec3(
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 0u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 1u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 2u].word));
+                    Vec3 posExt = Vec3(
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 3u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 4u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 5u].word));
+                    Vec2 uv0Org = Vec2(
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 6u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 7u].word));
+                    Vec2 uv0Ext = Vec2(
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 8u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 9u].word));
+                    Vec2 uv1Org = Vec2(
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 10u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 11u].word));
+                    Vec2 uv1Ext = Vec2(
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 12u].word),
+                        AsFloat(NVGCompactionParams.InPagePool[baseWord + 13u].word));
+
+                    UInt srcBase = baseWord + vRelOff + lane * vStride;
+                    UInt w0 = NVGCompactionParams.InPagePool[srcBase + 0u].word;
+                    UInt w1 = NVGCompactionParams.InPagePool[srcBase + 1u].word;
+                    UInt w2 = NVGCompactionParams.InPagePool[srcBase + 2u].word;
+                    UInt w3 = NVGCompactionParams.InPagePool[srcBase + 3u].word;
+                    UInt w4 = NVGCompactionParams.InPagePool[srcBase + 4u].word;
+                    UInt w5 = NVGCompactionParams.InPagePool[srcBase + 5u].word;
+                    UInt w6 = NVGCompactionParams.InPagePool[srcBase + 6u].word;
+
+                    Vec3 posStep = posExt * (1.0 / 65535.0);
+                    Vec3 pos = posOrg + Vec3(
+                        Float(w0 & 65535u),
+                        Float((w0 >> 16u) & 65535u),
+                        Float(w1 & 65535u)) * posStep;
+
+                    Vec3 norm = UnpackOctNormal(w2);
+                    Vec3 tang = Vec3(1.0, 0.0, 0.0);
+                    Vec3 bitg = Vec3(0.0, 0.0, 1.0);
+                    UnpackTanFrame(norm, (w1 >> 16u) & 65535u, tang, bitg);
+
+                    Vec2 uv0 = uv0Org + Vec2(
+                        Float(w3 & 65535u) / 65535.0,
+                        Float((w3 >> 16u) & 65535u) / 65535.0) * uv0Ext;
+                    Vec2 uv1 = uv1Org + Vec2(
+                        Float(w4 & 65535u) / 65535.0,
+                        Float((w4 >> 16u) & 65535u) / 65535.0) * uv1Ext;
+
+                    Vec4 col = Vec4(
+                        F16ToF32(w5 & 65535u),
+                        F16ToF32((w5 >> 16u) & 65535u),
+                        F16ToF32(w6 & 65535u),
+                        F16ToF32((w6 >> 16u) & 65535u));
+
+                    UInt b0 = 0u; UInt b1 = 0u; UInt b2 = 0u; UInt b3 = 0u;
+                    Float bw0 = 0.0; Float bw1 = 0.0; Float bw2 = 0.0; Float bw3 = 0.0;
+                    if (hasSkin) {
+                        UInt w7  = NVGCompactionParams.InPagePool[srcBase + 7u].word;
+                        UInt w8  = NVGCompactionParams.InPagePool[srcBase + 8u].word;
+                        UInt w9  = NVGCompactionParams.InPagePool[srcBase + 9u].word;
+                        UInt w10 = NVGCompactionParams.InPagePool[srcBase + 10u].word;
+                        b0  = w7 & 65535u;
+                        b1  = (w7 >> 16u) & 65535u;
+                        b2  = w8 & 65535u;
+                        b3  = (w8 >> 16u) & 65535u;
+                        bw0 = Float(w9 & 65535u) / 65535.0;
+                        bw1 = Float((w9 >> 16u) & 65535u) / 65535.0;
+                        bw2 = Float(w10 & 65535u) / 65535.0;
+                        bw3 = Float((w10 >> 16u) & 65535u) / 65535.0;
+                    }
+
+                    UInt dstBase = (vStart + lane) * 28u;
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 0u].word  = AsUInt(pos.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 1u].word  = AsUInt(pos.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 2u].word  = AsUInt(pos.z);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 3u].word  = AsUInt(norm.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 4u].word  = AsUInt(norm.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 5u].word  = AsUInt(norm.z);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 6u].word  = AsUInt(tang.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 7u].word  = AsUInt(tang.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 8u].word  = AsUInt(tang.z);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 9u].word  = AsUInt(bitg.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 10u].word = AsUInt(bitg.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 11u].word = AsUInt(bitg.z);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 12u].word = AsUInt(uv0.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 13u].word = AsUInt(uv0.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 14u].word = AsUInt(uv1.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 15u].word = AsUInt(uv1.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 16u].word = AsUInt(col.x);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 17u].word = AsUInt(col.y);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 18u].word = AsUInt(col.z);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 19u].word = AsUInt(col.w);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 20u].word = b0;
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 21u].word = b1;
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 22u].word = b2;
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 23u].word = b3;
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 24u].word = AsUInt(bw0);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 25u].word = AsUInt(bw1);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 26u].word = AsUInt(bw2);
+                    NVGCompactionParams.OutDecodedVertexWords[dstBase + 27u].word = AsUInt(bw3);
+                }
+
+                // Decode triangle [lane] 3 local indices into DecodedIndexPool (used with baseVertexLocation = vStart)
+                if (lane < tCount) {
+                    UInt packedTri = NVGCompactionParams.InPagePool[baseWord + iRelOff + lane].word;
+                    UInt iDst = iStart + lane * 3u;
+                    NVGCompactionParams.OutDecodedIndexPool[iDst + 0u].indexVal = packedTri & 255u;
+                    NVGCompactionParams.OutDecodedIndexPool[iDst + 1u].indexVal = (packedTri >> 8u) & 255u;
+                    NVGCompactionParams.OutDecodedIndexPool[iDst + 2u].indexVal = (packedTri >> 16u) & 255u;
+                }
+            }
+        }
+    }
+}

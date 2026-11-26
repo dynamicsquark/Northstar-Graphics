@@ -1,0 +1,24 @@
+// =====================================================================
+//  VirtualGeometry.nsl — Northstar NSL Standard Library: Virtual Geometry
+//
+//  Umbrella library module re-exporting the full Northstar Virtual Geometry
+//  shading suite:
+//    - GeometryCluster.nsl    (cluster headers, visible clusters, page pool)
+//    - GeometryVertex.nsl     (bit-exact vertex & skinning decompression)
+//    - GeometryInstance.nsl   (zero-copy GPUScene world & normal transforms)
+//    - GeometryTransforms.nsl (shadow page views & clip projection helpers)
+//    - GeometryDebug.nsl      (cluster, LOD, page, error & residency debug)
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/GeometryCluster.nsl")
+    Add("NorthstarLibrary/VirtualGeometry/GeometryVertex.nsl")
+    Add("NorthstarLibrary/VirtualGeometry/GeometryInstance.nsl")
+    Add("NorthstarLibrary/VirtualGeometry/GeometryTransforms.nsl")
+    Add("NorthstarLibrary/VirtualGeometry/GeometryDebug.nsl")
+}
+
+LIBRARY
+{
+}

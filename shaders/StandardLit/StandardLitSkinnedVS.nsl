@@ -1,0 +1,120 @@
+// =====================================================================
+//  StandardLitSkinnedVS.nsl
+//  Northstar Graphics — Built-in 4-Bone Linear Blend Skinning Vertex Shader
+//
+//  Implements ShaderVariant::SKINNED with normalized 4-bone weights,
+//  clamped palette indexing, and Gram-Schmidt tangent orthogonalization.
+// =====================================================================
+
+STAGE VERTEX
+
+INPUT_LAYOUT
+{
+    Get(VERTEX_POSITION)
+    Get(VERTEX_NORMAL)
+    Get(VERTEX_TANGENT)
+    Get(VERTEX_BITANGENT)
+    Get(VERTEX_UV0)
+    Get(VERTEX_UV1)
+    Get(VERTEX_COLOR)
+    Get(VERTEX_BONE_INDICES)
+    Get(VERTEX_BONE_WEIGHTS)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(CLIP_POSITION)
+    Add(WORLD_POSITION)
+    Add(WORLD_NORMAL)
+    Add(TANGENT)
+    Add(BITANGENT)
+    Add(UV0)
+    Add(UV1)
+    Add(COLOR)
+}
+
+PROPERTY Transforms
+{
+    Buffer Matrices
+    {
+        Get(WORLD_MATRIX)
+        Get(NORMAL_MATRIX)
+        Get(VP_MATRIX)
+    }
+}
+
+PROPERTY Skeleton
+{
+    Buffer SkinningInfo
+    {
+        Get(BONE_PALETTE_OFFSET)
+        Get(BONE_COUNT)
+        Get(SKINNING_REVISION)
+    }
+    StructuredBuffer BonePalette
+    {
+        Get(GLOBAL_BONE_MATRIX)
+    }
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+
+        Vec4  rawW = input.VERTEX_BONE_WEIGHTS;
+        Float wSum = rawW.x + rawW.y + rawW.z + rawW.w;
+        Vec4  w    = (wSum > 0.0001) ? (rawW / wSum) : Vec4(1.0, 0.0, 0.0, 0.0);
+
+        UInt  boneOffset = Skeleton.SkinningInfo.BONE_PALETTE_OFFSET;
+        UInt  maxIdx     = Max(Skeleton.SkinningInfo.BONE_COUNT, 1u) - 1u;
+        UInt4 boneIdx    = input.VERTEX_BONE_INDICES;
+
+        Mat4 bone0 = Skeleton.BonePalette[boneOffset + Min(boneIdx.x, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone1 = Skeleton.BonePalette[boneOffset + Min(boneIdx.y, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone2 = Skeleton.BonePalette[boneOffset + Min(boneIdx.z, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone3 = Skeleton.BonePalette[boneOffset + Min(boneIdx.w, maxIdx)].GLOBAL_BONE_MATRIX;
+
+        Vec4 pos4            = Vec4(input.VERTEX_POSITION, 1.0);
+        Vec3 skinnedLocalPos = Mul(bone0, pos4).xyz * w.x +
+                               Mul(bone1, pos4).xyz * w.y +
+                               Mul(bone2, pos4).xyz * w.z +
+                               Mul(bone3, pos4).xyz * w.w;
+
+        Vec4 nrm4               = Vec4(input.VERTEX_NORMAL, 0.0);
+        Vec3 skinnedLocalNormal = Normalize(Mul(bone0, nrm4).xyz * w.x +
+                                            Mul(bone1, nrm4).xyz * w.y +
+                                            Mul(bone2, nrm4).xyz * w.z +
+                                            Mul(bone3, nrm4).xyz * w.w);
+
+        Vec4 tan4                = Vec4(input.VERTEX_TANGENT, 0.0);
+        Vec3 skinnedLocalTangent = Normalize(Mul(bone0, tan4).xyz * w.x +
+                                             Mul(bone1, tan4).xyz * w.y +
+                                             Mul(bone2, tan4).xyz * w.z +
+                                             Mul(bone3, tan4).xyz * w.w);
+
+        Vec4 bit4                  = Vec4(input.VERTEX_BITANGENT, 0.0);
+        Vec3 skinnedLocalBitangent = Normalize(Mul(bone0, bit4).xyz * w.x +
+                                               Mul(bone1, bit4).xyz * w.y +
+                                               Mul(bone2, bit4).xyz * w.z +
+                                               Mul(bone3, bit4).xyz * w.w);
+
+        Vec4 worldPos = Mul(Transforms.Matrices.WORLD_MATRIX, Vec4(skinnedLocalPos, 1.0));
+        Vec3 worldNrm = Normalize(Mul(Transforms.Matrices.NORMAL_MATRIX, skinnedLocalNormal));
+        Vec3 rawTan   = Mul(Transforms.Matrices.WORLD_MATRIX, Vec4(skinnedLocalTangent, 0.0)).xyz;
+        Vec3 worldTan = Normalize(rawTan - worldNrm * Dot(rawTan, worldNrm));
+        Vec3 worldBit = Normalize(Mul(Transforms.Matrices.WORLD_MATRIX, Vec4(skinnedLocalBitangent, 0.0)).xyz);
+
+        o.WORLD_POSITION = worldPos.xyz;
+        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, worldPos);
+        o.WORLD_NORMAL   = worldNrm;
+        o.TANGENT        = worldTan;
+        o.BITANGENT      = worldBit;
+        o.UV0            = input.VERTEX_UV0;
+        o.UV1            = input.VERTEX_UV1;
+        o.COLOR          = input.VERTEX_COLOR;
+
+        return o;
+    }
+}

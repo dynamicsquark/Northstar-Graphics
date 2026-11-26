@@ -1,0 +1,65 @@
+// =====================================================================
+//  StandardLitNVGShadowVS.nsl
+//  Northstar Graphics — Attribute-Less NVG Vertex-Pulling NVS Shadow Shader
+//
+//  Zero-decode Path-A Virtual Geometry shadow caster vertex shader:
+//    - Declares only SV_VertexID / SV_InstanceID for direct NVG shadow pulling.
+//    - Projects compressed cluster corners directly into NVS physical page slices.
+// =====================================================================
+
+STAGE VERTEX
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl")
+}
+
+INPUT_LAYOUT
+{
+    Get(VERTEX_ID)
+    Get(INSTANCE_ID)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(CLIP_POSITION)
+    Add(UV0)
+    Add(RENDER_TARGET_ARRAY_INDEX)
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+
+        UInt objSlot     = 0u;
+        UInt pageViewIdx = 0u;
+        Vec3 localPos    = Vec3(0.0, 0.0, 0.0);
+        Vec3 localNrm    = Vec3(0.0, 1.0, 0.0);
+
+        if (!NVGDecodeClusterShadowDirect(
+                input.INSTANCE_ID,
+                input.VERTEX_ID,
+                objSlot,
+                pageViewIdx,
+                localPos,
+                localNrm))
+        {
+            o.CLIP_POSITION             = NVGDegenerateClipPosition();
+            o.UV0                       = Vec2(0.0, 0.0);
+            o.RENDER_TARGET_ARRAY_INDEX = 0u;
+            return o;
+        }
+
+        Mat4              world    = NVGGetObjectWorldMatrix(objSlot);
+        Vec3              worldPos = NVGTransformPosition(world, localPos);
+        Vec3              worldNrm = NVGTransformNormal(world, localNrm);
+        NVGShadowPageView pageView = NVGLoadShadowPageView(pageViewIdx);
+
+        o.CLIP_POSITION             = NVGProjectToShadowPage(pageView, worldPos, worldNrm);
+        o.UV0                       = Vec2(0.0, 0.0);
+        o.RENDER_TARGET_ARRAY_INDEX = pageView.physicalPageSlice;
+        return o;
+    }
+}

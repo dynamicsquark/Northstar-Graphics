@@ -1,0 +1,318 @@
+// =====================================================================
+//  GeometryCluster.nsl — Northstar NSL Standard Library: Virtual Geometry Clusters
+//
+//  Provides engine-owned Northstar Virtual Geometry (NVG) structured buffer
+//  bindings, availability guards, unified cluster/object identity helpers,
+//  and cluster header / index-stream decode helpers.
+//  Consolidated under PROPERTY NVGResources to share a single logical block.
+// =====================================================================
+
+PROPERTY NVGResources
+{
+    Buffer Params
+    {
+        Get(NVG_DRAW_BUCKET_ID)
+        Get(NVG_VISIBLE_CLUSTER_COUNT)
+        Get(NVG_VISIBLE_CLUSTER_OFFSET)
+        Get(GPU_SCENE_OBJECT_SLOT)
+        Get(NVG_DEBUG_MODE)
+        Get(NVG_MAX_SCREEN_ERROR_PX)
+        Get(NVG_PHYSICAL_POOL_CAPACITY)
+        Get(NVG_PAGE_WORD_COUNT)
+    }
+
+    StructuredBuffer PagePool
+    {
+        Get(NVG_PAGE_POOL_WORD)
+    }
+
+    StructuredBuffer BucketRanges
+    {
+        Get(NVG_BUCKET_FIRST_CLUSTER)
+        Get(NVG_BUCKET_CLUSTER_COUNT)
+        Get(NVG_BUCKET_MAX_TRIANGLES)
+        Get(NVG_BUCKET_FLAGS)
+    }
+
+    StructuredBuffer VisibleClusters
+    {
+        Get(NVG_VIS_OBJECT_SLOT)
+        Get(NVG_VIS_CLUSTER_ID)
+        Get(NVG_VIS_PHYSICAL_PAGE_INDEX)
+        Get(NVG_VIS_CLUSTER_WORD_OFFSET)
+        Get(NVG_VIS_VIRTUAL_PAGE_ID)
+        Get(NVG_VIS_LOD_AND_FLAGS)
+        Get(NVG_VIS_GEOMETRIC_ERROR)
+        Get(NVG_VIS_MATERIAL_ID)
+        Get(NVG_VIS_BONE_OFFSET)
+        Get(NVG_VIS_BONE_COUNT)
+        Get(NVG_VIS_DRAW_BUCKET_INDEX)
+        Get(NVG_VIS_VIEW_DEPTH_KEY)
+    }
+}
+
+LIBRARY
+{
+    struct NVGVisibleCluster
+    {
+        UInt  objectSlot;
+        UInt  clusterId;
+        UInt  physicalPageIndex;
+        UInt  clusterWordOffset;
+        UInt  virtualPageId;
+        UInt  lodLevel;
+        UInt  flags;
+        UInt  shadowPageViewIndex;
+        Float geometricError;
+        UInt  materialId;
+        UInt  bonePaletteOffset;
+        UInt  boneCount;
+        UInt  drawBucketIndex;
+        Float viewDepthKey;
+    };
+
+    struct NVGClusterHeader
+    {
+        Vec3 posOrigin;
+        Vec3 posExtent;
+        Vec2 uv0Origin;
+        Vec2 uv0Extent;
+        Vec2 uv1Origin;
+        Vec2 uv1Extent;
+        UInt vertexCount;
+        UInt triangleCount;
+        UInt lodLevel;
+        UInt attrFlags;
+        UInt vertexWordOffset;
+        UInt indexWordOffset;
+        UInt vertexStrideWords;
+        UInt pageBaseWord;
+    };
+
+    UInt NVGInvalidIndex()
+    {
+        return 4294967295u;
+    }
+
+    UInt NVGGetDrawBucketId()
+    {
+        return NVGResources.Params.NVG_DRAW_BUCKET_ID;
+    }
+
+    UInt NVGGetVisibleClusterOffset()
+    {
+        return NVGResources.Params.NVG_VISIBLE_CLUSTER_OFFSET;
+    }
+
+    UInt NVGGetCurrentObjectSlot()
+    {
+        return NVGResources.Params.GPU_SCENE_OBJECT_SLOT;
+    }
+
+    UInt NVGGetDebugMode()
+    {
+        return NVGResources.Params.NVG_DEBUG_MODE;
+    }
+
+    // Returns true when NVG buffers are live and the current draw has a valid NVG bucket.
+    Bool NVGIsAvailable()
+    {
+        UInt invalidIdx = NVGInvalidIndex();
+        UInt bucketId   = NVGResources.Params.NVG_DRAW_BUCKET_ID;
+        UInt baseOffset = NVGResources.Params.NVG_VISIBLE_CLUSTER_OFFSET;
+        if (bucketId == invalidIdx || baseOffset == invalidIdx)
+        {
+            return false;
+        }
+        UInt pageCount   = 0u;
+        UInt pageStride  = 0u;
+        UInt bucketCount = 0u;
+        UInt bucketStr   = 0u;
+        UInt visCount    = 0u;
+        UInt visStride   = 0u;
+        GetDimensions(NVGResources.PagePool, pageCount, pageStride);
+        GetDimensions(NVGResources.BucketRanges, bucketCount, bucketStr);
+        GetDimensions(NVGResources.VisibleClusters, visCount, visStride);
+        return (pageCount > 0u) && (bucketId < bucketCount) && (visCount > 0u);
+    }
+
+    // Unified visible-cluster index resolution across both Multi-Cluster Vertex Pulling
+    // (offset = 0, instanceId = 0..N-1) and Per-Cluster GPU-Decoded IA (offset = tid - first, instanceId = 0).
+    // Returns NVGInvalidIndex() (0xFFFFFFFFu) when unavailable (never confused with valid cluster 0).
+    UInt NVGGetVisibleClusterIndex(UInt instanceId)
+    {
+        UInt invalidIdx = NVGInvalidIndex();
+        UInt bucketId   = NVGResources.Params.NVG_DRAW_BUCKET_ID;
+        UInt baseOffset = NVGResources.Params.NVG_VISIBLE_CLUSTER_OFFSET;
+        if (bucketId == invalidIdx || baseOffset == invalidIdx)
+        {
+            return invalidIdx;
+        }
+
+        UInt bucketCount = 0u;
+        UInt bucketStr   = 0u;
+        UInt visBufCount = 0u;
+        UInt visStride   = 0u;
+        GetDimensions(NVGResources.BucketRanges, bucketCount, bucketStr);
+        GetDimensions(NVGResources.VisibleClusters, visBufCount, visStride);
+        if (bucketId >= bucketCount || visBufCount == 0u)
+        {
+            return invalidIdx;
+        }
+
+        UInt firstIdx   = NVGResources.BucketRanges[bucketId].NVG_BUCKET_FIRST_CLUSTER;
+        UInt bucketVis  = NVGResources.BucketRanges[bucketId].NVG_BUCKET_CLUSTER_COUNT;
+        UInt localIdx   = baseOffset + instanceId;
+        if (localIdx >= bucketVis)
+        {
+            return invalidIdx;
+        }
+        UInt visIdx = firstIdx + localIdx;
+        if (visIdx >= visBufCount)
+        {
+            return invalidIdx;
+        }
+        return visIdx;
+    }
+
+    // Hot-path visible-cluster index lookup for engine-dispatched NVG vertex-pull draws.
+    // Avoids 2x per-vertex GetDimensions resource queries once bucketId/baseOffset are validated non-sentinel.
+    UInt NVGGetVisibleClusterIndexFast(UInt instanceId)
+    {
+        UInt invalidIdx = NVGInvalidIndex();
+        UInt bucketId   = NVGResources.Params.NVG_DRAW_BUCKET_ID;
+        UInt baseOffset = NVGResources.Params.NVG_VISIBLE_CLUSTER_OFFSET;
+        if (bucketId == invalidIdx || baseOffset == invalidIdx)
+        {
+            return invalidIdx;
+        }
+        UInt firstIdx  = NVGResources.BucketRanges[bucketId].NVG_BUCKET_FIRST_CLUSTER;
+        UInt bucketVis = NVGResources.BucketRanges[bucketId].NVG_BUCKET_CLUSTER_COUNT;
+        UInt localIdx  = baseOffset + instanceId;
+        if (localIdx >= bucketVis)
+        {
+            return invalidIdx;
+        }
+        return firstIdx + localIdx;
+    }
+
+    Bool NVGHasActiveCluster(UInt instanceId)
+    {
+        return NVGGetVisibleClusterIndex(instanceId) != NVGInvalidIndex();
+    }
+
+    NVGVisibleCluster NVGLoadVisibleCluster(UInt instanceId)
+    {
+        UInt invalidIdx = NVGInvalidIndex();
+        UInt visIdx     = NVGGetVisibleClusterIndex(instanceId);
+
+        NVGVisibleCluster vc;
+        if (visIdx == invalidIdx)
+        {
+            vc.objectSlot          = invalidIdx;
+            vc.clusterId           = invalidIdx;
+            vc.physicalPageIndex   = invalidIdx;
+            vc.clusterWordOffset   = 0u;
+            vc.virtualPageId       = invalidIdx;
+            vc.lodLevel            = 0u;
+            vc.flags               = 0u;
+            vc.shadowPageViewIndex = 0u;
+            vc.geometricError      = 0.0;
+            vc.materialId          = 0u;
+            vc.bonePaletteOffset   = 0u;
+            vc.boneCount           = 0u;
+            vc.drawBucketIndex     = invalidIdx;
+            vc.viewDepthKey        = 0.0;
+            return vc;
+        }
+
+        vc.objectSlot          = NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
+        vc.clusterId           = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_ID;
+        vc.physicalPageIndex   = NVGResources.VisibleClusters[visIdx].NVG_VIS_PHYSICAL_PAGE_INDEX;
+        vc.clusterWordOffset   = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_WORD_OFFSET;
+        vc.virtualPageId       = NVGResources.VisibleClusters[visIdx].NVG_VIS_VIRTUAL_PAGE_ID;
+
+        UInt lodAndFlags       = NVGResources.VisibleClusters[visIdx].NVG_VIS_LOD_AND_FLAGS;
+        vc.lodLevel            = lodAndFlags & 255u;
+        vc.flags               = (lodAndFlags >> 8u) & 255u;
+        vc.shadowPageViewIndex = (lodAndFlags >> 16u) & 65535u;
+
+        vc.geometricError      = NVGResources.VisibleClusters[visIdx].NVG_VIS_GEOMETRIC_ERROR;
+        vc.materialId          = NVGResources.VisibleClusters[visIdx].NVG_VIS_MATERIAL_ID;
+        vc.bonePaletteOffset   = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_OFFSET;
+        vc.boneCount           = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_COUNT;
+        vc.drawBucketIndex     = NVGResources.VisibleClusters[visIdx].NVG_VIS_DRAW_BUCKET_INDEX;
+        vc.viewDepthKey        = NVGResources.VisibleClusters[visIdx].NVG_VIS_VIEW_DEPTH_KEY;
+        return vc;
+    }
+
+    // Resolves the current GPUScene object slot uniformly across VIRTUALIZED and STANDARD draws.
+    UInt NVGResolveObjectSlot(UInt instanceId)
+    {
+        UInt visIdx = NVGGetVisibleClusterIndex(instanceId);
+        if (visIdx != NVGInvalidIndex())
+        {
+            return NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
+        }
+        return NVGResources.Params.GPU_SCENE_OBJECT_SLOT;
+    }
+
+    UInt NVGReadPageWord(UInt wordAddr)
+    {
+        return NVGResources.PagePool[wordAddr].NVG_PAGE_POOL_WORD;
+    }
+
+    NVGClusterHeader NVGDecodeClusterHeader(NVGVisibleCluster vc)
+    {
+        UInt wordsPerPage = NVGResources.Params.NVG_PAGE_WORD_COUNT;
+        UInt baseWord     = vc.physicalPageIndex * wordsPerPage + vc.clusterWordOffset;
+
+        NVGClusterHeader h;
+        h.pageBaseWord = baseWord;
+        h.posOrigin = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 0u)),
+            AsFloat(NVGReadPageWord(baseWord + 1u)),
+            AsFloat(NVGReadPageWord(baseWord + 2u)));
+        h.posExtent = Vec3(
+            AsFloat(NVGReadPageWord(baseWord + 3u)),
+            AsFloat(NVGReadPageWord(baseWord + 4u)),
+            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        h.uv0Origin = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 6u)),
+            AsFloat(NVGReadPageWord(baseWord + 7u)));
+        h.uv0Extent = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 8u)),
+            AsFloat(NVGReadPageWord(baseWord + 9u)));
+        h.uv1Origin = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 10u)),
+            AsFloat(NVGReadPageWord(baseWord + 11u)));
+        h.uv1Extent = Vec2(
+            AsFloat(NVGReadPageWord(baseWord + 12u)),
+            AsFloat(NVGReadPageWord(baseWord + 13u)));
+
+        UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        h.vertexCount       = countsAndFlags & 255u;
+        h.triangleCount     = (countsAndFlags >> 8u) & 255u;
+        h.lodLevel          = (countsAndFlags >> 16u) & 255u;
+        h.attrFlags         = (countsAndFlags >> 24u) & 255u;
+
+        UInt offsets        = NVGReadPageWord(baseWord + 15u);
+        h.vertexWordOffset  = offsets & 65535u;
+        h.indexWordOffset   = (offsets >> 16u) & 65535u;
+        h.vertexStrideWords = ((h.attrFlags & 4u) != 0u) ? 11u : 7u;
+        return h;
+    }
+
+    Bool NVGIsVertexActiveInCluster(NVGClusterHeader header, UInt vertexId)
+    {
+        return vertexId < (header.triangleCount * 3u);
+    }
+
+    UInt NVGLoadClusterVertexIndex(NVGClusterHeader header, UInt vertexId)
+    {
+        UInt triIdx    = vertexId / 3u;
+        UInt cornerIdx = vertexId - triIdx * 3u;
+        UInt packedTri = NVGReadPageWord(header.pageBaseWord + header.indexWordOffset + triIdx);
+        return (packedTri >> (cornerIdx * 8u)) & 255u;
+    }
+}

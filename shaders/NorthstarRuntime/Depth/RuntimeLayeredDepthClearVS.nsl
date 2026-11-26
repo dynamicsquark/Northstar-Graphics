@@ -1,0 +1,66 @@
+// =====================================================================
+//  RuntimeLayeredDepthClearVS.nsl — NorthstarRuntime Internal Depth VS
+//  GPU-driven fullscreen triangle vertex shader for selective layered
+//  depth clear via SV_InstanceID -> DirtySlices[SV_InstanceID] ->
+//  SV_RenderTargetArrayIndex.
+// =====================================================================
+
+STAGE VERTEX
+
+PROPERTY LayeredClearParams {
+    Buffer Config {
+        Add(clearDepth)      : Float = 1.0
+        Add(maxArrayLayers)  : UInt  = 256
+        Add(maxDirtySlices)  : UInt  = 256
+    }
+    StructuredBuffer DirtySlices {
+        Add(sliceIndex) : UInt
+    }
+}
+
+INPUT_LAYOUT {
+    Get(VERTEX_ID)
+    Get(INSTANCE_ID)
+}
+
+OUTPUT_LAYOUT {
+    Add(CLIP_POSITION)
+    Add(RENDER_TARGET_ARRAY_INDEX)
+}
+
+SHADER {
+    STAGE_OUTPUT Main(STAGE_INPUT input) {
+        STAGE_OUTPUT o;
+        UInt vid = input.VERTEX_ID;
+        UInt iid = input.INSTANCE_ID;
+
+        Float x = -1.0;
+        Float y = -1.0;
+        if (vid == 1u) {
+            x = -1.0;
+            y = 3.0;
+        } else if (vid == 2u) {
+            x = 3.0;
+            y = -1.0;
+        }
+
+        UInt maxLayers = LayeredClearParams.Config.maxArrayLayers;
+        UInt maxDirty  = LayeredClearParams.Config.maxDirtySlices;
+        Float z        = LayeredClearParams.Config.clearDepth;
+
+        if (iid < maxDirty) {
+            UInt sliceIdx = LayeredClearParams.DirtySlices[iid].sliceIndex;
+            if (sliceIdx < maxLayers) {
+                o.CLIP_POSITION = Vec4(x, y, z, 1.0);
+                o.RENDER_TARGET_ARRAY_INDEX = sliceIdx;
+                return o;
+            }
+        }
+
+        // Defense-in-depth: emit degenerate off-screen vertex if out-of-range
+        o.CLIP_POSITION = Vec4(-10.0, -10.0, 2.0, 1.0);
+        o.RENDER_TARGET_ARRAY_INDEX = 0u;
+        return o;
+    }
+}
+

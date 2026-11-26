@@ -1,0 +1,110 @@
+// =====================================================================
+//  RuntimeReflectionMaterialize.nsl — NorthstarRuntime Internal Compute
+//  Reflection-Driven GPU Resource Materializer (CST-Compliant Gather/Pack)
+//
+//  Materializes reflection-compatible StructuredBuffer views directly on GPU
+//  from physically-backed engine GPU buffers (zero CPU readback, zero stalls)
+//  when a shader requests a valid field subset, reordered layout, or CST
+//  hybrid Get() + Add() structure ([0..N-1] engine, [N..N+M-1] user).
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY ReflectionMaterializeParams {
+    Buffer Config {
+        Add(srcStrideWords)     : UInt = 1
+        Add(dstStrideWords)     : UInt = 1
+        Add(engineElementCount) : UInt = 0
+        Add(userElementCount)   : UInt = 0
+        Add(copySpanCount)      : UInt = 0
+        Add(srcBaseElement)     : UInt = 0
+        Add(srcTotalWords)      : UInt = 0
+        Add(userTotalWords)     : UInt = 0
+        Add(dispatchGroupsX)    : UInt = 1
+    }
+    StructuredBuffer InSrcWords {
+        Add(word) : UInt
+    }
+    StructuredBuffer InCopySpans {
+        Add(srcWordOffset) : UInt
+        Add(dstWordOffset) : UInt
+        Add(wordCount)     : UInt
+        Add(flags)         : UInt
+    }
+    StructuredBuffer InUserWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutDstWords {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt groupsX      = ReflectionMaterializeParams.Config.dispatchGroupsX;
+        UInt rowStride    = (groupsX > 0u) ? (groupsX * 64u) : 64u;
+        UInt elemIdx      = dtid.y * rowStride + dtid.x;
+        UInt engCount     = ReflectionMaterializeParams.Config.engineElementCount;
+        UInt usrCount     = ReflectionMaterializeParams.Config.userElementCount;
+        UInt totalCount   = engCount + usrCount;
+        if (elemIdx >= totalCount) {
+            return;
+        }
+
+        UInt srcStrideW   = ReflectionMaterializeParams.Config.srcStrideWords;
+        UInt dstStrideW   = ReflectionMaterializeParams.Config.dstStrideWords;
+        UInt spanCount    = ReflectionMaterializeParams.Config.copySpanCount;
+        UInt srcTotalW    = ReflectionMaterializeParams.Config.srcTotalWords;
+        UInt usrTotalW    = ReflectionMaterializeParams.Config.userTotalWords;
+        UInt dstBase      = elemIdx * dstStrideW;
+
+        if (elemIdx < engCount) {
+            // [0 .. N-1]: Engine-owned range. Zero entire destination element first
+            // so any CST user Add() fields inside engine records are deterministically 0.
+            for (UInt z = 0u; z < dstStrideW; z = z + 1u) {
+                ReflectionMaterializeParams.OutDstWords[dstBase + z].word = 0u;
+            }
+
+            UInt srcElemIdx = ReflectionMaterializeParams.Config.srcBaseElement + elemIdx;
+            UInt srcBase    = srcElemIdx * srcStrideW;
+
+            for (UInt s = 0u; s < spanCount; s = s + 1u) {
+                UInt srcOff = ReflectionMaterializeParams.InCopySpans[s].srcWordOffset;
+                UInt dstOff = ReflectionMaterializeParams.InCopySpans[s].dstWordOffset;
+                UInt wCnt   = ReflectionMaterializeParams.InCopySpans[s].wordCount;
+                UInt flags  = ReflectionMaterializeParams.InCopySpans[s].flags;
+                if (flags == 0u) {
+                    for (UInt w = 0u; w < wCnt; w = w + 1u) {
+                        UInt sIdx = srcBase + srcOff + w;
+                        UInt dIdx = dstBase + dstOff + w;
+                        if (sIdx < srcTotalW && (dstOff + w) < dstStrideW) {
+                            ReflectionMaterializeParams.OutDstWords[dIdx].word =
+                                ReflectionMaterializeParams.InSrcWords[sIdx].word;
+                        }
+                    }
+                }
+            }
+        } else {
+            // [N .. N+M-1]: User-owned CST range. Copy user payload verbatim, then
+            // zero all engine Get() field spans so user data cannot spoof engine fields.
+            UInt uIdx  = elemIdx - engCount;
+            UInt uBase = uIdx * dstStrideW;
+            for (UInt w = 0u; w < dstStrideW; w = w + 1u) {
+                UInt sIdx = uBase + w;
+                UInt val  = (sIdx < usrTotalW) ? ReflectionMaterializeParams.InUserWords[sIdx].word : 0u;
+                ReflectionMaterializeParams.OutDstWords[dstBase + w].word = val;
+            }
+
+            for (UInt s = 0u; s < spanCount; s = s + 1u) {
+                UInt dstOff = ReflectionMaterializeParams.InCopySpans[s].dstWordOffset;
+                UInt wCnt   = ReflectionMaterializeParams.InCopySpans[s].wordCount;
+                for (UInt w = 0u; w < wCnt; w = w + 1u) {
+                    if ((dstOff + w) < dstStrideW) {
+                        ReflectionMaterializeParams.OutDstWords[dstBase + dstOff + w].word = 0u;
+                    }
+                }
+            }
+        }
+    }
+}

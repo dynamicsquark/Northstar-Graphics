@@ -1,0 +1,658 @@
+// =====================================================================
+//  RuntimeNVSPageProjection.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Shadows (NVS)
+//  Orthographic Clipmap & Perspective Spot/Point Per-Page Projections
+//
+//  Responsibilities:
+//    Mode 0 (RESET):
+//      Clears OutProjectionTelemetry[0u] (16 x UInt = 64 bytes) on the GPU.
+//    Mode 1 (BUILD_PAGE_PROJECTIONS):
+//      Evaluates all physical shadow pool slots [0 .. physicalPoolCapacity-1]:
+//      - Validates physical <-> virtual page linkage and shadow view state.
+//      - Computes toroidal -> absolute world/tangent page coordinates.
+//      - Builds exact per-page Orthographic (Directional) or Off-Center
+//        Perspective (Spot cone & Point 6-face cube) LightView, PageProj,
+//        and World -> PageClip matrices (336-byte NVSPageRenderData ABI),
+//        plus tight 3D world-space shadow volume AABB and bounding sphere.
+//      - Distinguishes newly cleared pages needing caster rasterization
+//        (CLEARED_NOT_RENDERED -> NEEDS_CASTER_RENDER, compacted into OutActiveRenderPageList)
+//        from cached valid shadow pages (RESIDENT_VALID -> CACHED_VALID_SHADOW).
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVSPageProjectionParams {
+    Buffer Config {
+        Add(dispatchMode)         : UInt = 0
+        Add(currentFrame)         : UInt = 1
+        Add(physicalPoolCapacity) : UInt = 256
+        Add(totalVirtualPages)    : UInt = 16384
+        Add(clipmapTableSize)     : UInt = 16
+        Add(maxLights)            : UInt = 4
+        Add(clipmapLevels)        : UInt = 4
+        Add(depthCompareMode)     : UInt = 0
+    }
+    StructuredBuffer InClipmapLevels {
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(pagesPerAxis)         : UInt
+        Add(flags)                : UInt
+        Add(snappedOriginPageX)   : Int
+        Add(snappedOriginPageY)   : Int
+        Add(worldExtent)          : Float
+        Add(pageWorldSize)        : Float
+        Add(texelWorldSize)       : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(cameraLightZ)         : Float
+        Add(lightRightAndCenterX) : Vec4
+        Add(lightUpAndCenterY)    : Vec4
+        Add(lightDirAndExtrusion) : Vec4
+        Add(transitionAndPadding) : Vec4
+        Add(worldToLightViewCol0) : Vec4
+        Add(worldToLightViewCol1) : Vec4
+        Add(worldToLightViewCol2) : Vec4
+        Add(worldToLightViewCol3) : Vec4
+        Add(lightViewToWorldCol0) : Vec4
+        Add(lightViewToWorldCol1) : Vec4
+        Add(lightViewToWorldCol2) : Vec4
+        Add(lightViewToWorldCol3) : Vec4
+    }
+    StructuredBuffer InVirtualPageTable {
+        Add(stateAndFlags)        : UInt
+        Add(physicalPageIndex)    : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(lastTouchedFrame)     : UInt
+    }
+    StructuredBuffer InPhysicalPageTable {
+        Add(stateAndFlags)         : UInt
+        Add(ownerVirtualFlatIndex) : UInt
+        Add(ownerVirtualAddress)   : UInt
+        Add(physicalGeneration)    : UInt
+        Add(lastUsedFrame)         : UInt
+        Add(allocatedFrame)        : UInt
+        Add(minEvictableFrame)     : UInt
+        Add(metaAux)               : UInt
+    }
+    RWStructuredBuffer OutPageRenderData {
+        Add(physicalPageIndex)    : UInt
+        Add(virtualFlatIndex)     : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(renderFlags)          : UInt
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(virtualPageX)         : UInt
+        Add(virtualPageY)         : UInt
+        Add(worldPageX)           : Int
+        Add(worldPageY)           : Int
+        Add(physicalGeneration)   : UInt
+        Add(lastUsedFrame)        : UInt
+        Add(lightMinX)            : Float
+        Add(lightMinY)            : Float
+        Add(lightMaxX)            : Float
+        Add(lightMaxY)            : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(worldCenterX)         : Float
+        Add(worldCenterY)         : Float
+        Add(worldCenterZ)         : Float
+        Add(pageWorldSize)        : Float
+        Add(worldBoundsMinX)      : Float
+        Add(worldBoundsMinY)      : Float
+        Add(worldBoundsMinZ)      : Float
+        Add(texelWorldSize)       : Float
+        Add(worldBoundsMaxX)      : Float
+        Add(worldBoundsMaxY)      : Float
+        Add(worldBoundsMaxZ)      : Float
+        Add(shadowVolumeRadius)   : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(viewportWidth)        : UInt
+        Add(viewportHeight)       : UInt
+        Add(worldToPageClipCol0)  : Vec4
+        Add(worldToPageClipCol1)  : Vec4
+        Add(worldToPageClipCol2)  : Vec4
+        Add(worldToPageClipCol3)  : Vec4
+        Add(lightViewCol0)        : Vec4
+        Add(lightViewCol1)        : Vec4
+        Add(lightViewCol2)        : Vec4
+        Add(lightViewCol3)        : Vec4
+        Add(pageProjCol0)         : Vec4
+        Add(pageProjCol1)         : Vec4
+        Add(pageProjCol2)         : Vec4
+        Add(pageProjCol3)         : Vec4
+    }
+    RWStructuredBuffer OutActiveRenderPageList {
+        Add(physicalPageIndex) : UInt
+    }
+    RWStructuredBuffer OutProjectionTelemetry {
+        Add(examinedPhysicalSlots)        : UInt
+        Add(validResidentPageCount)       : UInt
+        Add(activeRenderPageCount)        : UInt
+        Add(cachedValidPageCount)         : UInt
+        Add(allocatedNotClearedCount)     : UInt
+        Add(freePhysicalSlotCount)        : UInt
+        Add(invalidMetadataRejectedCount) : UInt
+        Add(multiLightActivePageCount)    : UInt
+        Add(level0ActiveRenderCount)      : UInt
+        Add(level1ActiveRenderCount)      : UInt
+        Add(level2ActiveRenderCount)      : UInt
+        Add(level3ActiveRenderCount)      : UInt
+        Add(level0ResidentCount)          : UInt
+        Add(level1ResidentCount)          : UInt
+        Add(level2ResidentCount)          : UInt
+        Add(level3ResidentCount)          : UInt
+    }
+}
+
+SHADER {
+    void WriteClearedPageRenderData(UInt slotIdx, UInt flagsVal) {
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].physicalPageIndex    = slotIdx;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].virtualFlatIndex     = 0xFFFFFFFFu;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].virtualAddressPacked = 0u;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].renderFlags          = flagsVal;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightId              = 0u;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].clipmapLevel         = 0u;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].virtualPageX         = 0u;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].virtualPageY         = 0u;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldPageX           = 0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldPageY           = 0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].physicalGeneration   = 0u;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lastUsedFrame        = 0u;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightMinX            = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightMinY            = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightMaxX            = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightMaxY            = 0.0;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].receiverMinZ         = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].receiverMaxZ         = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].casterMinZ           = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].casterMaxZ           = 0.0;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldCenterX         = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldCenterY         = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldCenterZ         = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].pageWorldSize        = 0.0;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldBoundsMinX      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldBoundsMinY      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldBoundsMinZ      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].texelWorldSize       = 0.0;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldBoundsMaxX      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldBoundsMaxY      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldBoundsMaxZ      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].shadowVolumeRadius   = 0.0;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].depthBiasNdc         = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].normalBiasWorld      = 0.0;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].viewportWidth        = 128u;
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].viewportHeight       = 128u;
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldToPageClipCol0  = Vec4(1.0, 0.0, 0.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldToPageClipCol1  = Vec4(0.0, 1.0, 0.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldToPageClipCol2  = Vec4(0.0, 0.0, 1.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].worldToPageClipCol3  = Vec4(0.0, 0.0, 0.0, 1.0);
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightViewCol0        = Vec4(1.0, 0.0, 0.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightViewCol1        = Vec4(0.0, 1.0, 0.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightViewCol2        = Vec4(0.0, 0.0, 1.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].lightViewCol3        = Vec4(0.0, 0.0, 0.0, 1.0);
+
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].pageProjCol0         = Vec4(1.0, 0.0, 0.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].pageProjCol1         = Vec4(0.0, 1.0, 0.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].pageProjCol2         = Vec4(0.0, 0.0, 1.0, 0.0);
+        NVSPageProjectionParams.OutPageRenderData[slotIdx].pageProjCol3         = Vec4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    Int FloorDivPow2(Int value, UInt shift) {
+        Int res = value;
+        if (shift > 0u) {
+            if (value >= 0) {
+                res = Int(UInt(value) >> shift);
+            } else {
+                res = -Int((UInt(-1 - value) >> shift) + 1u);
+            }
+        }
+        return res;
+    }
+
+    Int OrthoSnapOriginAtMip(Int originMip0, UInt mip) {
+        Int roundBias = (mip > 0u) ? Int(1u << (mip - 1u)) : 0;
+        return FloorDivPow2(originMip0 + roundBias, mip);
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt tid          = dtid.x;
+        UInt dispatchMode = NVSPageProjectionParams.Config.dispatchMode;
+        UInt prev         = 0u;
+
+        // =================================================================
+        //  MODE 0: Reset Telemetry Counters (64 Bytes)
+        // =================================================================
+        if (dispatchMode == 0u) {
+            if (gid.x > 0u || gid.y > 0u || gid.z > 0u) {
+                return;
+            }
+            if (gtid.x == 0u) {
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].examinedPhysicalSlots        = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].validResidentPageCount       = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].activeRenderPageCount        = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].cachedValidPageCount         = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].allocatedNotClearedCount     = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].freePhysicalSlotCount        = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].multiLightActivePageCount    = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level0ActiveRenderCount      = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level1ActiveRenderCount      = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level2ActiveRenderCount      = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level3ActiveRenderCount      = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level0ResidentCount          = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level1ResidentCount          = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level2ResidentCount          = 0u;
+                NVSPageProjectionParams.OutProjectionTelemetry[0u].level3ResidentCount          = 0u;
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1: Build Per-Page Orthographic & Perspective Projections
+        // =================================================================
+        if (dispatchMode == 1u) {
+            UInt poolCap = NVSPageProjectionParams.Config.physicalPoolCapacity;
+            if (tid >= poolCap) {
+                return;
+            }
+
+            InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].examinedPhysicalSlots, 1u, prev);
+
+            UInt physStateFlags = NVSPageProjectionParams.InPhysicalPageTable[tid].stateAndFlags;
+            UInt physState      = physStateFlags & 15u;
+
+            if (physState == 0u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].freePhysicalSlotCount, 1u, prev);
+                WriteClearedPageRenderData(tid, 0u);
+                return;
+            }
+
+            if (physState == 1u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].allocatedNotClearedCount, 1u, prev);
+                WriteClearedPageRenderData(tid, 16u);
+                return;
+            }
+
+            if (physState != 2u && physState != 3u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                WriteClearedPageRenderData(tid, 0u);
+                return;
+            }
+
+            UInt vFlat     = NVSPageProjectionParams.InPhysicalPageTable[tid].ownerVirtualFlatIndex;
+            UInt totalVirt = NVSPageProjectionParams.Config.totalVirtualPages;
+            if (vFlat >= totalVirt) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                WriteClearedPageRenderData(tid, 0u);
+                return;
+            }
+
+            UInt virtStateFlags = NVSPageProjectionParams.InVirtualPageTable[vFlat].stateAndFlags;
+            UInt virtState      = virtStateFlags & 15u;
+            UInt virtPhysIdx    = NVSPageProjectionParams.InVirtualPageTable[vFlat].physicalPageIndex;
+            UInt virtPacked     = NVSPageProjectionParams.InVirtualPageTable[vFlat].virtualAddressPacked;
+            UInt packed         = NVSPageProjectionParams.InPhysicalPageTable[tid].ownerVirtualAddress;
+
+            if ((virtState != 2u && virtState != 3u) || (virtPhysIdx != tid) || (virtPacked != packed)) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                WriteClearedPageRenderData(tid, 0u);
+                return;
+            }
+
+            Bool isExtended = ((physStateFlags & 128u) != 0u);
+            UInt vx         = packed & 255u;
+            UInt vy         = (packed >> 8u) & 255u;
+            UInt mip        = 0u;
+            UInt lvl        = 0u;
+            UInt lightId    = 0u;
+            UInt gen        = 0u;
+            UInt tableIdx   = 0u;
+
+            UInt maxLights     = NVSPageProjectionParams.Config.maxLights;
+            UInt clipmapLevels = NVSPageProjectionParams.Config.clipmapLevels;
+            UInt tableSize     = NVSPageProjectionParams.Config.clipmapTableSize;
+
+            if (isExtended) {
+                mip      = (packed >> 16u) & 15u;
+                gen      = (packed >> 20u) & 4095u;
+                tableIdx = NVSPageProjectionParams.InPhysicalPageTable[tid].metaAux;
+                if (gen == 0u || tableIdx >= tableSize || mip >= 8u) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                    WriteClearedPageRenderData(tid, 0u);
+                    return;
+                }
+                lightId = tableIdx >> 2u;
+                lvl     = tableIdx & 3u;
+            } else {
+                lvl     = (packed >> 16u) & 3u;
+                lightId = (packed >> 18u) & 63u;
+                gen     = (packed >> 24u) & 255u;
+                if (gen == 0u || lightId >= maxLights || lvl >= clipmapLevels) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                    WriteClearedPageRenderData(tid, 0u);
+                    return;
+                }
+                tableIdx = lightId * clipmapLevels + lvl;
+                if (tableIdx >= tableSize) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                    WriteClearedPageRenderData(tid, 0u);
+                    return;
+                }
+            }
+
+            UInt  cmFlags          = NVSPageProjectionParams.InClipmapLevels[tableIdx].flags;
+            UInt  basePagesPerAxis = NVSPageProjectionParams.InClipmapLevels[tableIdx].pagesPerAxis;
+            UInt  maxMip           = (cmFlags >> 12u) & 15u;
+            Float mipScale         = Float(1u << mip);
+            UInt  cmPagesPerAxis   = (basePagesPerAxis > 0u) ? Max(basePagesPerAxis >> mip, 1u) : 0u;
+            Float cmPageSize       = NVSPageProjectionParams.InClipmapLevels[tableIdx].pageWorldSize * mipScale;
+            Float effTexelSize     = NVSPageProjectionParams.InClipmapLevels[tableIdx].texelWorldSize * mipScale;
+            Float cmCasterMinZ     = NVSPageProjectionParams.InClipmapLevels[tableIdx].casterMinZ;
+            Float cmCasterMaxZ     = NVSPageProjectionParams.InClipmapLevels[tableIdx].casterMaxZ;
+            Float dz               = cmCasterMaxZ - cmCasterMinZ;
+            Bool  isPerspective    = (cmFlags & 4u) != 0u;
+            Bool  isTexelRelBias   = (cmFlags & 256u) != 0u;
+
+            if ((cmFlags & 1u) == 0u ||
+                basePagesPerAxis == 0u ||
+                (isExtended && mip > maxMip) ||
+                vx >= cmPagesPerAxis ||
+                vy >= cmPagesPerAxis ||
+                cmPageSize <= 0.000001 ||
+                dz <= 0.000001 ||
+                (isPerspective && cmCasterMinZ <= 0.00001)) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                WriteClearedPageRenderData(tid, 0u);
+                return;
+            }
+
+            if (!isExtended) {
+                UInt rawSlots          = maxLights * clipmapLevels;
+                UInt totalSlots        = (rawSlots > 0u) ? rawSlots : 1u;
+                UInt viewPages         = basePagesPerAxis * basePagesPerAxis;
+                UInt divPages          = totalVirt / totalSlots;
+                UInt tablePagesPerSlot = (divPages > viewPages) ? divPages : viewPages;
+                UInt sqrtAxis          = UInt(sqrt(Float(tablePagesPerSlot)) + 0.5);
+                UInt tablePagesPerAxis = (sqrtAxis > basePagesPerAxis) ? sqrtAxis : basePagesPerAxis;
+                UInt expectedFlat      = tableIdx * tablePagesPerSlot + vy * tablePagesPerAxis + vx;
+                if (expectedFlat != vFlat) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].invalidMetadataRejectedCount, 1u, prev);
+                    WriteClearedPageRenderData(tid, 0u);
+                    return;
+                }
+            }
+
+            Vec4 rVec = NVSPageProjectionParams.InClipmapLevels[tableIdx].lightRightAndCenterX;
+            Vec4 uVec = NVSPageProjectionParams.InClipmapLevels[tableIdx].lightUpAndCenterY;
+            Vec4 dVec = NVSPageProjectionParams.InClipmapLevels[tableIdx].lightDirAndExtrusion;
+
+            Int snapX     = (isPerspective || cmPagesPerAxis == 1u)
+                ? 0
+                : OrthoSnapOriginAtMip(NVSPageProjectionParams.InClipmapLevels[tableIdx].snappedOriginPageX, mip);
+            Int snapY     = (isPerspective || cmPagesPerAxis == 1u)
+                ? 0
+                : OrthoSnapOriginAtMip(NVSPageProjectionParams.InClipmapLevels[tableIdx].snappedOriginPageY, mip);
+            Int nPages    = Int(cmPagesPerAxis);
+            Int halfPages = nPages / 2;
+
+            Int relX = (cmPagesPerAxis == 1u) ? 0 : ((Int(vx) - snapX) % nPages);
+            if (relX < 0) {
+                relX = relX + nPages;
+            }
+            Int relY = (cmPagesPerAxis == 1u) ? 0 : ((Int(vy) - snapY) % nPages);
+            if (relY < 0) {
+                relY = relY + nPages;
+            }
+
+            Int worldPageX = (cmPagesPerAxis == 1u) ? 0 : ((snapX - halfPages) + relX);
+            Int worldPageY = (cmPagesPerAxis == 1u) ? 0 : ((snapY - halfPages) + relY);
+
+            Float singleShiftX = (cmPagesPerAxis == 1u) ? ((isPerspective ? 0.0 : rVec.w) - (0.5 * cmPageSize)) : 0.0;
+            Float singleShiftY = (cmPagesPerAxis == 1u) ? ((isPerspective ? 0.0 : uVec.w) - (0.5 * cmPageSize)) : 0.0;
+            Float minX = Float(worldPageX) * cmPageSize + singleShiftX;
+            Float minY = Float(worldPageY) * cmPageSize + singleShiftY;
+            Float maxX = minX + cmPageSize;
+            Float maxY = minY + cmPageSize;
+
+            Vec3 R = rVec.xyz;
+            Vec3 U = uVec.xyz;
+            Vec3 D = dVec.xyz;
+
+            Float sx = 2.0 / cmPageSize;
+            Float sy = 2.0 / cmPageSize;
+            Float ox = -(maxX + minX) / cmPageSize;
+            Float oy = -(maxY + minY) / cmPageSize;
+
+            UInt depthMode = NVSPageProjectionParams.Config.depthCompareMode;
+            Bool revZ      = (depthMode == 1u) || ((cmFlags & 2u) != 0u);
+
+            Vec3  worldCenter  = Vec3(0.0, 0.0, 0.0);
+            Vec3  worldMin     = Vec3(0.0, 0.0, 0.0);
+            Vec3  worldMax     = Vec3(0.0, 0.0, 0.0);
+            Float volumeRadius = 0.0;
+
+            Vec4 lvCol0  = Vec4(R.x, U.x, D.x, 0.0);
+            Vec4 lvCol1  = Vec4(R.y, U.y, D.y, 0.0);
+            Vec4 lvCol2  = Vec4(R.z, U.z, D.z, 0.0);
+            Vec4 lvCol3  = Vec4(0.0, 0.0, 0.0, 1.0);
+            Vec4 prCol0  = Vec4(1.0, 0.0, 0.0, 0.0);
+            Vec4 prCol1  = Vec4(0.0, 1.0, 0.0, 0.0);
+            Vec4 prCol2  = Vec4(0.0, 0.0, 1.0, 0.0);
+            Vec4 prCol3  = Vec4(0.0, 0.0, 0.0, 1.0);
+            Vec4 w2cCol0 = Vec4(1.0, 0.0, 0.0, 0.0);
+            Vec4 w2cCol1 = Vec4(0.0, 1.0, 0.0, 0.0);
+            Vec4 w2cCol2 = Vec4(0.0, 0.0, 1.0, 0.0);
+            Vec4 w2cCol3 = Vec4(0.0, 0.0, 0.0, 1.0);
+
+            if (isPerspective) {
+                Vec3 lightPos = NVSPageProjectionParams.InClipmapLevels[tableIdx].lightViewToWorldCol3.xyz;
+                Vec3 c0 = lightPos + R * (minX * cmCasterMinZ) + U * (minY * cmCasterMinZ) + D * cmCasterMinZ;
+                Vec3 c1 = lightPos + R * (maxX * cmCasterMinZ) + U * (minY * cmCasterMinZ) + D * cmCasterMinZ;
+                Vec3 c2 = lightPos + R * (maxX * cmCasterMinZ) + U * (maxY * cmCasterMinZ) + D * cmCasterMinZ;
+                Vec3 c3 = lightPos + R * (minX * cmCasterMinZ) + U * (maxY * cmCasterMinZ) + D * cmCasterMinZ;
+                Vec3 c4 = lightPos + R * (minX * cmCasterMaxZ) + U * (minY * cmCasterMaxZ) + D * cmCasterMaxZ;
+                Vec3 c5 = lightPos + R * (maxX * cmCasterMaxZ) + U * (minY * cmCasterMaxZ) + D * cmCasterMaxZ;
+                Vec3 c6 = lightPos + R * (maxX * cmCasterMaxZ) + U * (maxY * cmCasterMaxZ) + D * cmCasterMaxZ;
+                Vec3 c7 = lightPos + R * (minX * cmCasterMaxZ) + U * (maxY * cmCasterMaxZ) + D * cmCasterMaxZ;
+
+                worldMin     = min(min(min(c0, c1), min(c2, c3)), min(min(c4, c5), min(c6, c7)));
+                worldMax     = max(max(max(c0, c1), max(c2, c3)), max(max(c4, c5), max(c6, c7)));
+                worldCenter  = 0.5 * (worldMin + worldMax);
+                Vec3 halfBox = 0.5 * (worldMax - worldMin);
+                volumeRadius = sqrt(Dot(halfBox, halfBox));
+
+                Float tx = -Dot(lightPos, R);
+                Float ty = -Dot(lightPos, U);
+                Float tz = -Dot(lightPos, D);
+                lvCol3   = Vec4(tx, ty, tz, 1.0);
+
+                Float pz = revZ ? (-cmCasterMinZ / dz) : (cmCasterMaxZ / dz);
+                Float qz = revZ ? ((cmCasterMinZ * cmCasterMaxZ) / dz) : (-(cmCasterMinZ * cmCasterMaxZ) / dz);
+
+                prCol0 = Vec4(sx,  0.0, 0.0, 0.0);
+                prCol1 = Vec4(0.0, sy,  0.0, 0.0);
+                prCol2 = Vec4(ox,  oy,  pz,  1.0);
+                prCol3 = Vec4(0.0, 0.0, qz,  0.0);
+
+                w2cCol0 = prCol0 * lvCol0.x + prCol1 * lvCol0.y + prCol2 * lvCol0.z + prCol3 * lvCol0.w;
+                w2cCol1 = prCol0 * lvCol1.x + prCol1 * lvCol1.y + prCol2 * lvCol1.z + prCol3 * lvCol1.w;
+                w2cCol2 = prCol0 * lvCol2.x + prCol1 * lvCol2.y + prCol2 * lvCol2.z + prCol3 * lvCol2.w;
+                w2cCol3 = prCol0 * lvCol3.x + prCol1 * lvCol3.y + prCol2 * lvCol3.z + prCol3 * lvCol3.w;
+            } else {
+                Float cx = 0.5 * (minX + maxX);
+                Float cy = 0.5 * (minY + maxY);
+                Float cz = 0.5 * (cmCasterMinZ + cmCasterMaxZ);
+
+                worldCenter = R * cx + U * cy + D * cz;
+
+                Float hx = 0.5 * cmPageSize;
+                Float hy = 0.5 * cmPageSize;
+                Float hz = 0.5 * dz;
+
+                Vec3 extentWorld = Vec3(
+                    abs(R.x) * hx + abs(U.x) * hy + abs(D.x) * hz,
+                    abs(R.y) * hx + abs(U.y) * hy + abs(D.y) * hz,
+                    abs(R.z) * hx + abs(U.z) * hy + abs(D.z) * hz);
+
+                worldMin     = worldCenter - extentWorld;
+                worldMax     = worldCenter + extentWorld;
+                volumeRadius = sqrt(hx * hx + hy * hy + hz * hz);
+
+                Float sz = revZ ? (-1.0 / dz) : (1.0 / dz);
+                Float oz = revZ ? (cmCasterMaxZ / dz) : (-cmCasterMinZ / dz);
+
+                prCol0 = Vec4(sx,  0.0, 0.0, 0.0);
+                prCol1 = Vec4(0.0, sy,  0.0, 0.0);
+                prCol2 = Vec4(0.0, 0.0, sz,  0.0);
+                prCol3 = Vec4(ox,  oy,  oz,  1.0);
+
+                w2cCol0 = Vec4(sx * R.x, sy * U.x, sz * D.x, 0.0);
+                w2cCol1 = Vec4(sx * R.y, sy * U.y, sz * D.y, 0.0);
+                w2cCol2 = Vec4(sx * R.z, sy * U.z, sz * D.z, 0.0);
+                w2cCol3 = Vec4(ox,       oy,       oz,       1.0);
+            }
+
+            UInt rFlags = 1u; // NVS_PAGE_RENDER_FLAG_VALID_RESIDENT
+            if (revZ) {
+                rFlags = rFlags | 32u; // NVS_PAGE_RENDER_FLAG_REVERSED_Z
+            }
+            if (isPerspective) {
+                rFlags = rFlags | 64u; // NVS_PAGE_RENDER_FLAG_PERSPECTIVE
+            }
+            if ((virtStateFlags & 128u) != 0u) {
+                rFlags = rFlags | 8u; // NVS_PAGE_RENDER_FLAG_NEWLY_ALLOCATED
+            }
+            if (isExtended) {
+                rFlags = rFlags | 128u | ((mip & 15u) << 8u); // EXTENDED_VIEW | MIP_LEVEL [8..11]
+            }
+
+            InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].validResidentPageCount, 1u, prev);
+            if (lvl == 0u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level0ResidentCount, 1u, prev);
+            } else if (lvl == 1u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level1ResidentCount, 1u, prev);
+            } else if (lvl == 2u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level2ResidentCount, 1u, prev);
+            } else if (lvl == 3u) {
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level3ResidentCount, 1u, prev);
+            }
+
+            if (physState == 2u) {
+                rFlags = rFlags | 2u; // NVS_PAGE_RENDER_FLAG_NEEDS_CASTER_RENDER
+                UInt activeSlot = 0u;
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].activeRenderPageCount, 1u, activeSlot);
+                NVSPageProjectionParams.OutActiveRenderPageList[activeSlot].physicalPageIndex = tid;
+
+                if (lvl == 0u) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level0ActiveRenderCount, 1u, prev);
+                } else if (lvl == 1u) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level1ActiveRenderCount, 1u, prev);
+                } else if (lvl == 2u) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level2ActiveRenderCount, 1u, prev);
+                } else if (lvl == 3u) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].level3ActiveRenderCount, 1u, prev);
+                }
+
+                if (lightId > 0u) {
+                    InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].multiLightActivePageCount, 1u, prev);
+                }
+            } else {
+                rFlags = rFlags | 4u; // NVS_PAGE_RENDER_FLAG_CACHED_VALID_SHADOW
+                InterlockedAdd(NVSPageProjectionParams.OutProjectionTelemetry[0u].cachedValidPageCount, 1u, prev);
+            }
+
+            NVSPageProjectionParams.OutPageRenderData[tid].physicalPageIndex    = tid;
+            NVSPageProjectionParams.OutPageRenderData[tid].virtualFlatIndex     = vFlat;
+            NVSPageProjectionParams.OutPageRenderData[tid].virtualAddressPacked = packed;
+            NVSPageProjectionParams.OutPageRenderData[tid].renderFlags          = rFlags;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].lightId              = lightId;
+            NVSPageProjectionParams.OutPageRenderData[tid].clipmapLevel         = lvl;
+            NVSPageProjectionParams.OutPageRenderData[tid].virtualPageX         = vx;
+            NVSPageProjectionParams.OutPageRenderData[tid].virtualPageY         = vy;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].worldPageX           = worldPageX;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldPageY           = worldPageY;
+            NVSPageProjectionParams.OutPageRenderData[tid].physicalGeneration   = NVSPageProjectionParams.InPhysicalPageTable[tid].physicalGeneration;
+            NVSPageProjectionParams.OutPageRenderData[tid].lastUsedFrame        = NVSPageProjectionParams.InPhysicalPageTable[tid].lastUsedFrame;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].lightMinX            = minX;
+            NVSPageProjectionParams.OutPageRenderData[tid].lightMinY            = minY;
+            NVSPageProjectionParams.OutPageRenderData[tid].lightMaxX            = maxX;
+            NVSPageProjectionParams.OutPageRenderData[tid].lightMaxY            = maxY;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].receiverMinZ         = NVSPageProjectionParams.InClipmapLevels[tableIdx].receiverMinZ;
+            NVSPageProjectionParams.OutPageRenderData[tid].receiverMaxZ         = NVSPageProjectionParams.InClipmapLevels[tableIdx].receiverMaxZ;
+            NVSPageProjectionParams.OutPageRenderData[tid].casterMinZ           = cmCasterMinZ;
+            NVSPageProjectionParams.OutPageRenderData[tid].casterMaxZ           = cmCasterMaxZ;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].worldCenterX         = worldCenter.x;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldCenterY         = worldCenter.y;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldCenterZ         = worldCenter.z;
+            NVSPageProjectionParams.OutPageRenderData[tid].pageWorldSize        = cmPageSize;
+
+            Float rawDepthBias  = NVSPageProjectionParams.InClipmapLevels[tableIdx].depthBiasNdc;
+            Float rawNormalBias = NVSPageProjectionParams.InClipmapLevels[tableIdx].normalBiasWorld;
+            Float outDepthBias  = rawDepthBias;
+            Float outNormalBias = rawNormalBias;
+            if (isPerspective && isTexelRelBias) {
+                Float absRasterDB = (mipScale * abs(rawDepthBias)) / Max(cmCasterMaxZ, cmCasterMinZ);
+                outDepthBias      = revZ ? (-absRasterDB) : absRasterDB;
+                // Apply normal bias 100% on the receiver side across all light types so shadow casters
+                // stay watertight with zero hard-normal edge cracks across single & instanced draws.
+                outNormalBias     = 0.0;
+            } else if (isTexelRelBias) {
+                outDepthBias  = rawDepthBias * mipScale;
+                outNormalBias = 0.0;
+            }
+
+            NVSPageProjectionParams.OutPageRenderData[tid].worldBoundsMinX      = worldMin.x;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldBoundsMinY      = worldMin.y;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldBoundsMinZ      = worldMin.z;
+            NVSPageProjectionParams.OutPageRenderData[tid].texelWorldSize       = effTexelSize;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].worldBoundsMaxX      = worldMax.x;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldBoundsMaxY      = worldMax.y;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldBoundsMaxZ      = worldMax.z;
+            NVSPageProjectionParams.OutPageRenderData[tid].shadowVolumeRadius   = volumeRadius;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].depthBiasNdc         = outDepthBias;
+            NVSPageProjectionParams.OutPageRenderData[tid].normalBiasWorld      = outNormalBias;
+            NVSPageProjectionParams.OutPageRenderData[tid].viewportWidth        = 128u;
+            NVSPageProjectionParams.OutPageRenderData[tid].viewportHeight       = 128u;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].worldToPageClipCol0  = w2cCol0;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldToPageClipCol1  = w2cCol1;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldToPageClipCol2  = w2cCol2;
+            NVSPageProjectionParams.OutPageRenderData[tid].worldToPageClipCol3  = w2cCol3;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].lightViewCol0        = lvCol0;
+            NVSPageProjectionParams.OutPageRenderData[tid].lightViewCol1        = lvCol1;
+            NVSPageProjectionParams.OutPageRenderData[tid].lightViewCol2        = lvCol2;
+            NVSPageProjectionParams.OutPageRenderData[tid].lightViewCol3        = lvCol3;
+
+            NVSPageProjectionParams.OutPageRenderData[tid].pageProjCol0         = prCol0;
+            NVSPageProjectionParams.OutPageRenderData[tid].pageProjCol1         = prCol1;
+            NVSPageProjectionParams.OutPageRenderData[tid].pageProjCol2         = prCol2;
+            NVSPageProjectionParams.OutPageRenderData[tid].pageProjCol3         = prCol3;
+        }
+    }
+}

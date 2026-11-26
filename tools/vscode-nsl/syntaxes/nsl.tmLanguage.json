@@ -1,0 +1,221 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "NSL",
+  "scopeName": "source.nsl",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#stage-directive" },
+    { "include": "#preprocessor" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#attributes" },
+    { "include": "#top-level-blocks" },
+    { "include": "#resource-kinds" },
+    { "include": "#add-get" },
+    { "include": "#types" },
+    { "include": "#stage-types" },
+    { "include": "#keywords" },
+    { "include": "#storage" },
+    { "include": "#intrinsics" },
+    { "include": "#engine-properties" },
+    { "include": "#stage-io-names" },
+    { "include": "#semantics" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.nsl",
+          "begin": "//",
+          "end": "$"
+        },
+        {
+          "name": "comment.block.nsl",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "stage-directive": {
+      "patterns": [
+        {
+          "name": "meta.directive.stage.nsl",
+          "match": "^\\s*(STAGE_DEF|STAGE)\\s+(VERTEX|PIXEL|COMPUTE|GEOMETRY|HULL|DOMAIN)\\b",
+          "captures": {
+            "1": { "name": "keyword.control.directive.stage.nsl" },
+            "2": { "name": "constant.language.shader-stage.nsl" }
+          }
+        }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.shader.nsl",
+          "match": "^\\s*(#)\\s*(shader)\\s+(VERTEX|PIXEL|COMPUTE|GEOMETRY|HULL|DOMAIN)\\b",
+          "captures": {
+            "1": { "name": "punctuation.definition.preprocessor.nsl" },
+            "2": { "name": "keyword.control.directive.shader.nsl" },
+            "3": { "name": "constant.language.shader-stage.nsl" }
+          }
+        },
+        {
+          "name": "meta.preprocessor.include.nsl",
+          "begin": "^\\s*(#)\\s*(include)\\b",
+          "end": "$",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.preprocessor.nsl" },
+            "2": { "name": "keyword.control.directive.include.nsl" }
+          },
+          "patterns": [
+            {
+              "name": "string.quoted.double.nsl",
+              "match": "\"[^\"]*\""
+            }
+          ]
+        },
+        {
+          "name": "keyword.control.directive.nsl",
+          "match": "^\\s*#\\s*(define|undef|ifdef|ifndef|if|elif|else|endif)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.nsl",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nsl",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.nsl",
+          "match": "\\b\\d+\\.\\d*([eE][+-]?\\d+)?[fF]?\\b|\\b\\.\\d+([eE][+-]?\\d+)?[fF]?\\b|\\b\\d+[eE][+-]?\\d+[fF]?\\b|\\b\\d+[fF]\\b"
+        },
+        {
+          "name": "constant.numeric.hex.nsl",
+          "match": "\\b0[xX][0-9A-Fa-f]+[uU]?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.nsl",
+          "match": "\\b\\d+[uU]?\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "name": "meta.attribute.nsl",
+      "begin": "\\[",
+      "end": "\\]",
+      "patterns": [
+        {
+          "name": "entity.other.attribute-name.nsl",
+          "match": "\\b(numthreads|maxvertexcount|inputtopology|outputtopology|domain|partitioning|outputcontrolpoints|patchconstantfunc)\\b"
+        },
+        {
+          "include": "#strings"
+        },
+        {
+          "include": "#numbers"
+        }
+      ]
+    },
+    "top-level-blocks": {
+      "patterns": [
+        {
+          "name": "keyword.control.block.nsl",
+          "match": "\\b(PROPERTY|INPUT_LAYOUT|OUTPUT_LAYOUT|SHADER|LIBRARY_DECLARATION|LIBRARY)\\b"
+        }
+      ]
+    },
+    "resource-kinds": {
+      "name": "support.type.resource.nsl",
+      "match": "\\b(Buffer|Texture2D|TextureCube|Texture2DArray|TextureCubeArray|SamplerState|SamplerComparisonState|StructuredBuffer|RWStructuredBuffer|RWTexture2D)\\b"
+    },
+    "add-get": {
+      "patterns": [
+        {
+          "name": "keyword.other.catalog.nsl",
+          "match": "\\b(Add|Get)\\b(?=\\s*\\()"
+        }
+      ]
+    },
+    "types": {
+      "name": "support.type.primitive.nsl",
+      "match": "\\b(Float|Double|Bool|Int|Int2|Int3|Int4|UInt|UInt2|UInt3|UInt4|Vec2|Vec3|Vec4|Mat3|Mat4|Color|Quat|void|Void)\\b"
+    },
+    "stage-types": {
+      "name": "entity.name.type.stage.nsl",
+      "match": "\\b(STAGE_INPUT|STAGE_OUTPUT|PATCH_CONSTANT_DATA|InputPatch|OutputPatch|PointStream|LineStream|TriangleStream|NVSLookupResult|NVSShadowTapSample|NVSResolvedStepPage|NVSResolvedLightShadowViews|NVGVisibleCluster|NVGClusterHeader|NVGDecodedVertex|NVGVisibleClusterInfo|NVGClusterHeaderInfo|NVGUnpackedVertex|NVGInstanceTransform)\\b"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.nsl",
+          "match": "\\b(if|else|for|while|do|switch|case|default|break|continue|return|discard)\\b"
+        },
+        {
+          "name": "keyword.other.struct.nsl",
+          "match": "\\b(struct|typedef)\\b"
+        },
+        {
+          "name": "constant.language.boolean.nsl",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "storage": {
+      "name": "storage.modifier.nsl",
+      "match": "\\b(in|out|inout|static|const|groupshared|inline|extern)\\b"
+    },
+    "intrinsics": {
+      "name": "support.function.intrinsic.nsl",
+      "match": "\\b(Abs|Sign|Floor|Ceil|Round|Frac|Trunc|Modf|Clamp|Saturate|Min|Max|Lerp|SmoothStep|Pow|Sqrt|Rsqrt|Exp|Exp2|Log|Log2|Sin|Cos|Tan|Asin|Acos|Atan|Atan2|Dot|Cross|Normalize|Length|Distance|Reflect|Refract|Mul|Transpose|Determinant|Sample|SampleLevel|SampleCmp|SampleCmpLevelZero|Load|Clip|Ddx|Ddy|All|Any|CountBits|FirstBitHigh|FirstBitLow|AsFloat|AsInt|AsUInt|F16ToF32|F32ToF16|IsNaN|IsInf|IsFinite|InterlockedAdd|InterlockedOr|InterlockedAnd|InterlockedXor|InterlockedMin|InterlockedMax|InterlockedExchange|InterlockedCompareExchange|InterlockedCompareStore|GroupMemoryBarrier|GroupMemoryBarrierWithGroupSync|DeviceMemoryBarrier|DeviceMemoryBarrierWithGroupSync|AllMemoryBarrier|AllMemoryBarrierWithGroupSync|Append|RestartStrip|GetDimensions)\\b"
+    },
+    "engine-properties": {
+      "name": "variable.other.constant.engine.nsl",
+      "match": "\\b(AMBIENT_COLOR|AMBIENT_INTENSITY|BONE_COUNT|BONE_MATRIX|BONE_PALETTE_OFFSET|CAMERA_ASPECT|CAMERA_DIRECTION|CAMERA_FOV|CAMERA_POSITION|DELTA_TIME|ENGINE_TIME|FAR_PLANE|FRAME_INDEX|GEOMETRY_MODE|GLOBAL_BONE_MATRIX|GLOBAL_LIGHT_ATTENUATION|GLOBAL_LIGHT_CASTS_SHADOW|GLOBAL_LIGHT_COLOR|GLOBAL_LIGHT_DIRECTION|GLOBAL_LIGHT_INNER_CONE|GLOBAL_LIGHT_INTENSITY|GLOBAL_LIGHT_NORMAL_BIAS|GLOBAL_LIGHT_NVS_LIGHT_ID|GLOBAL_LIGHT_OUTER_CONE|GLOBAL_LIGHT_POSITION|GLOBAL_LIGHT_RANGE|GLOBAL_LIGHT_SHADOW_BIAS|GLOBAL_LIGHT_SHADOW_SOFTNESS|GLOBAL_LIGHT_SHADOW_VIEW_BASE|GLOBAL_LIGHT_SHADOW_VIEW_COUNT|GLOBAL_LIGHT_TYPE|GLOBAL_LIGHT_VP_MATRIX|GPU_SCENE_OBJECT_SLOT|INSTANCE_BONE_COUNT|INSTANCE_BONE_OFFSET|INSTANCE_CUSTOM_DATA|INSTANCE_ID_VALUE|INSTANCE_WORLD_MATRIX|INV_PROJECTION_MATRIX|INV_VIEW_MATRIX|INV_WORLD_MATRIX|LIGHT_COUNT|MVP_MATRIX|NEAR_PLANE|NORMAL_MATRIX|NVG_BUCKET_CLUSTER_COUNT|NVG_BUCKET_FIRST_CLUSTER|NVG_BUCKET_FLAGS|NVG_BUCKET_MAX_TRIANGLES|NVG_DEBUG_MODE|NVG_DRAW_BUCKET_ID|NVG_MAX_SCREEN_ERROR_PX|NVG_OBJ_AABB_MAX|NVG_OBJ_AABB_MIN|NVG_OBJ_BASE_VERTEX|NVG_OBJ_BATCH_GROUP_ID|NVG_OBJ_BOUNDING_SPHERE|NVG_OBJ_FLAGS|NVG_OBJ_GENERATION|NVG_OBJ_INDEX_COUNT|NVG_OBJ_LOD_GROUP_ID|NVG_OBJ_LOD_MATERIAL_FLAGS|NVG_OBJ_MATERIAL_ID|NVG_OBJ_MESH_ID|NVG_OBJ_RENDER_FLAGS|NVG_OBJ_SLOT_INDEX|NVG_OBJ_START_INDEX|NVG_OBJ_SUBMESH_INDEX|NVG_OBJ_VERTEX_COUNT|NVG_OBJ_WORLD_MATRIX|NVG_PAGE_POOL_WORD|NVG_PAGE_WORD_COUNT|NVG_PHYSICAL_POOL_CAPACITY|NVG_SHADOW_PAGE_DEPTH_BIAS|NVG_SHADOW_PAGE_NORMAL_BIAS|NVG_SHADOW_PAGE_SLICE|NVG_SHADOW_PAGE_TEXEL_SIZE|NVG_SHADOW_PAGE_VP_MATRIX|NVG_VIS_BONE_COUNT|NVG_VIS_BONE_OFFSET|NVG_VIS_CLUSTER_ID|NVG_VIS_CLUSTER_WORD_OFFSET|NVG_VIS_DRAW_BUCKET_INDEX|NVG_VIS_GEOMETRIC_ERROR|NVG_VIS_LOD_AND_FLAGS|NVG_VIS_MATERIAL_ID|NVG_VIS_OBJECT_SLOT|NVG_VIS_PHYSICAL_PAGE_INDEX|NVG_VIS_VIEW_DEPTH_KEY|NVG_VIS_VIRTUAL_PAGE_ID|NVG_VISIBLE_CLUSTER_COUNT|NVG_VISIBLE_CLUSTER_OFFSET|NVS_CLIPMAP_LEVEL|NVS_COMPARISON_SAMPLER|NVS_DEPTH_BIAS_NDC|NVS_DEPTH_MODE|NVS_DEPTH_SAMPLER|NVS_NORMAL_BIAS_WORLD|NVS_PAGE_TEXEL_SIZE|NVS_PAGES_PER_AXIS|NVS_PHYSICAL_PAGE_INDEX|NVS_PHYSICAL_POOL_CAPACITY|NVS_PPAGE_ALLOCATED_FRAME|NVS_PPAGE_GENERATION|NVS_PPAGE_LAST_USED_FRAME|NVS_PPAGE_META_AUX|NVS_PPAGE_MIN_EVICTABLE_FRAME|NVS_PPAGE_OWNER_ADDRESS|NVS_PPAGE_OWNER_FLAT_INDEX|NVS_PPAGE_STATE_AND_FLAGS|NVS_RECEIVER_MAX_Z|NVS_RECEIVER_MIN_Z|NVS_SAMPLING_AVAILABLE|NVS_SCREEN_PIXEL_WORLD_SCALE|NVS_SHADOW_MAP|NVS_SNAPSHOT_FRAME_INDEX|NVS_SPARSE_DIR_CAPACITY|NVS_SPARSE_DIR_STRIDE|NVS_SPARSE_NODE_VALUE|NVS_SPARSE_ROOT_CAPACITY|NVS_TOTAL_VIRTUAL_PAGES|NVS_VIEW_CASTER_MAX_Z|NVS_VIEW_CASTER_MIN_Z|NVS_VIEW_DEPTH_BIAS_NDC|NVS_VIEW_DIR_AND_EXTRUSION|NVS_VIEW_FLAGS|NVS_VIEW_LIGHT_ID|NVS_VIEW_LIGHT_TO_WORLD|NVS_VIEW_NORMAL_BIAS_WORLD|NVS_VIEW_PAGE_WORLD_SIZE|NVS_VIEW_PAGES_PER_AXIS|NVS_VIEW_RECEIVER_MAX_Z|NVS_VIEW_RECEIVER_MIN_Z|NVS_VIEW_REF_LIGHT_Z|NVS_VIEW_RIGHT_AND_CENTER_X|NVS_VIEW_SNAPPED_ORIGIN_X|NVS_VIEW_SNAPPED_ORIGIN_Y|NVS_VIEW_SUB_INDEX|NVS_VIEW_TABLE_COUNT|NVS_VIEW_TEXEL_WORLD_SIZE|NVS_VIEW_TRANSITION_AND_PARAMS|NVS_VIEW_UP_AND_CENTER_Y|NVS_VIEW_WORLD_EXTENT|NVS_VIEW_WORLD_TO_LIGHT|NVS_VIRTUAL_PAGE_ADDRESS|NVS_VPAGE_LAST_TOUCHED_FRAME|NVS_VPAGE_PHYSICAL_INDEX|NVS_VPAGE_STATE_AND_FLAGS|NVS_VPAGE_VIRTUAL_ADDRESS|PROJECTION_MATRIX|SCREEN_SIZE|SKINNING_REVISION|TIME|VIEW_MATRIX|VP_MATRIX|WORLD_MATRIX)\\b"
+    },
+    "stage-io-names": {
+      "name": "variable.other.constant.stage-io.nsl",
+      "match": "\\b(VERTEX_POSITION|VERTEX_NORMAL|VERTEX_TANGENT|VERTEX_BITANGENT|VERTEX_UV0|VERTEX_UV1|VERTEX_UV2|VERTEX_UV3|VERTEX_COLOR|VERTEX_COLOR0|VERTEX_COLOR1|VERTEX_BONE_INDICES|VERTEX_BONE_WEIGHTS|WORLD_POSITION|WORLD_NORMAL|UV0|UV1|UV2|UV3|TANGENT|BITANGENT|COLOR|VIEW_DIRECTION|VERTEX_ID|INSTANCE_ID|CLIP_POSITION|RENDER_TARGET_ARRAY_INDEX|VIEWPORT_ARRAY_INDEX|COLOR_TARGET[0-7]|FRAG_DEPTH|IS_FRONT_FACE|SAMPLE_INDEX|PRIMITIVE_ID|DISPATCH_THREAD_ID|GROUP_ID|GROUP_THREAD_ID|GROUP_INDEX)\\b"
+    },
+    "semantics": {
+      "name": "support.type.semantic.nsl",
+      "match": "\\b(DISPATCH_THREAD_ID|GROUP_ID|GROUP_THREAD_ID|GROUP_INDEX|DOMAIN_LOCATION|CONTROL_POINT_ID|PRIMITIVE_ID|GS_INSTANCE_ID|CLIP_POSITION|RENDER_TARGET_ARRAY_INDEX|VIEWPORT_ARRAY_INDEX|COLOR_TARGET[0-7]|FRAG_DEPTH|VERTEX_ID|INSTANCE_ID|TESS_FACTOR|INSIDE_TESS_FACTOR|SV_[A-Za-z0-9_]+)\\b"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.nsl",
+          "match": "(\\+|\\-|\\*|/|%|&|\\||\\^|<<|>>)?="
+        },
+        {
+          "name": "keyword.operator.comparison.nsl",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.nsl",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.bitwise.nsl",
+          "match": "<<|>>|&|\\||\\^|~"
+        },
+        {
+          "name": "keyword.operator.ternary.nsl",
+          "match": "\\?|:"
+        },
+        {
+          "name": "keyword.operator.arithmetic.nsl",
+          "match": "\\+|\\-|\\*|/|%|\\+\\+|\\-\\-"
+        }
+      ]
+    }
+  }
+}

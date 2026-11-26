@@ -1,0 +1,690 @@
+// =====================================================================
+//  RuntimeNVGIndirectDraw.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — GPU Path-B Indirect Draw Generator
+//
+//  Reads compacted Path-B (IA-stream) NVGVisibleClusterGPUData records,
+//  allocates 256B-aligned per-draw Constant Buffers and 64B-aligned
+//  per-batch Instance buffers using reflected NVSDrawGroupShaderBindingDesc
+//  + NVSDrawGroupFieldPatch tables, and emits 96-byte promoted
+//  NVSIndirectDrawCommand records pointing at DecodedVertexPool &
+//  DecodedIndexPool for both Camera (Geometry/Depth) and NVS Shadow passes.
+//
+//  Dispatch Modes:
+//    Mode 0 (RESET_BUCKETS):
+//      Zeroes OutBucketCommandCounts[0 .. bucketCount-1] and pool cursors.
+//    Mode 1 (BUILD_INDIRECT_DRAWS):
+//      Emits promoted 96B ExecuteIndirect draw commands per Path-B visible
+//      cluster with GPU-populated CBVs, Instance SRVs, and Bone Palette SRVs.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGIndirectDrawParams {
+    Buffer Config {
+        Add(dispatchMode)             : UInt  = 0
+        Add(bucketCount)              : UInt  = 256
+        Add(maxVisibleCapacity)       : UInt  = 262144
+        Add(rawVisibleCounterIdx)     : UInt  = 3
+        Add(maxCommandsPerBucket)     : UInt  = 16384
+        Add(drawGroupBindingCount)    : UInt  = 0
+        Add(decodedTableCapacity)     : UInt  = 65536
+        Add(isShadowPass)             : UInt  = 0
+        Add(decodedVBAddressLo)       : UInt  = 0
+        Add(decodedVBAddressHi)       : UInt  = 0
+        Add(decodedVBSizeBytes)       : UInt  = 0
+        Add(decodedIBAddressLo)       : UInt  = 0
+        Add(decodedIBAddressHi)       : UInt  = 0
+        Add(decodedIBSizeBytes)       : UInt  = 0
+        Add(cbvPoolBaseLo)            : UInt  = 0
+        Add(cbvPoolBaseHi)            : UInt  = 0
+        Add(instancePoolBaseLo)       : UInt  = 0
+        Add(instancePoolBaseHi)       : UInt  = 0
+        Add(bonePaletteBaseLo)        : UInt  = 0
+        Add(bonePaletteBaseHi)        : UInt  = 0
+        Add(maxPerDrawCBVWords)       : UInt  = 0
+        Add(maxPerBatchInstanceWords) : UInt  = 0
+        Add(shadowPageViewCount)      : UInt  = 0
+        Add(skinningRevision)         : UInt  = 1
+        Add(cameraPosition)           : Vec3
+        Add(cameraNearPlane)          : Float = 0.1
+        Add(cameraDirection)          : Vec3
+        Add(cameraFarPlane)           : Float = 1000.0
+        Add(cameraFov)                : Float = 1.04719755
+        Add(cameraAspect)             : Float = 1.77777778
+        Add(shadowCommitRecordCap)    : UInt  = 0
+        Add(reserved1)                : UInt  = 0
+        Add(viewMatrix)               : Mat4
+        Add(invViewMatrix)            : Mat4
+        Add(projMatrix)               : Mat4
+        Add(invProjMatrix)            : Mat4
+        Add(vpMatrix)                 : Mat4
+        Add(invVPMatrix)              : Mat4
+    }
+    StructuredBuffer InCompactedVisibleClusters {
+        Add(objectSlotIndex)   : UInt
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(virtualPageId)     : UInt
+        Add(lodAndFlags)       : UInt
+        Add(geometricError)    : Float
+        Add(materialId)        : UInt
+        Add(bonePaletteOffset) : UInt
+        Add(boneCount)         : UInt
+        Add(drawBucketIndex)   : UInt
+        Add(viewDepthKey)      : Float
+    }
+    StructuredBuffer InBucketRanges {
+        Add(firstVisibleCluster) : UInt
+        Add(visibleClusterCount) : UInt
+        Add(maxTriangleCount)    : UInt
+        Add(bucketFlags)         : UInt
+    }
+    StructuredBuffer InDecodedClusterTable {
+        Add(decodedFrameMarker) : UInt
+        Add(vertexStartIndex)   : UInt
+        Add(indexStartOffset)   : UInt
+        Add(indexCount)         : UInt
+    }
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : Int
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldCol0)           : Vec4
+        Add(worldCol1)           : Vec4
+        Add(worldCol2)           : Vec4
+        Add(worldCol3)           : Vec4
+    }
+    StructuredBuffer InDrawGroupBindings {
+        Add(bindingFlags)               : UInt
+        Add(patchFirstIndex)            : UInt
+        Add(patchCount)                 : UInt
+        Add(instanceStrideBytes)        : UInt
+        Add(cbv0ByteSize)               : UInt
+        Add(cbv1ByteSize)               : UInt
+        Add(cbv2ByteSize)               : UInt
+        Add(instanceTemplateWordOffset) : UInt
+        Add(cbv0TemplateWordOffset)     : UInt
+        Add(cbv1TemplateWordOffset)     : UInt
+        Add(cbv2TemplateWordOffset)     : UInt
+        Add(shaderSetId)                : UInt
+        Add(activeStageMask)            : UInt
+        Add(cbvCount)                   : UInt
+        Add(srvMode)                    : UInt
+        Add(drawGroupIndex)             : UInt
+    }
+    StructuredBuffer InDrawGroupFieldPatches {
+        Add(semanticId) : UInt
+        Add(targetSlot) : UInt
+        Add(byteOffset) : UInt
+        Add(byteSize)   : UInt
+    }
+    StructuredBuffer InDrawGroupTemplateWords {
+        Add(word) : UInt
+    }
+    StructuredBuffer InShadowPageViews {
+        Add(vpCol0)            : Vec4
+        Add(vpCol1)            : Vec4
+        Add(vpCol2)            : Vec4
+        Add(vpCol3)            : Vec4
+        Add(physicalPageSlice) : UInt
+        Add(depthBiasNdc)      : Float
+        Add(normalBiasWorld)   : Float
+        Add(texelWorldSize)    : Float
+    }
+    RWStructuredBuffer OutIndirectDrawCommands {
+        Add(vbAddressLo)           : UInt
+        Add(vbAddressHi)           : UInt
+        Add(vbSizeInBytes)         : UInt
+        Add(vbStrideInBytes)       : UInt
+        Add(ibAddressLo)           : UInt
+        Add(ibAddressHi)           : UInt
+        Add(ibSizeInBytes)         : UInt
+        Add(ibFormat)              : UInt
+        Add(cbv0AddressLo)         : UInt
+        Add(cbv0AddressHi)         : UInt
+        Add(cbv1AddressLo)         : UInt
+        Add(cbv1AddressHi)         : UInt
+        Add(cbv2AddressLo)         : UInt
+        Add(cbv2AddressHi)         : UInt
+        Add(srv0AddressLo)         : UInt
+        Add(srv0AddressHi)         : UInt
+        Add(indexCountPerInstance) : UInt
+        Add(instanceCount)         : UInt
+        Add(startIndexLocation)    : UInt
+        Add(baseVertexLocation)    : Int
+        Add(startInstanceLocation) : UInt
+        Add(drawContextIndex)      : UInt
+        Add(meshDescriptorIndex)   : UInt
+        Add(commandFlags)          : UInt
+    }
+    RWStructuredBuffer OutPerDrawCBVWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutPerBatchInstanceWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutBucketCommandCounts {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutQueueCounters {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer InOutPageCommitRecords {
+        Add(physicalPageIndex)          : UInt
+        Add(resultFlags)                : UInt
+        Add(expectedPhysicalGeneration) : UInt
+        Add(expectedVirtualFlatIndex)   : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+    void AddGpuAddressWords(UInt baseLo, UInt baseHi, UInt wordOffset, out UInt outLo, out UInt outHi) {
+        UInt addLo = wordOffset << 2u;
+        UInt addHi = wordOffset >> 30u;
+        UInt sumLo = baseLo + addLo;
+        UInt carry = (sumLo < baseLo) ? 1u : 0u;
+        outLo = sumLo;
+        outHi = baseHi + addHi + carry;
+    }
+
+    void AddGpuAddressMatrices64B(UInt baseLo, UInt baseHi, UInt matrixIndex, out UInt outLo, out UInt outHi) {
+        UInt addLo = matrixIndex << 6u;
+        UInt addHi = matrixIndex >> 26u;
+        UInt sumLo = baseLo + addLo;
+        UInt carry = (sumLo < baseLo) ? 1u : 0u;
+        outLo = sumLo;
+        outHi = baseHi + addHi + carry;
+    }
+
+    void MulMat4Cols(
+        Vec4 a0, Vec4 a1, Vec4 a2, Vec4 a3,
+        Vec4 b0, Vec4 b1, Vec4 b2, Vec4 b3,
+        out Vec4 out0, out Vec4 out1, out Vec4 out2, out Vec4 out3)
+    {
+        out0 = a0 * b0.x + a1 * b0.y + a2 * b0.z + a3 * b0.w;
+        out1 = a0 * b1.x + a1 * b1.y + a2 * b1.z + a3 * b1.w;
+        out2 = a0 * b2.x + a1 * b2.y + a2 * b2.z + a3 * b2.w;
+        out3 = a0 * b3.x + a1 * b3.y + a2 * b3.z + a3 * b3.w;
+    }
+
+    void InvertMat4Cols(
+        Vec4 c0, Vec4 c1, Vec4 c2, Vec4 c3,
+        out Vec4 out0, out Vec4 out1, out Vec4 out2, out Vec4 out3)
+    {
+        Float m00 = c0.x; Float m01 = c1.x; Float m02 = c2.x; Float m03 = c3.x;
+        Float m10 = c0.y; Float m11 = c1.y; Float m12 = c2.y; Float m13 = c3.y;
+        Float m20 = c0.z; Float m21 = c1.z; Float m22 = c2.z; Float m23 = c3.z;
+        Float m30 = c0.w; Float m31 = c1.w; Float m32 = c2.w; Float m33 = c3.w;
+
+        Float s0 = m00 * m11 - m10 * m01;
+        Float s1 = m00 * m12 - m10 * m02;
+        Float s2 = m00 * m13 - m10 * m03;
+        Float s3 = m01 * m12 - m11 * m02;
+        Float s4 = m01 * m13 - m11 * m03;
+        Float s5 = m02 * m13 - m12 * m03;
+
+        Float k5 = m22 * m33 - m32 * m23;
+        Float k4 = m21 * m33 - m31 * m23;
+        Float k3 = m21 * m32 - m31 * m22;
+        Float k2 = m20 * m33 - m30 * m23;
+        Float k1 = m20 * m32 - m30 * m22;
+        Float k0 = m20 * m31 - m30 * m21;
+
+        Float det = s0 * k5 - s1 * k4 + s2 * k3 + s3 * k2 - s4 * k1 + s5 * k0;
+        if (Abs(det) <= 0.00000000000000000001) {
+            out0 = Vec4(1.0, 0.0, 0.0, 0.0);
+            out1 = Vec4(0.0, 1.0, 0.0, 0.0);
+            out2 = Vec4(0.0, 0.0, 1.0, 0.0);
+            out3 = Vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        Float invDet = 1.0 / det;
+        out0 = Vec4(
+            ( m11 * k5 - m12 * k4 + m13 * k3) * invDet,
+            (-m10 * k5 + m12 * k2 - m13 * k1) * invDet,
+            ( m10 * k4 - m11 * k2 + m13 * k0) * invDet,
+            (-m10 * k3 + m11 * k1 - m12 * k0) * invDet);
+        out1 = Vec4(
+            (-m01 * k5 + m02 * k4 - m03 * k3) * invDet,
+            ( m00 * k5 - m02 * k2 + m03 * k1) * invDet,
+            (-m00 * k4 + m01 * k2 - m03 * k0) * invDet,
+            ( m00 * k3 - m01 * k1 + m02 * k0) * invDet);
+        out2 = Vec4(
+            ( m31 * s5 - m32 * s4 + m33 * s3) * invDet,
+            (-m30 * s5 + m32 * s2 - m33 * s1) * invDet,
+            ( m30 * s4 - m31 * s2 + m33 * s0) * invDet,
+            (-m30 * s3 + m31 * s1 - m32 * s0) * invDet);
+        out3 = Vec4(
+            (-m21 * s5 + m22 * s4 - m23 * s3) * invDet,
+            ( m20 * s5 - m22 * s2 + m23 * s1) * invDet,
+            (-m20 * s4 + m21 * s2 - m23 * s0) * invDet,
+            ( m20 * s3 - m21 * s1 + m22 * s0) * invDet);
+    }
+
+    void WriteMat4ToCBV(UInt baseWord, Vec4 c0, Vec4 c1, Vec4 c2, Vec4 c3) {
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 0u].word  = AsUInt(c0.x);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 1u].word  = AsUInt(c0.y);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 2u].word  = AsUInt(c0.z);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 3u].word  = AsUInt(c0.w);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 4u].word  = AsUInt(c1.x);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 5u].word  = AsUInt(c1.y);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 6u].word  = AsUInt(c1.z);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 7u].word  = AsUInt(c1.w);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 8u].word  = AsUInt(c2.x);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 9u].word  = AsUInt(c2.y);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 10u].word = AsUInt(c2.z);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 11u].word = AsUInt(c2.w);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 12u].word = AsUInt(c3.x);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 13u].word = AsUInt(c3.y);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 14u].word = AsUInt(c3.z);
+        NVGIndirectDrawParams.OutPerDrawCBVWords[baseWord + 15u].word = AsUInt(c3.w);
+    }
+
+    void WriteMat4ToInst(UInt baseWord, Vec4 c0, Vec4 c1, Vec4 c2, Vec4 c3) {
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 0u].word  = AsUInt(c0.x);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 1u].word  = AsUInt(c0.y);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 2u].word  = AsUInt(c0.z);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 3u].word  = AsUInt(c0.w);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 4u].word  = AsUInt(c1.x);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 5u].word  = AsUInt(c1.y);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 6u].word  = AsUInt(c1.z);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 7u].word  = AsUInt(c1.w);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 8u].word  = AsUInt(c2.x);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 9u].word  = AsUInt(c2.y);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 10u].word = AsUInt(c2.z);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 11u].word = AsUInt(c2.w);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 12u].word = AsUInt(c3.x);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 13u].word = AsUInt(c3.y);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 14u].word = AsUInt(c3.z);
+        NVGIndirectDrawParams.OutPerBatchInstanceWords[baseWord + 15u].word = AsUInt(c3.w);
+    }
+
+    void ExtractMat4Cols(Mat4 m, out Vec4 c0, out Vec4 c1, out Vec4 c2, out Vec4 c3) {
+        c0 = Mul(m, Vec4(1.0, 0.0, 0.0, 0.0));
+        c1 = Mul(m, Vec4(0.0, 1.0, 0.0, 0.0));
+        c2 = Mul(m, Vec4(0.0, 0.0, 1.0, 0.0));
+        c3 = Mul(m, Vec4(0.0, 0.0, 0.0, 1.0));
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt tid  = dtid.x;
+        UInt mode = NVGIndirectDrawParams.Config.dispatchMode;
+        UInt prev = 0u;
+
+        if (mode == 0u) {
+            if (tid < NVGIndirectDrawParams.Config.bucketCount) {
+                NVGIndirectDrawParams.OutBucketCommandCounts[tid].count = 0u;
+            }
+            if (tid == 0u) {
+                NVGIndirectDrawParams.OutQueueCounters[14u].count = 0u; // perDrawCBVWordCursor
+                NVGIndirectDrawParams.OutQueueCounters[15u].count = 0u; // perBatchInstanceWordCursor
+            }
+            return;
+        }
+
+        // MODE 1: Generate promoted 96-byte ExecuteIndirect commands for Path-B visible clusters (Grid-Stride Unlimited)
+        UInt cntIdx   = NVGIndirectDrawParams.Config.rawVisibleCounterIdx;
+        UInt totalVis = Min(NVGIndirectDrawParams.OutQueueCounters[cntIdx].count,
+                            NVGIndirectDrawParams.Config.maxVisibleCapacity);
+        for (UInt curTid = dtid.x; curTid < totalVis; curTid = curTid + 4194240u) {
+            UInt bucket = NVGIndirectDrawParams.InCompactedVisibleClusters[curTid].drawBucketIndex;
+            if (bucket >= NVGIndirectDrawParams.Config.bucketCount ||
+                bucket >= NVGIndirectDrawParams.Config.drawGroupBindingCount) {
+                continue;
+            }
+            // Only Path-B IA-stream buckets (bit 0) generate 96B ExecuteIndirect commands
+            if ((NVGIndirectDrawParams.InBucketRanges[bucket].bucketFlags & 1u) == 0u) {
+                continue;
+            }
+            if ((NVGIndirectDrawParams.InDrawGroupBindings[bucket].bindingFlags & 1u) == 0u) {
+                continue;
+            }
+
+            UInt clusterId = NVGIndirectDrawParams.InCompactedVisibleClusters[curTid].clusterId;
+            if (clusterId >= NVGIndirectDrawParams.Config.decodedTableCapacity) {
+                continue;
+            }
+            UInt packedCounts = NVGIndirectDrawParams.InDecodedClusterTable[clusterId].indexCount;
+            UInt iCount       = packedCounts & 65535u;
+            UInt vCount       = packedCounts >> 16u;
+            if (iCount == 0u || vCount == 0u) {
+                continue;
+            }
+            UInt vStart = NVGIndirectDrawParams.InDecodedClusterTable[clusterId].vertexStartIndex;
+            UInt iStart = NVGIndirectDrawParams.InDecodedClusterTable[clusterId].indexStartOffset;
+
+            UInt firstCluster       = NVGIndirectDrawParams.InBucketRanges[bucket].firstVisibleCluster;
+            UInt visClusterCount    = NVGIndirectDrawParams.InBucketRanges[bucket].visibleClusterCount;
+            UInt localClusterOffset = (curTid >= firstCluster) ? (curTid - firstCluster) : 0u;
+
+            UInt objSlot     = NVGIndirectDrawParams.InCompactedVisibleClusters[curTid].objectSlotIndex;
+            UInt lodAndFlags = NVGIndirectDrawParams.InCompactedVisibleClusters[curTid].lodAndFlags;
+            UInt boneOff     = NVGIndirectDrawParams.InCompactedVisibleClusters[curTid].bonePaletteOffset;
+            UInt boneCnt     = NVGIndirectDrawParams.InCompactedVisibleClusters[curTid].boneCount;
+            UInt shViewIdx   = (lodAndFlags >> 16u) & 65535u;
+            UInt commitCap   = (NVGIndirectDrawParams.Config.isShadowPass != 0u)
+                ? NVGIndirectDrawParams.Config.shadowCommitRecordCap
+                : 0u;
+
+            if (NVGIndirectDrawParams.OutBucketCommandCounts[bucket].count >=
+                NVGIndirectDrawParams.Config.maxCommandsPerBucket) {
+                InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                if (shViewIdx < commitCap) {
+                    UInt pFl = 0u;
+                    InterlockedOr(NVGIndirectDrawParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                    if ((pFl & 2u) == 0u) { InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[38u].word, 1u, prev); }
+                }
+                continue;
+            }
+
+            // Allocate all promoted CBV slots (256-byte = 64-word aligned each) in one atomic reservation
+            UInt cbvCount  = Min(NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbvCount, 3u);
+            UInt cbvSize[3];
+            UInt cbvTpl[3];
+            UInt cbvWordsNeeded[3];
+            UInt cbvWordsAligned[3];
+            UInt cbvAllocWord[3];
+            UInt cbvAddrLo[3];
+            UInt cbvAddrHi[3];
+
+            cbvSize[0] = NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbv0ByteSize;
+            cbvSize[1] = NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbv1ByteSize;
+            cbvSize[2] = NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbv2ByteSize;
+            cbvTpl[0]  = NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbv0TemplateWordOffset;
+            cbvTpl[1]  = NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbv1TemplateWordOffset;
+            cbvTpl[2]  = NVGIndirectDrawParams.InDrawGroupBindings[bucket].cbv2TemplateWordOffset;
+
+            UInt totalCbvWords = 0u;
+            for (UInt s = 0u; s < 3u; s = s + 1u) {
+                cbvWordsNeeded[s]  = 0u;
+                cbvWordsAligned[s] = 0u;
+                cbvAllocWord[s]    = 0u;
+                cbvAddrLo[s]       = 0u;
+                cbvAddrHi[s]       = 0u;
+                if (s < cbvCount && cbvSize[s] > 0u) {
+                    cbvWordsNeeded[s]  = (cbvSize[s] + 3u) >> 2u;
+                    cbvWordsAligned[s] = (cbvWordsNeeded[s] + 63u) & (~63u); // 256B D3D12 CBV alignment
+                    totalCbvWords      = totalCbvWords + cbvWordsAligned[s];
+                }
+            }
+
+            if (totalCbvWords > 0u) {
+                UInt cbvGroupBase = 0u;
+                InterlockedAdd(NVGIndirectDrawParams.OutQueueCounters[14u].count, totalCbvWords, cbvGroupBase);
+                if (cbvGroupBase + totalCbvWords > NVGIndirectDrawParams.Config.maxPerDrawCBVWords) {
+                    InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                    if (shViewIdx < commitCap) {
+                        UInt pFl = 0u;
+                        InterlockedOr(NVGIndirectDrawParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                        if ((pFl & 2u) == 0u) { InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[38u].word, 1u, prev); }
+                    }
+                    continue;
+                }
+                UInt curCbvBase = cbvGroupBase;
+                for (UInt s = 0u; s < 3u; s = s + 1u) {
+                    if (cbvWordsAligned[s] > 0u) {
+                        cbvAllocWord[s] = curCbvBase;
+                        for (UInt w = 0u; w < cbvWordsNeeded[s]; w = w + 1u) {
+                            NVGIndirectDrawParams.OutPerDrawCBVWords[curCbvBase + w].word =
+                                NVGIndirectDrawParams.InDrawGroupTemplateWords[cbvTpl[s] + w].word;
+                        }
+                        AddGpuAddressWords(
+                            NVGIndirectDrawParams.Config.cbvPoolBaseLo,
+                            NVGIndirectDrawParams.Config.cbvPoolBaseHi,
+                            curCbvBase, cbvAddrLo[s], cbvAddrHi[s]);
+                        curCbvBase = curCbvBase + cbvWordsAligned[s];
+                    }
+                }
+            }
+
+            // Allocate optional Instance SRV slot or Bone Palette SRV slice BEFORE claiming a command slot
+            UInt srvMode   = NVGIndirectDrawParams.InDrawGroupBindings[bucket].srvMode;
+            UInt srvAddrLo = 0u;
+            UInt srvAddrHi = 0u;
+            UInt instWordBase = 0u;
+            Bool hasInstSlot  = false;
+
+            if (srvMode == 1u) {
+                // NVS_INDIRECT_SRV_INSTANCE_POOL
+                UInt instStrideB = Max(NVGIndirectDrawParams.InDrawGroupBindings[bucket].instanceStrideBytes, 16u);
+                UInt instWords   = (instStrideB + 3u) >> 2u;
+                UInt instAligned = (instWords + 15u) & (~15u); // 64B alignment
+                UInt baseW = 0u;
+                InterlockedAdd(NVGIndirectDrawParams.OutQueueCounters[15u].count, instAligned, baseW);
+                if (baseW + instAligned > NVGIndirectDrawParams.Config.maxPerBatchInstanceWords) {
+                    InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                    if (shViewIdx < commitCap) {
+                        UInt pFl = 0u;
+                        InterlockedOr(NVGIndirectDrawParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                        if ((pFl & 2u) == 0u) { InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[38u].word, 1u, prev); }
+                    }
+                    continue;
+                }
+                instWordBase = baseW;
+                hasInstSlot  = true;
+                UInt instTpl = NVGIndirectDrawParams.InDrawGroupBindings[bucket].instanceTemplateWordOffset;
+                for (UInt w = 0u; w < instWords; w = w + 1u) {
+                    NVGIndirectDrawParams.OutPerBatchInstanceWords[baseW + w].word =
+                        NVGIndirectDrawParams.InDrawGroupTemplateWords[instTpl + w].word;
+                }
+                AddGpuAddressWords(
+                    NVGIndirectDrawParams.Config.instancePoolBaseLo,
+                    NVGIndirectDrawParams.Config.instancePoolBaseHi,
+                    baseW, srvAddrLo, srvAddrHi);
+            } else if (srvMode == 2u) {
+                // NVS_INDIRECT_SRV_BONE_PALETTE_SLICE
+                AddGpuAddressMatrices64B(
+                    NVGIndirectDrawParams.Config.bonePaletteBaseLo,
+                    NVGIndirectDrawParams.Config.bonePaletteBaseHi,
+                    boneOff, srvAddrLo, srvAddrHi);
+            }
+
+            // Claim command slot in bucket ONLY after CBV & Instance allocations succeed
+            UInt cmdLocalIdx = 0u;
+            InterlockedAdd(NVGIndirectDrawParams.OutBucketCommandCounts[bucket].count, 1u, cmdLocalIdx);
+            if (cmdLocalIdx >= NVGIndirectDrawParams.Config.maxCommandsPerBucket) {
+                InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+                if (shViewIdx < commitCap) {
+                    UInt pFl = 0u;
+                    InterlockedOr(NVGIndirectDrawParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, pFl);
+                    if ((pFl & 2u) == 0u) { InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[38u].word, 1u, prev); }
+                }
+                continue;
+            }
+            UInt cmdGlobalIdx = bucket * NVGIndirectDrawParams.Config.maxCommandsPerBucket + cmdLocalIdx;
+
+            // Prepare matrices for reflection-driven patching
+            Vec4 wCol0 = NVGIndirectDrawParams.InGPUSceneObjects[objSlot].worldCol0;
+            Vec4 wCol1 = NVGIndirectDrawParams.InGPUSceneObjects[objSlot].worldCol1;
+            Vec4 wCol2 = NVGIndirectDrawParams.InGPUSceneObjects[objSlot].worldCol2;
+            Vec4 wCol3 = NVGIndirectDrawParams.InGPUSceneObjects[objSlot].worldCol3;
+
+            Vec4 vp0; Vec4 vp1; Vec4 vp2; Vec4 vp3;
+            UInt  shSlice = 0u;
+            Float shBias  = 0.0;
+            Float shNBias = 0.0;
+            if (NVGIndirectDrawParams.Config.isShadowPass != 0u &&
+                shViewIdx < NVGIndirectDrawParams.Config.shadowPageViewCount) {
+                vp0     = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].vpCol0;
+                vp1     = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].vpCol1;
+                vp2     = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].vpCol2;
+                vp3     = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].vpCol3;
+                shSlice = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].physicalPageSlice;
+                shBias  = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].depthBiasNdc;
+                shNBias = NVGIndirectDrawParams.InShadowPageViews[shViewIdx].normalBiasWorld;
+            } else {
+                ExtractMat4Cols(NVGIndirectDrawParams.Config.vpMatrix, vp0, vp1, vp2, vp3);
+            }
+
+            Vec4 mvp0; Vec4 mvp1; Vec4 mvp2; Vec4 mvp3;
+            MulMat4Cols(vp0, vp1, vp2, vp3, wCol0, wCol1, wCol2, wCol3, mvp0, mvp1, mvp2, mvp3);
+
+            Vec4 invW0; Vec4 invW1; Vec4 invW2; Vec4 invW3;
+            InvertMat4Cols(wCol0, wCol1, wCol2, wCol3, invW0, invW1, invW2, invW3);
+
+            // Apply all reflected NVSDrawGroupFieldPatch entries
+            UInt pFirst = NVGIndirectDrawParams.InDrawGroupBindings[bucket].patchFirstIndex;
+            UInt pCount = NVGIndirectDrawParams.InDrawGroupBindings[bucket].patchCount;
+            for (UInt pi = 0u; pi < pCount; pi = pi + 1u) {
+                UInt sem  = NVGIndirectDrawParams.InDrawGroupFieldPatches[pFirst + pi].semanticId;
+                UInt slot = NVGIndirectDrawParams.InDrawGroupFieldPatches[pFirst + pi].targetSlot;
+                UInt wOff = NVGIndirectDrawParams.InDrawGroupFieldPatches[pFirst + pi].byteOffset >> 2u;
+
+                if (slot < 3u && slot < cbvCount && cbvSize[slot] > 0u) {
+                    UInt dstW = cbvAllocWord[slot] + wOff;
+                    if (sem == 1u) {
+                        WriteMat4ToCBV(dstW, wCol0, wCol1, wCol2, wCol3);
+                    } else if (sem == 2u) {
+                        WriteMat4ToCBV(dstW, invW0, invW1, invW2, invW3);
+                    } else if (sem == 3u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 0u].word  = AsUInt(invW0.x);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 1u].word  = AsUInt(invW1.x);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 2u].word  = AsUInt(invW2.x);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 3u].word  = 0u;
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 4u].word  = AsUInt(invW0.y);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 5u].word  = AsUInt(invW1.y);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 6u].word  = AsUInt(invW2.y);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 7u].word  = 0u;
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 8u].word  = AsUInt(invW0.z);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 9u].word  = AsUInt(invW1.z);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 10u].word = AsUInt(invW2.z);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 11u].word = 0u;
+                    } else if (sem == 4u) {
+                        Vec4 v0; Vec4 v1; Vec4 v2; Vec4 v3;
+                        ExtractMat4Cols(NVGIndirectDrawParams.Config.viewMatrix, v0, v1, v2, v3);
+                        WriteMat4ToCBV(dstW, v0, v1, v2, v3);
+                    } else if (sem == 5u) {
+                        Vec4 v0; Vec4 v1; Vec4 v2; Vec4 v3;
+                        ExtractMat4Cols(NVGIndirectDrawParams.Config.invViewMatrix, v0, v1, v2, v3);
+                        WriteMat4ToCBV(dstW, v0, v1, v2, v3);
+                    } else if (sem == 6u) {
+                        Vec4 p0; Vec4 p1; Vec4 p2; Vec4 p3;
+                        ExtractMat4Cols(NVGIndirectDrawParams.Config.projMatrix, p0, p1, p2, p3);
+                        WriteMat4ToCBV(dstW, p0, p1, p2, p3);
+                    } else if (sem == 7u) {
+                        Vec4 p0; Vec4 p1; Vec4 p2; Vec4 p3;
+                        ExtractMat4Cols(NVGIndirectDrawParams.Config.invProjMatrix, p0, p1, p2, p3);
+                        WriteMat4ToCBV(dstW, p0, p1, p2, p3);
+                    } else if (sem == 8u) {
+                        WriteMat4ToCBV(dstW, vp0, vp1, vp2, vp3);
+                    } else if (sem == 9u) {
+                        Vec4 ivp0; Vec4 ivp1; Vec4 ivp2; Vec4 ivp3;
+                        ExtractMat4Cols(NVGIndirectDrawParams.Config.invVPMatrix, ivp0, ivp1, ivp2, ivp3);
+                        WriteMat4ToCBV(dstW, ivp0, ivp1, ivp2, ivp3);
+                    } else if (sem == 10u) {
+                        WriteMat4ToCBV(dstW, mvp0, mvp1, mvp2, mvp3);
+                    } else if (sem == 11u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 0u].word = AsUInt(NVGIndirectDrawParams.Config.cameraPosition.x);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 1u].word = AsUInt(NVGIndirectDrawParams.Config.cameraPosition.y);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 2u].word = AsUInt(NVGIndirectDrawParams.Config.cameraPosition.z);
+                    } else if (sem == 12u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 0u].word = AsUInt(NVGIndirectDrawParams.Config.cameraDirection.x);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 1u].word = AsUInt(NVGIndirectDrawParams.Config.cameraDirection.y);
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW + 2u].word = AsUInt(NVGIndirectDrawParams.Config.cameraDirection.z);
+                    } else if (sem == 13u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = AsUInt(NVGIndirectDrawParams.Config.cameraNearPlane);
+                    } else if (sem == 14u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = AsUInt(NVGIndirectDrawParams.Config.cameraFarPlane);
+                    } else if (sem == 15u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = boneOff;
+                    } else if (sem == 16u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = boneCnt;
+                    } else if (sem == 17u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = NVGIndirectDrawParams.Config.skinningRevision;
+                    } else if (sem == 18u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = shSlice;
+                    } else if (sem == 21u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = AsUInt(shBias);
+                    } else if (sem == 22u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = AsUInt(shNBias);
+                    } else if (sem == 25u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = AsUInt(NVGIndirectDrawParams.Config.cameraFov);
+                    } else if (sem == 26u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = AsUInt(NVGIndirectDrawParams.Config.cameraAspect);
+                    } else if (sem == 27u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = bucket;
+                    } else if (sem == 28u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = visClusterCount;
+                    } else if (sem == 29u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = localClusterOffset;
+                    } else if (sem == 30u) {
+                        NVGIndirectDrawParams.OutPerDrawCBVWords[dstW].word = objSlot;
+                    }
+                } else if (slot == 3u && hasInstSlot) {
+                    UInt dstW = instWordBase + wOff;
+                    if (sem == 32u) {
+                        WriteMat4ToInst(dstW, wCol0, wCol1, wCol2, wCol3);
+                    } else if (sem == 33u) {
+                        NVGIndirectDrawParams.OutPerBatchInstanceWords[dstW].word = objSlot;
+                    } else if (sem == 34u) {
+                        NVGIndirectDrawParams.OutPerBatchInstanceWords[dstW].word = clusterId;
+                    } else if (sem == 35u) {
+                        NVGIndirectDrawParams.OutPerBatchInstanceWords[dstW].word = boneOff;
+                    } else if (sem == 36u) {
+                        NVGIndirectDrawParams.OutPerBatchInstanceWords[dstW].word = boneCnt;
+                    }
+                }
+            }
+
+            UInt clusterVbLo = 0u;
+            UInt clusterVbHi = 0u;
+            AddGpuAddressWords(
+                NVGIndirectDrawParams.Config.decodedVBAddressLo,
+                NVGIndirectDrawParams.Config.decodedVBAddressHi,
+                vStart * 28u,
+                clusterVbLo,
+                clusterVbHi);
+
+            // Write final 96-byte promoted NVSIndirectDrawCommand
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].vbAddressLo           = clusterVbLo;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].vbAddressHi           = clusterVbHi;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].vbSizeInBytes         = vCount * 112u;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].vbStrideInBytes       = 112u;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].ibAddressLo           = NVGIndirectDrawParams.Config.decodedIBAddressLo;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].ibAddressHi           = NVGIndirectDrawParams.Config.decodedIBAddressHi;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].ibSizeInBytes         = NVGIndirectDrawParams.Config.decodedIBSizeBytes;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].ibFormat              = 42u; // DXGI_FORMAT_R32_UINT
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].cbv0AddressLo         = cbvAddrLo[0];
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].cbv0AddressHi         = cbvAddrHi[0];
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].cbv1AddressLo         = cbvAddrLo[1];
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].cbv1AddressHi         = cbvAddrHi[1];
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].cbv2AddressLo         = cbvAddrLo[2];
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].cbv2AddressHi         = cbvAddrHi[2];
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].srv0AddressLo         = srvAddrLo;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].srv0AddressHi         = srvAddrHi;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].indexCountPerInstance = iCount;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].instanceCount         = 1u;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].startIndexLocation    = iStart;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].baseVertexLocation    = 0;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].startInstanceLocation = 0u;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].drawContextIndex      = curTid;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].meshDescriptorIndex   = clusterId;
+            NVGIndirectDrawParams.OutIndirectDrawCommands[cmdGlobalIdx].commandFlags          = 1u;
+
+            if (NVGIndirectDrawParams.Config.isShadowPass != 0u) {
+                InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[19u].word, 1u, prev); // shadowIndirectDraws
+            } else {
+                InterlockedAdd(NVGIndirectDrawParams.OutTelemetry[14u].word, 1u, prev); // indirectDrawsGenerated
+            }
+        }
+    }
+}

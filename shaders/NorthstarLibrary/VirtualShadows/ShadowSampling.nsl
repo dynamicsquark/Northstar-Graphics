@@ -1,0 +1,870 @@
+// =====================================================================
+//  ShadowSampling.nsl — Northstar NSL Standard Library: Physical Shadow Sampling
+//
+//  Provides engine-owned NVS physical shadow Texture2DArray and pipeline
+//  sampler bindings (NVS_SHADOW_MAP, NVS_COMPARISON_SAMPLER, NVS_DEPTH_SAMPLER)
+//  together with raw depth, texel load, hardware comparison, sparse virtual
+//  mip neighbor resolution, and seamless 3D cross-face Point cubemap tap sampling.
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualShadows/ShadowPageLookup.nsl")
+}
+
+PROPERTY NVSShadowResources
+{
+    Texture2DArray ShadowMaps
+    {
+        Get(NVS_SHADOW_MAP)
+    }
+
+    SamplerComparisonState ComparisonSamplers
+    {
+        Get(NVS_COMPARISON_SAMPLER)
+    }
+
+    SamplerState DepthSamplers
+    {
+        Get(NVS_DEPTH_SAMPLER)
+    }
+}
+
+LIBRARY
+{
+    struct NVSShadowTapSample
+    {
+        Bool  valid;
+        UInt  status;
+        UInt  physicalPageIndex;
+        Float rawDepth;
+        Float visibility;
+        Float compareDepth;
+    };
+
+    Float NVSSamplePhysicalDepthRaw(UInt physicalPageIndex, Vec2 borderSafeUV)
+    {
+        return SampleLevel(
+            NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP,
+            NVSShadowResources.DepthSamplers.NVS_DEPTH_SAMPLER,
+            Vec3(borderSafeUV.x, borderSafeUV.y, Float(physicalPageIndex)),
+            0.0).r;
+    }
+
+    Float NVSSamplePhysicalDepthTexel(UInt physicalPageIndex, Int2 texelXY)
+    {
+        Int maxTexel = Int(Max(NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE, 1u)) - 1;
+        Int clampedX = Clamp(texelXY.x, 0, maxTexel);
+        Int clampedY = Clamp(texelXY.y, 0, maxTexel);
+        return Load(
+            NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP,
+            Int4(clampedX, clampedY, Int(physicalPageIndex), 0)).r;
+    }
+
+    Float NVSSamplePhysicalDepthCompare(
+        UInt  physicalPageIndex,
+        Vec2  borderSafeUV,
+        Float compareDepth)
+    {
+        return SampleCmpLevelZero(
+            NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP,
+            NVSShadowResources.ComparisonSamplers.NVS_COMPARISON_SAMPLER,
+            Vec3(borderSafeUV.x, borderSafeUV.y, Float(physicalPageIndex)),
+            compareDepth);
+    }
+
+    Float NVSEvaluateLookupCompare(
+        NVSLookupResult lookup,
+        Float           invalidPageFallbackVisibility)
+    {
+        Float vis = invalidPageFallbackVisibility;
+        if (lookup.status == 0u)
+        {
+            vis = NVSSamplePhysicalDepthCompare(
+                lookup.physicalPageIndex,
+                lookup.borderSafeSliceUV,
+                lookup.receiverCompareDepth);
+        }
+        else if (lookup.status == 6u)
+        {
+            vis = 1.0;
+        }
+        return vis;
+    }
+
+    struct NVSResolvedStepPage
+    {
+        UInt  status;
+        UInt  physicalPageIndex;
+        Vec2  safeUV;
+        Float compareDepth;
+        Bool  crossFace;
+    };
+
+    Int NVSLoopDynamicZero()
+    {
+        return Int(NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE >> 24u);
+    }
+
+    // Computes the exact analytic Receiver-Plane Depth Bias (RPDB) gradient
+    // Vec2(dNdcZ / dTexelX, dNdcZ / dTexelY) on the receiver tangent plane at
+    // centerLookup without screen-space ddx/ddy derivatives (safe inside dynamic
+    // or divergent multi-light loops and free of silhouette quad-derivative spikes).
+    Vec2 NVSComputeReceiverPlaneDepthGradientPerTexel(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldNormal)
+    {
+        Vec2  grad   = Vec2(0.0, 0.0);
+        Float nLenSq = Dot(worldNormal, worldNormal);
+        if (nLenSq > 0.25 && centerLookup.status < 5u)
+        {
+            Vec3  safeN         = worldNormal * Rsqrt(nLenSq);
+            UInt  viewFlags     = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_FLAGS;
+            Bool  isReversedZ   = (viewFlags & 2u) != 0u;
+            Bool  isPerspective = (viewFlags & 4u) != 0u;
+            UInt  basePagesAxis = Max(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_PAGES_PER_AXIS, 1u);
+            Float worldExtent   = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_WORLD_EXTENT;
+            Float cMinZ         = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MIN_Z;
+            Float cMaxZ         = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MAX_Z;
+            Float dz            = Max(cMaxZ - cMinZ, 0.000001);
+
+            Vec3  R  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_RIGHT_AND_CENTER_X.xyz;
+            Vec3  U  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_UP_AND_CENTER_Y.xyz;
+            Vec3  D  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DIR_AND_EXTRUSION.xyz;
+            Float nx = Dot(safeN, R);
+            Float ny = Dot(safeN, U);
+            Float nz = Dot(safeN, D);
+
+            Float invTexelCount = 1.0 / Float(Max(NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE, 1u));
+
+            if (isPerspective)
+            {
+                UInt  evalMip     = centerLookup.resolvedMipLevel;
+                UInt  mipPages    = Max(basePagesAxis >> evalMip, 1u);
+                Float mipPageSize = worldExtent / Float(mipPages);
+                Float texelTan    = mipPageSize * invTexelCount;
+                Float centerShift = (mipPages == 1u) ? 0.5 : 0.0;
+                Float centerExX   = Float(centerLookup.worldPageX) + centerLookup.rawSliceUV.x;
+                Float centerExY   = Float(centerLookup.worldPageY) + (1.0 - centerLookup.rawSliceUV.y);
+                Float tx0         = (centerExX - centerShift) * mipPageSize;
+                Float ty0         = (centerExY - centerShift) * mipPageSize;
+
+                Float rayLen      = Sqrt((tx0 * tx0) + (ty0 * ty0) + 1.0);
+                Float rawDenom    = (nx * tx0) + (ny * ty0) + nz;
+                Float absCos      = Abs(rawDenom) / rayLen;
+                Float termFade    = Clamp(absCos / 0.15, 0.0, 1.0);
+                Float minDenom    = 0.12 * rayLen;
+                Float safeDenom   = (rawDenom >= 0.0) ? Max(rawDenom, minDenom) : Min(rawDenom, -minDenom);
+
+                Float safeLz      = Max(centerLookup.receiverLightZ, Max(cMinZ, 0.0001));
+                Float qz          = isReversedZ ? ((cMinZ * cMaxZ) / dz) : (-(cMinZ * cMaxZ) / dz);
+                Float scalePersp  = (qz / safeLz) * (texelTan / safeDenom) * termFade;
+                grad              = Vec2(nx * scalePersp, -ny * scalePersp);
+            }
+            else
+            {
+                UInt  evalMip    = centerLookup.resolvedMipLevel;
+                UInt  mipPages   = Max(basePagesAxis >> evalMip, 1u);
+                Float texelWorld = (worldExtent / Float(mipPages)) * invTexelCount;
+                Float absNz      = Abs(nz);
+                Float termFade   = Clamp(absNz / 0.15, 0.0, 1.0);
+                Float safeNz     = (nz >= 0.0) ? Max(nz, 0.12) : Min(nz, -0.12);
+                Float ndcPerM    = isReversedZ ? (-1.0 / dz) : (1.0 / dz);
+                Float scaleOrtho = ((texelWorld * ndcPerM) / safeNz) * termFade;
+                grad             = Vec2(-nx * scaleOrtho, ny * scaleOrtho);
+            }
+
+            grad = Vec2(Clamp(grad.x, -0.25, 0.25), Clamp(grad.y, -0.25, 0.25));
+        }
+        return grad;
+    }
+
+    NVSResolvedStepPage NVSResolveViewStepPage(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldNormal,
+        Vec2            sampleTexelOffsetXY,
+        Vec2            rpdbGrad,
+        Float           invTexelCount,
+        Float           minUV,
+        Float           maxUV)
+    {
+        NVSResolvedStepPage r;
+        r.status            = 1u;
+        r.physicalPageIndex = ~0u;
+        r.compareDepth      = Clamp(centerLookup.receiverCompareDepth + Dot(rpdbGrad, sampleTexelOffsetXY), 0.0, 1.0);
+        r.crossFace         = false;
+
+        Float exactPageX = Float(centerLookup.worldPageX) + centerLookup.rawSliceUV.x + (sampleTexelOffsetXY.x * invTexelCount);
+        Float exactPageY = Float(centerLookup.worldPageY) + (1.0 - centerLookup.rawSliceUV.y) - (sampleTexelOffsetXY.y * invTexelCount);
+        Float flX        = Floor(exactPageX);
+        Float flY        = Floor(exactPageY);
+        Int   wPageX     = Int(flX);
+        Int   wPageY     = Int(flY);
+        Float rawU       = exactPageX - flX;
+        Float rawV       = 1.0 - (exactPageY - flY);
+        r.safeUV         = Vec2(Clamp(rawU, minUV, maxUV), Clamp(rawV, minUV, maxUV));
+
+        if (wPageX == centerLookup.worldPageX && wPageY == centerLookup.worldPageY)
+        {
+            r.status            = centerLookup.status;
+            r.physicalPageIndex = centerLookup.physicalPageIndex;
+        }
+        else
+        {
+            UInt viewFlags     = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_FLAGS;
+            UInt basePagesAxis = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_PAGES_PER_AXIS;
+            Bool isPerspective = (viewFlags & 4u) != 0u;
+            Bool isPointCube   = (viewFlags & 32u) != 0u;
+            UInt evalMip       = centerLookup.resolvedMipLevel;
+            UInt mipPagesAxis  = Max(basePagesAxis >> evalMip, 1u);
+
+            Int  snappedOrigX  = (isPerspective || mipPagesAxis == 1u)
+                ? 0
+                : NVSOrthoSnapOriginAtMip(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SNAPPED_ORIGIN_X, evalMip);
+            Int  snappedOrigY  = (isPerspective || mipPagesAxis == 1u)
+                ? 0
+                : NVSOrthoSnapOriginAtMip(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SNAPPED_ORIGIN_Y, evalMip);
+            Int  halfPages     = Int(mipPagesAxis / 2u);
+            Int  relX          = wPageX - (snappedOrigX - halfPages);
+            Int  relY          = wPageY - (snappedOrigY - halfPages);
+            Int  lim           = Int(mipPagesAxis);
+
+            if (relX < 0 || relX >= lim || relY < 0 || relY >= lim)
+            {
+                r.status = 6u;
+                // Point Light 6-face seamless cubemap cross-face boundary resolution
+                if (isPointCube && centerLookup.receiverLightZ > 0.00001)
+                {
+                    UInt faceIdx      = NVSExtractViewCubeFaceIndex(viewFlags);
+                    UInt cubeBaseView = (viewIndex >= faceIdx) ? (viewIndex - faceIdx) : viewIndex;
+
+                    UInt viewBufCount  = 0u;
+                    UInt viewBufStride = 0u;
+                    GetDimensions(NVSShadowMetadata.LightViewTable, viewBufCount, viewBufStride);
+                    UInt viewTableLimit = Min(NVSShadowMetadata.Params.NVS_VIEW_TABLE_COUNT, viewBufCount);
+
+                    if ((cubeBaseView + 6u) <= viewTableLimit)
+                    {
+                        Float worldExtent = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_WORLD_EXTENT;
+                        Float cMinZ0      = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MIN_Z;
+                        Float cMaxZ0      = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MAX_Z;
+                        Float mipPageSize = worldExtent / Float(mipPagesAxis);
+                        Float centerShift = (mipPagesAxis == 1u) ? 0.5 : 0.0;
+                        Float tapTanX     = (exactPageX - centerShift) * mipPageSize;
+                        Float tapTanY     = (exactPageY - centerShift) * mipPageSize;
+
+                        Mat4 lightToWorld = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_LIGHT_TO_WORLD;
+                        Vec3 lightPos     = Mul(lightToWorld, Vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                        Vec3 R            = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_RIGHT_AND_CENTER_X.xyz;
+                        Vec3 U            = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_UP_AND_CENTER_Y.xyz;
+                        Vec3 D            = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DIR_AND_EXTRUSION.xyz;
+
+                        // Intersect offset ray with the receiver tangent plane so cross-face cube taps preserve 3D RPDB continuity
+                        Float nSq0   = Dot(worldNormal, worldNormal);
+                        Float tapLz0 = centerLookup.receiverLightZ;
+                        if (nSq0 > 0.25)
+                        {
+                            Vec3  safeN0   = worldNormal * Rsqrt(nSq0);
+                            Float cTanX    = ((Float(centerLookup.worldPageX) + centerLookup.rawSliceUV.x) - centerShift) * mipPageSize;
+                            Float cTanY    = ((Float(centerLookup.worldPageY) + (1.0 - centerLookup.rawSliceUV.y)) - centerShift) * mipPageSize;
+                            Vec3  cRay     = D + (R * cTanX) + (U * cTanY);
+                            Vec3  tRay     = D + (R * tapTanX) + (U * tapTanY);
+                            Float cNum     = Dot(safeN0, cRay);
+                            Float tDen     = Dot(safeN0, tRay);
+                            if ((cNum * tDen) > 0.0)
+                            {
+                                Float minTDen  = 0.25 * Sqrt(Dot(tRay, tRay));
+                                Float safeTDen = (tDen >= 0.0) ? Max(tDen, minTDen) : Min(tDen, -minTDen);
+                                Float ratio    = Clamp(cNum / safeTDen, 0.5, 2.0);
+                                tapLz0         = Clamp(centerLookup.receiverLightZ * ratio, cMinZ0, cMaxZ0);
+                            }
+                        }
+
+                        Vec3 tapWorldPos  = lightPos + (D + (R * tapTanX) + (U * tapTanY)) * tapLz0;
+                        UInt nbrView      = NVSSelectPointCubeFaceView(cubeBaseView, tapWorldPos);
+                        UInt nbrFlags     = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_FLAGS;
+                        UInt nbrBasePages = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_PAGES_PER_AXIS;
+                        Float nbrExtent   = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_WORLD_EXTENT;
+                        Float nbrMinZ     = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_CASTER_MIN_Z;
+                        Float nbrMaxZ     = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_CASTER_MAX_Z;
+                        UInt nbrMipCount  = NVSExtractViewMipCount(nbrFlags);
+
+                        Mat4  nbrL2W      = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_LIGHT_TO_WORLD;
+                        Vec3  nbrLightPos = Mul(nbrL2W, Vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                        Vec3  nbrRel      = tapWorldPos - nbrLightPos;
+                        Float nbrLx       = Dot(nbrRel, NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_RIGHT_AND_CENTER_X.xyz);
+                        Float nbrLy       = Dot(nbrRel, NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_UP_AND_CENTER_Y.xyz);
+                        Float nbrLz       = Dot(nbrRel, NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_DIR_AND_EXTRUSION.xyz);
+
+                        if ((nbrFlags & 1u) != 0u &&
+                            nbrBasePages > 0u &&
+                            nbrLz >= nbrMinZ &&
+                            nbrLz <= nbrMaxZ &&
+                            nbrLz > 0.00001 &&
+                            (nbrMaxZ - nbrMinZ) > 0.000001)
+                        {
+                            UInt vPageBufCount  = 0u;
+                            UInt vPageBufStride = 0u;
+                            GetDimensions(NVSShadowMetadata.VirtualPageTable, vPageBufCount, vPageBufStride);
+                            UInt pPageBufCount  = 0u;
+                            UInt pPageBufStride = 0u;
+                            GetDimensions(NVSShadowMetadata.PhysicalPageTable, pPageBufCount, pPageBufStride);
+                            UInt totVP      = Min(NVSShadowMetadata.Params.NVS_TOTAL_VIRTUAL_PAGES, vPageBufCount);
+                            UInt physCap    = Min(NVSShadowMetadata.Params.NVS_PHYSICAL_POOL_CAPACITY, pPageBufCount);
+                            UInt nbrLightId = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_LIGHT_ID;
+                            UInt nbrSubIdx  = NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_SUB_INDEX;
+                            Float projX     = nbrLx / nbrLz;
+                            Float projY     = nbrLy / nbrLz;
+
+                            UInt tryCnt = (((evalMip + 1u) < nbrMipCount) ? 2u : 1u) + UInt(NVSLoopDynamicZero());
+                            for (UInt tPass = 0u; tPass < tryCnt; tPass++)
+                            {
+                                UInt  curMip      = (tPass == 0u) ? evalMip : (nbrMipCount - 1u);
+                                UInt  curPages    = Max(nbrBasePages >> curMip, 1u);
+                                Float curPageSize = nbrExtent / Float(curPages);
+                                Float curShift    = (curPages == 1u) ? 0.5 : 0.0;
+                                Float exX         = (projX / curPageSize) + curShift;
+                                Float exY         = (projY / curPageSize) + curShift;
+                                Float flNbrX      = Floor(exX);
+                                Float flNbrY      = Floor(exY);
+                                Int   nwX         = Int(flNbrX);
+                                Int   nwY         = Int(flNbrY);
+                                Int   nHalf       = Int(curPages / 2u);
+                                Int   nRelX       = nwX + nHalf;
+                                Int   nRelY       = nwY + nHalf;
+                                Int   nLim        = Int(curPages);
+                                UInt  curSt       = 6u;
+                                UInt  nPhys       = ~0u;
+
+                                if (nRelX >= 0 && nRelX < nLim && nRelY >= 0 && nRelY < nLim)
+                                {
+                                    UInt nvx    = (curPages == 1u) ? 0u : NVSWorldPageToToroidalPage(nwX, curPages);
+                                    UInt nvy    = (curPages == 1u) ? 0u : NVSWorldPageToToroidalPage(nwY, curPages);
+                                    UInt nvFlat = NVSLookupSparseVirtualFlatIndex(nbrView, nbrLightId, nbrSubIdx, curMip, nvx, nvy, nbrBasePages);
+                                    if (nvFlat == (~0u))
+                                    {
+                                        curSt = 1u;
+                                    }
+                                    else if (nvFlat < totVP)
+                                    {
+                                        UInt vSF    = NVSShadowMetadata.VirtualPageTable[nvFlat].NVS_VPAGE_STATE_AND_FLAGS;
+                                        UInt vState = vSF & 0xFu;
+                                        if (vState != 3u)
+                                        {
+                                            curSt = (vState == 1u || vState == 2u) ? 2u : ((vState == 4u) ? 3u : 1u);
+                                        }
+                                        else
+                                        {
+                                            UInt physIdx = NVSShadowMetadata.VirtualPageTable[nvFlat].NVS_VPAGE_PHYSICAL_INDEX;
+                                            if (physIdx >= physCap)
+                                            {
+                                                curSt = 4u;
+                                            }
+                                            else
+                                            {
+                                                UInt pkAddr = NVSShadowMetadata.VirtualPageTable[nvFlat].NVS_VPAGE_VIRTUAL_ADDRESS;
+                                                UInt pSF    = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_STATE_AND_FLAGS;
+                                                UInt pState = pSF & 0xFu;
+                                                UInt pFlat  = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_OWNER_FLAT_INDEX;
+                                                UInt pAddr  = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_OWNER_ADDRESS;
+                                                UInt pGen   = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_GENERATION;
+                                                UInt pView  = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_META_AUX;
+                                                Bool extAd  = ((vSF & 512u) != 0u) || ((pSF & 128u) != 0u);
+                                                Bool match  = extAd
+                                                    ? (((pkAddr >> 20u) & 0xFFFu) != 0u && pView == nbrView && ((pkAddr >> 16u) & 0xFu) == curMip && (pkAddr & 0xFFu) == nvx && ((pkAddr >> 8u) & 0xFFu) == nvy)
+                                                    : (((pkAddr >> 24u) & 0xFFu) != 0u && ((pkAddr >> 18u) & 0x3Fu) == nbrLightId && ((pkAddr >> 16u) & 0x3u) == nbrSubIdx && (pkAddr & 0xFFu) == nvx && ((pkAddr >> 8u) & 0xFFu) == nvy);
+                                                curSt = (match && pState == 3u && pGen != 0u && pFlat == nvFlat && pAddr == pkAddr) ? 0u : 4u;
+                                                nPhys = physIdx;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (tPass == 0u)
+                                {
+                                    r.status = curSt;
+                                }
+                                if (curSt == 0u)
+                                {
+                                    Float nRawU = exX - flNbrX;
+                                    Float nRawV = 1.0 - (exY - flNbrY);
+                                    r.safeUV    = Vec2(Clamp(nRawU, minUV, maxUV), Clamp(nRawV, minUV, maxUV));
+
+                                    Bool  revZ  = (nbrFlags & 2u) != 0u;
+                                    Float dz    = nbrMaxZ - nbrMinZ;
+                                    Float pz    = revZ ? (-nbrMinZ / dz) : (nbrMaxZ / dz);
+                                    Float qz    = revZ ? ((nbrMinZ * nbrMaxZ) / dz) : (-(nbrMinZ * nbrMaxZ) / dz);
+                                    Float ndcZ  = pz + (qz / nbrLz);
+
+                                    Float nSq         = Dot(worldNormal, worldNormal);
+                                    Float slopeFactor = 1.0;
+                                    if (nSq > 0.25)
+                                    {
+                                        Vec3  safeN   = worldNormal * Rsqrt(nSq);
+                                        Float rayInvL = Rsqrt(Max(Dot(nbrRel, nbrRel), 0.0000000001));
+                                        Float cosSlp  = Clamp(Abs(Dot(safeN, nbrRel * rayInvL)), 0.0, 1.0);
+                                        Float sinSlp  = Sqrt(Max(1.0 - (cosSlp * cosSlp), 0.0));
+                                        slopeFactor   = 1.0 + Clamp(sinSlp / Max(cosSlp, 0.15), 0.0, 6.0);
+                                    }
+
+                                    Float absDb = Abs(NVSShadowMetadata.LightViewTable[nbrView].NVS_VIEW_DEPTH_BIAS_NDC);
+                                    Float effDb = 0.0;
+                                    if (absDb > 0.0)
+                                    {
+                                        Bool rastDB = (nbrFlags & 64u) != 0u;
+                                        Bool texRel = (nbrFlags & 256u) != 0u;
+                                        if (texRel)
+                                        {
+                                            Float mScale    = Float(1u << curMip);
+                                            Float fullB     = (mScale * absDb * slopeFactor) / Max(nbrLz, nbrMinZ);
+                                            Float rastB     = rastDB ? ((mScale * absDb) / Max(nbrMaxZ, nbrMinZ)) : 0.0;
+                                            Float minNdcEps = 0.0000015 * Clamp(absDb * 1000000.0, 0.0, 1.0);
+                                            effDb           = Max(fullB - rastB, minNdcEps);
+                                        }
+                                        else
+                                        {
+                                            effDb = rastDB ? 0.0 : absDb;
+                                        }
+                                    }
+
+                                    r.compareDepth      = Clamp(revZ ? (ndcZ + effDb) : (ndcZ - effDb), 0.0, 1.0);
+                                    r.status            = 0u;
+                                    r.physicalPageIndex = nPhys;
+                                    r.crossFace         = true;
+                                    break;
+                                }
+                                if (curSt == 6u || curSt == 7u)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                UInt viewLightId  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_LIGHT_ID;
+                UInt viewSubIdx   = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SUB_INDEX;
+                UInt viewMipCount = NVSExtractViewMipCount(viewFlags);
+                UInt sameTryCnt   = (((evalMip + 1u) < viewMipCount) ? 2u : 1u) + UInt(NVSLoopDynamicZero());
+
+                for (UInt sPass = 0u; sPass < sameTryCnt; sPass++)
+                {
+                    UInt curMip      = (sPass == 0u) ? evalMip : (viewMipCount - 1u);
+                    UInt curPages    = Max(basePagesAxis >> curMip, 1u);
+                    Int  cwX         = wPageX;
+                    Int  cwY         = wPageY;
+                    Vec2 curSafe     = r.safeUV;
+                    Bool inCurBounds = true;
+                    if (sPass > 0u)
+                    {
+                        Float invMipPages  = 1.0 / Float(Max(mipPagesAxis, 1u));
+                        Float curShift     = (curPages == 1u) ? 0.5 : 0.0;
+                        Float worldExtentS = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_WORLD_EXTENT;
+                        Float centerNormX  = (!isPerspective && curPages == 1u && worldExtentS > 0.00001)
+                            ? (NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_RIGHT_AND_CENTER_X.w / worldExtentS)
+                            : 0.0;
+                        Float centerNormY  = (!isPerspective && curPages == 1u && worldExtentS > 0.00001)
+                            ? (NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_UP_AND_CENTER_Y.w / worldExtentS)
+                            : 0.0;
+                        Float curExX       = (((exactPageX * invMipPages) - centerNormX) * Float(curPages)) + curShift;
+                        Float curExY       = (((exactPageY * invMipPages) - centerNormY) * Float(curPages)) + curShift;
+                        Float flCurX       = Floor(curExX);
+                        Float flCurY       = Floor(curExY);
+                        cwX                = Int(flCurX);
+                        cwY                = Int(flCurY);
+                        curSafe            = Vec2(Clamp(curExX - flCurX, minUV, maxUV), Clamp(1.0 - (curExY - flCurY), minUV, maxUV));
+
+                        Int curSnapX = (isPerspective || curPages == 1u)
+                            ? 0
+                            : NVSOrthoSnapOriginAtMip(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SNAPPED_ORIGIN_X, curMip);
+                        Int curSnapY = (isPerspective || curPages == 1u)
+                            ? 0
+                            : NVSOrthoSnapOriginAtMip(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SNAPPED_ORIGIN_Y, curMip);
+                        Int curHalf  = Int(curPages / 2u);
+                        Int cRelX    = cwX - (curSnapX - curHalf);
+                        Int cRelY    = cwY - (curSnapY - curHalf);
+                        Int cLim     = Int(curPages);
+                        inCurBounds  = (cRelX >= 0 && cRelX < cLim && cRelY >= 0 && cRelY < cLim);
+                    }
+
+                    UInt vx    = (curPages == 1u) ? 0u : NVSWorldPageToToroidalPage(cwX, curPages);
+                    UInt vy    = (curPages == 1u) ? 0u : NVSWorldPageToToroidalPage(cwY, curPages);
+                    UInt vFlat = inCurBounds
+                        ? NVSLookupSparseVirtualFlatIndex(viewIndex, viewLightId, viewSubIdx, curMip, vx, vy, basePagesAxis)
+                        : (~1u);
+                    UInt curSt = inCurBounds ? 1u : 6u;
+                    UInt cPhys = ~0u;
+
+                    if (!inCurBounds)
+                    {
+                        curSt = 6u;
+                    }
+                    else if (vFlat == (~0u))
+                    {
+                        curSt = 1u;
+                    }
+                    else if (vFlat >= NVSShadowMetadata.Params.NVS_TOTAL_VIRTUAL_PAGES)
+                    {
+                        curSt = 6u;
+                    }
+                    else
+                    {
+                        UInt vStateAndFlags = NVSShadowMetadata.VirtualPageTable[vFlat].NVS_VPAGE_STATE_AND_FLAGS;
+                        UInt vState         = vStateAndFlags & 0xFu;
+                        if (vState != 3u)
+                        {
+                            curSt = (vState == 1u || vState == 2u) ? 2u : ((vState == 4u) ? 3u : 1u);
+                        }
+                        else
+                        {
+                            UInt physIdx = NVSShadowMetadata.VirtualPageTable[vFlat].NVS_VPAGE_PHYSICAL_INDEX;
+                            if (physIdx >= NVSShadowMetadata.Params.NVS_PHYSICAL_POOL_CAPACITY)
+                            {
+                                curSt = 4u;
+                            }
+                            else
+                            {
+                                UInt packedAddr     = NVSShadowMetadata.VirtualPageTable[vFlat].NVS_VPAGE_VIRTUAL_ADDRESS;
+                                UInt pStateAndFlags = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_STATE_AND_FLAGS;
+                                UInt pState         = pStateAndFlags & 0xFu;
+                                UInt pOwnerFlat     = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_OWNER_FLAT_INDEX;
+                                UInt pOwnerAddr     = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_OWNER_ADDRESS;
+                                UInt pGen           = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_GENERATION;
+                                UInt pOwnerView     = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_META_AUX;
+
+                                Bool isExtAddr = ((vStateAndFlags & 512u) != 0u) || ((pStateAndFlags & 128u) != 0u);
+                                Bool addrMatch = isExtAddr
+                                    ? (((packedAddr >> 20u) & 0xFFFu) != 0u && pOwnerView == viewIndex && ((packedAddr >> 16u) & 0xFu) == curMip && (packedAddr & 0xFFu) == vx && ((packedAddr >> 8u) & 0xFFu) == vy)
+                                    : (((packedAddr >> 24u) & 0xFFu) != 0u && ((packedAddr >> 18u) & 0x3Fu) == viewLightId && ((packedAddr >> 16u) & 0x3u) == viewSubIdx && (packedAddr & 0xFFu) == vx && ((packedAddr >> 8u) & 0xFFu) == vy);
+
+                                curSt = (addrMatch && pState == 3u && pGen != 0u && pOwnerFlat == vFlat && pOwnerAddr == packedAddr) ? 0u : 4u;
+                                cPhys = physIdx;
+                            }
+                        }
+                    }
+
+                    if (sPass == 0u)
+                    {
+                        r.status = curSt;
+                    }
+                    if (curSt == 0u)
+                    {
+                        if (sPass > 0u)
+                        {
+                            r.safeUV    = curSafe;
+                            Bool  revZ  = (viewFlags & 2u) != 0u;
+                            Bool  texRl = (viewFlags & 256u) != 0u;
+                            Bool  rstDB = (viewFlags & 64u) != 0u;
+                            Float absDb = Abs(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DEPTH_BIAS_NDC);
+                            if (texRl && absDb > 0.0 && !rstDB)
+                            {
+                                Float slopeFactor = 1.0;
+                                Float nSqStep     = Dot(worldNormal, worldNormal);
+                                if (nSqStep > 0.25)
+                                {
+                                    Vec3  safeNStep    = worldNormal * Rsqrt(nSqStep);
+                                    Vec3  lightDirStep = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DIR_AND_EXTRUSION.xyz;
+                                    Float cosSlp       = Clamp(Abs(Dot(safeNStep, lightDirStep)), 0.4, 1.0);
+                                    slopeFactor        = Clamp(1.0 / cosSlp, 1.0, 2.5);
+                                }
+                                Float dScale = Float(1u << curMip) - Float(1u << evalMip);
+                                Float addDb  = dScale * absDb * slopeFactor;
+                                if (isPerspective)
+                                {
+                                    Float cMinZ = Max(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MIN_Z, 0.0001);
+                                    addDb       = addDb / Max(centerLookup.receiverLightZ, cMinZ);
+                                }
+                                r.compareDepth = Clamp(revZ ? (r.compareDepth + addDb) : (r.compareDepth - addDb), 0.0, 1.0);
+                            }
+                        }
+                        r.status            = 0u;
+                        r.physicalPageIndex = cPhys;
+                        break;
+                    }
+                }
+            }
+        }
+        return r;
+    }
+
+    // Evaluates a C0-continuous comparison shadow tap at a texel offset relative to centerLookup
+    // using a precomputed per-texel Receiver-Plane Depth Bias gradient (rpdbGrad).
+    // Performs exact 4-corner per-texel RPDB bilinear comparison inside the page and across
+    // page boundaries and Point cubemap face edges, eliminating sub-texel sawtooth tearing.
+    NVSShadowTapSample NVSSampleCompareTapAtTexelOffsetGrad(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldNormal,
+        Vec2            texelOffsetXY,
+        Vec2            rpdbGrad)
+    {
+        NVSShadowTapSample tap;
+        tap.valid             = false;
+        tap.status            = centerLookup.status;
+        tap.physicalPageIndex = ~0u;
+        tap.rawDepth          = 0.0;
+        tap.visibility        = 0.0;
+        Float baseCmpDepth    = centerLookup.receiverCompareDepth + Dot(rpdbGrad, texelOffsetXY);
+        tap.compareDepth      = Clamp(baseCmpDepth, 0.0, 1.0);
+
+        if (centerLookup.status < 5u)
+        {
+            UInt  texelCount    = Max(NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE, 1u);
+            Int   iTexelCount   = Int(texelCount);
+            Float fTexelCount   = Float(texelCount);
+            Float invTexelCount = 1.0 / fTexelCount;
+            Float minUV         = 0.5 * invTexelCount;
+            Float maxUV         = 1.0 - minUV;
+
+            UInt  vFlags        = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_FLAGS;
+            Bool  isRevZ        = (vFlags & 2u) != 0u;
+
+            Vec2  centerTex     = centerLookup.rawSliceUV * fTexelCount;
+            Vec2  tapTex        = centerTex + texelOffsetXY - Vec2(0.5, 0.5);
+            Vec2  flTap         = Floor(tapTex);
+            Int   ix0           = Int(flTap.x);
+            Int   iy0           = Int(flTap.y);
+            Float fx            = tapTex.x - flTap.x;
+            Float fy            = tapTex.y - flTap.y;
+
+            if (ix0 >= 0 && (ix0 + 1) < iTexelCount &&
+                iy0 >= 0 && (iy0 + 1) < iTexelCount)
+            {
+                if (centerLookup.status == 0u)
+                {
+                    // Exact C0-continuous 4-corner per-texel RPDB bilinear comparison:
+                    // compares each texel center of the 2x2 quad against its own analytic
+                    // receiver tangent-plane depth (zero sawtooth discontinuity across texel boundaries).
+                    Int   slice = Int(centerLookup.physicalPageIndex);
+                    Float d00   = Load(NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP, Int4(ix0,     iy0,     slice, 0)).r;
+                    Float d10   = Load(NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP, Int4(ix0 + 1, iy0,     slice, 0)).r;
+                    Float d01   = Load(NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP, Int4(ix0,     iy0 + 1, slice, 0)).r;
+                    Float d11   = Load(NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP, Int4(ix0 + 1, iy0 + 1, slice, 0)).r;
+
+                    Float z00   = Clamp(baseCmpDepth + ((-fx)        * rpdbGrad.x) + ((-fy)        * rpdbGrad.y), 0.0, 1.0);
+                    Float z10   = Clamp(baseCmpDepth + ((1.0 - fx)   * rpdbGrad.x) + ((-fy)        * rpdbGrad.y), 0.0, 1.0);
+                    Float z01   = Clamp(baseCmpDepth + ((-fx)        * rpdbGrad.x) + ((1.0 - fy)   * rpdbGrad.y), 0.0, 1.0);
+                    Float z11   = Clamp(baseCmpDepth + ((1.0 - fx)   * rpdbGrad.x) + ((1.0 - fy)   * rpdbGrad.y), 0.0, 1.0);
+
+                    Float c00   = isRevZ ? ((z00 >= d00) ? 1.0 : 0.0) : ((z00 <= d00) ? 1.0 : 0.0);
+                    Float c10   = isRevZ ? ((z10 >= d10) ? 1.0 : 0.0) : ((z10 <= d10) ? 1.0 : 0.0);
+                    Float c01   = isRevZ ? ((z01 >= d01) ? 1.0 : 0.0) : ((z01 <= d01) ? 1.0 : 0.0);
+                    Float c11   = isRevZ ? ((z11 >= d11) ? 1.0 : 0.0) : ((z11 <= d11) ? 1.0 : 0.0);
+
+                    Float row0  = c00 + ((c10 - c00) * fx);
+                    Float row1  = c01 + ((c11 - c01) * fx);
+
+                    tap.valid             = true;
+                    tap.status            = 0u;
+                    tap.physicalPageIndex = centerLookup.physicalPageIndex;
+                    tap.visibility        = row0 + ((row1 - row0) * fy);
+                }
+            }
+            else
+            {
+                // Seamless 4-corner per-texel RPDB comparison across page seams & Point cube face boundaries
+                Int   subCount  = 4 + NVSLoopDynamicZero();
+                Float offX0     = (Float(ix0) + 0.5) - centerTex.x;
+                Float offY0     = (Float(iy0) + 0.5) - centerTex.y;
+                Float wSum      = 0.0;
+                Float vSum      = 0.0;
+                UInt  firstSt   = 1u;
+
+                for (Int sIdx = 0; sIdx < subCount; sIdx++)
+                {
+                    Int   kx   = sIdx & 1;
+                    Int   ky   = sIdx >> 1;
+                    Float wx   = (kx == 0) ? (1.0 - fx) : fx;
+                    Float wy   = (ky == 0) ? (1.0 - fy) : fy;
+                    Float curX = offX0 + Float(kx);
+                    Float curY = offY0 + Float(ky);
+                    NVSResolvedStepPage sp = NVSResolveViewStepPage(
+                        viewIndex,
+                        centerLookup,
+                        worldNormal,
+                        Vec2(curX, curY),
+                        rpdbGrad,
+                        invTexelCount,
+                        minUV,
+                        maxUV);
+                    if (sIdx == 0)
+                    {
+                        firstSt = sp.status;
+                    }
+                    if (sp.status == 0u)
+                    {
+                        Float vis = 0.0;
+                        if (sp.crossFace)
+                        {
+                            vis = NVSSamplePhysicalDepthCompare(
+                                sp.physicalPageIndex,
+                                sp.safeUV,
+                                sp.compareDepth);
+                        }
+                        else
+                        {
+                            Int   tx = Clamp(Int(Floor(sp.safeUV.x * fTexelCount)), 0, iTexelCount - 1);
+                            Int   ty = Clamp(Int(Floor(sp.safeUV.y * fTexelCount)), 0, iTexelCount - 1);
+                            Float d  = Load(NVSShadowResources.ShadowMaps.NVS_SHADOW_MAP, Int4(tx, ty, Int(sp.physicalPageIndex), 0)).r;
+                            vis      = isRevZ ? ((sp.compareDepth >= d) ? 1.0 : 0.0) : ((sp.compareDepth <= d) ? 1.0 : 0.0);
+                        }
+                        Float w   = wx * wy;
+                        wSum      = wSum + w;
+                        vSum      = vSum + (w * vis);
+                        tap.physicalPageIndex = sp.physicalPageIndex;
+                        tap.compareDepth      = sp.compareDepth;
+                    }
+                }
+
+                if (wSum > 0.0)
+                {
+                    tap.valid      = true;
+                    tap.status     = 0u;
+                    tap.visibility = vSum / wSum;
+                }
+                else
+                {
+                    tap.status = firstSt;
+                }
+            }
+        }
+
+        return tap;
+    }
+
+    NVSShadowTapSample NVSSampleCompareTapAtTexelOffset(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Vec2            texelOffsetXY)
+    {
+        Vec2 rpdbGrad = (Dot(texelOffsetXY, texelOffsetXY) > 0.00000001)
+            ? NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal)
+            : Vec2(0.0, 0.0);
+        return NVSSampleCompareTapAtTexelOffsetGrad(
+            viewIndex,
+            centerLookup,
+            worldNormal,
+            texelOffsetXY,
+            rpdbGrad);
+    }
+
+    Float NVSEvaluateHardShadow(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float invalidPageFallbackVisibility)
+    {
+        NVSLookupResult lookup = NVSResolveShadowLookup(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal);
+        Float vis = NVSEvaluateLookupCompare(lookup, invalidPageFallbackVisibility);
+        if (lookup.status == 0u)
+        {
+            Vec2 rpdbGrad = NVSComputeReceiverPlaneDepthGradientPerTexel(
+                lookup.selectedViewIndex,
+                lookup,
+                worldNormal);
+            NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                lookup.selectedViewIndex,
+                lookup,
+                worldNormal,
+                Vec2(0.0, 0.0),
+                rpdbGrad);
+            if (tap.valid)
+            {
+                vis = tap.visibility;
+            }
+        }
+        return vis;
+    }
+
+    NVSShadowTapSample NVSSampleRawTapAtTexelOffsetGrad(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldNormal,
+        Vec2            texelOffsetXY,
+        Vec2            rpdbGrad)
+    {
+        NVSShadowTapSample tap;
+        tap.valid             = false;
+        tap.status            = centerLookup.status;
+        tap.physicalPageIndex = ~0u;
+        tap.rawDepth          = 0.0;
+        tap.visibility        = 0.0;
+        tap.compareDepth      = Clamp(centerLookup.receiverCompareDepth + Dot(rpdbGrad, texelOffsetXY), 0.0, 1.0);
+
+        if (centerLookup.status < 5u)
+        {
+            UInt  texelCount    = Max(NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE, 1u);
+            Float invTexelCount = 1.0 / Float(texelCount);
+            Float minUV         = 0.5 * invTexelCount;
+            Float maxUV         = 1.0 - minUV;
+            Vec2  shiftedUV     = centerLookup.rawSliceUV + (texelOffsetXY * invTexelCount);
+
+            if (shiftedUV.x >= minUV && shiftedUV.x <= maxUV &&
+                shiftedUV.y >= minUV && shiftedUV.y <= maxUV)
+            {
+                if (centerLookup.status == 0u)
+                {
+                    tap.valid             = true;
+                    tap.status            = 0u;
+                    tap.physicalPageIndex = centerLookup.physicalPageIndex;
+                    tap.rawDepth          = NVSSamplePhysicalDepthRaw(
+                        centerLookup.physicalPageIndex,
+                        shiftedUV);
+                }
+            }
+            else
+            {
+                NVSResolvedStepPage sp = NVSResolveViewStepPage(
+                    viewIndex,
+                    centerLookup,
+                    worldNormal,
+                    texelOffsetXY,
+                    rpdbGrad,
+                    invTexelCount,
+                    minUV,
+                    maxUV);
+                tap.status       = sp.status;
+                tap.compareDepth = sp.compareDepth;
+                if (sp.status == 0u)
+                {
+                    tap.valid             = true;
+                    tap.physicalPageIndex = sp.physicalPageIndex;
+                    tap.rawDepth          = NVSSamplePhysicalDepthRaw(
+                        sp.physicalPageIndex,
+                        sp.safeUV);
+                }
+            }
+        }
+
+        return tap;
+    }
+
+    NVSShadowTapSample NVSSampleRawTapAtTexelOffset(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Vec2            texelOffsetXY)
+    {
+        Vec2 rpdbGrad = (Dot(texelOffsetXY, texelOffsetXY) > 0.00000001)
+            ? NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal)
+            : Vec2(0.0, 0.0);
+        return NVSSampleRawTapAtTexelOffsetGrad(
+            viewIndex,
+            centerLookup,
+            worldNormal,
+            texelOffsetXY,
+            rpdbGrad);
+    }
+}

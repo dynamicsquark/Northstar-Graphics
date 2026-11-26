@@ -1,0 +1,93 @@
+// =====================================================================
+//  StandardLitNVGVS.nsl
+//  Northstar Graphics — Attribute-Less NVG Vertex-Pulling Lit Vertex Shader
+//
+//  Zero-decode Path-A Virtual Geometry vertex shader paired with StandardLitPS:
+//    - Declares only SV_VertexID / SV_InstanceID so CoreNVGManager selects
+//      hardware multi-cluster Vertex Pulling (zero intermediate IA decode).
+//    - Decompresses cluster vertices directly from 32 KiB physical pages.
+// =====================================================================
+
+STAGE VERTEX
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl")
+}
+
+INPUT_LAYOUT
+{
+    Get(VERTEX_ID)
+    Get(INSTANCE_ID)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(CLIP_POSITION)
+    Add(WORLD_POSITION)
+    Add(WORLD_NORMAL)
+    Add(TANGENT)
+    Add(BITANGENT)
+    Add(UV0)
+    Add(UV1)
+    Add(COLOR)
+}
+
+PROPERTY Transforms
+{
+    Buffer Matrices
+    {
+        Get(VP_MATRIX)
+    }
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+
+        UInt             objSlot = 0u;
+        NVGDecodedVertex v;
+        if (!NVGDecodeClusterVertexDirect(input.INSTANCE_ID, input.VERTEX_ID, objSlot, v))
+        {
+            o.CLIP_POSITION  = NVGDegenerateClipPosition();
+            o.WORLD_POSITION = Vec3(0.0, 0.0, 0.0);
+            o.WORLD_NORMAL   = Vec3(0.0, 1.0, 0.0);
+            o.TANGENT        = Vec3(1.0, 0.0, 0.0);
+            o.BITANGENT      = Vec3(0.0, 0.0, 1.0);
+            o.UV0            = Vec2(0.0, 0.0);
+            o.UV1            = Vec2(0.0, 0.0);
+            o.COLOR          = Vec4(1.0, 1.0, 1.0, 1.0);
+            return o;
+        }
+
+        Mat4 world    = NVGGetObjectWorldMatrix(objSlot);
+        Vec3 worldPos = NVGTransformPosition(world, v.position);
+        Vec3 worldNrm = NVGTransformNormal(world, v.normal);
+
+        Vec3 refAxis  = (Abs(worldNrm.y) < 0.999) ? Vec3(0.0, 1.0, 0.0) : Vec3(1.0, 0.0, 0.0);
+        Vec3 worldTan = Normalize(Cross(refAxis, worldNrm));
+        Vec3 worldBit = Cross(worldNrm, worldTan);
+
+        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, Vec4(worldPos, 1.0));
+        o.WORLD_POSITION = worldPos;
+        o.WORLD_NORMAL   = worldNrm;
+        o.TANGENT        = worldTan;
+        o.BITANGENT      = worldBit;
+        o.UV0            = v.uv0;
+        o.UV1            = v.uv0;
+
+        if (NVGGetDebugMode() != 0u)
+        {
+            NVGVisibleCluster dbgVc = NVGLoadVisibleCluster(input.INSTANCE_ID);
+            o.COLOR = Vec4(NVGComputeDebugColor(dbgVc, worldNrm), 1.0);
+        }
+        else
+        {
+            o.COLOR = v.color;
+        }
+
+        return o;
+    }
+}

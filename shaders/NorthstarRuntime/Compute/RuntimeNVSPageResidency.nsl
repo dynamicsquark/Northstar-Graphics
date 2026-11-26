@@ -1,0 +1,1800 @@
+// =====================================================================
+//  RuntimeNVSPageResidency.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Shadows (NVS) — Demand-Driven 2-Level Sparse
+//  Virtual Page Hierarchy, Fair Cross-Light Residency & Physical Pool
+//
+//  Dispatch Modes:
+//    Mode 0 (PROCESS_REQUESTS_AND_ALLOCATE):
+//      - Flat path (sparseMode == 0): 16-bit flat VPT residency pass.
+//      - Sparse path (sparseMode != 0): Demand-driven 2-level directory +
+//        64-page leaf block allocation on GPU, 64-bit (viewIndex, coord)
+//        deduplication, coarse-anchor + fair cross-light quota + priority
+//        sorting, LRU physical eviction, and selective clear indirect args.
+//    Mode 1 (MARK_CLEARED_PAGES):
+//      Transitions ALLOCATED_NOT_CLEARED (1) -> CLEARED_NOT_RENDERED (2).
+//    Mode 2 (PROMOTE_CLEARED_TO_VALID):
+//      Direct state promotion: CLEARED_NOT_RENDERED (2) -> VALID_SHADOW_DATA (3).
+//    Mode 3 (RESET_ALL_TABLES):
+//      Resets VirtualPageTable, PhysicalPageTable, SparsePageHierarchy,
+//      ring-buffer free lists, and telemetry on the GPU.
+//    Mode 4 (COMMIT_RENDERED_PAGES):
+//      Generation-checked per-page CLEARED_NOT_RENDERED -> VALID_SHADOW_DATA
+//      commit after shadow rasterization.
+//    Mode 5 (BATCH_INVALIDATE_VIEWS):
+//      O(1) per-physical-page batch invalidation, toroidal origin-shift
+//      strip invalidation, and full directory/leaf-block reclamation for
+//      deleted or reconfigured lights/views/cameras.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVSResidencyParams {
+    Buffer Config {
+        Add(dispatchMode)             : UInt = 0
+        Add(currentFrame)             : UInt = 1
+        Add(minInFlightProtectFrames) : UInt = 2
+        Add(requestCount)             : UInt = 0
+        Add(pagesPerAxis)             : UInt = 32
+        Add(clipmapLevelCount)        : UInt = 4
+        Add(maxLightCount)            : UInt = 1
+        Add(physicalPoolCapacity)     : UInt = 256
+        Add(invalidationMode)         : UInt = 0
+        Add(invalidateLightId)        : UInt = 0
+        Add(invalidateClipmapLevel)   : UInt = 0
+        Add(invalidateRegionPacked)   : UInt = 0
+        Add(originShiftDeltaX)        : Int  = 0
+        Add(originShiftDeltaY)        : Int  = 0
+        Add(maxDirtyClearOutput)      : UInt = 256
+        Add(clearTailSentinel)        : UInt = 1
+        Add(snappedOriginPageX)       : Int  = 0
+        Add(snappedOriginPageY)       : Int  = 0
+        Add(markClearedInPass)        : UInt = 0
+        Add(gpuRequestConfig)         : UInt = 0
+        Add(sparseMode)               : UInt = 0
+        Add(sparseRootCapacity)       : UInt = 0
+        Add(sparseDirCapacity)        : UInt = 0
+        Add(sparseBlockCapacity)      : UInt = 0
+        Add(invalidationCmdCount)     : UInt = 0
+        Add(maxMissRecordsCapacity)   : UInt = 0
+        Add(clipmapTableSize)         : UInt = 0
+        Add(residencySubMode)         : UInt = 0
+    }
+    StructuredBuffer PageRequests {
+        Add(virtualAddressPacked) : UInt
+        Add(requestFlags)         : UInt
+        Add(requestPriority)      : UInt
+        Add(requestUserData)      : UInt
+    }
+    StructuredBuffer InInvalidationCommands {
+        Add(mode)              : UInt
+        Add(viewIndex)         : UInt
+        Add(viewCount)         : UInt
+        Add(regionOrPagesAxis) : UInt
+        Add(originShiftDeltaX) : Int
+        Add(originShiftDeltaY) : Int
+        Add(snappedOriginX)    : Int
+        Add(snappedOriginY)    : Int
+    }
+    StructuredBuffer InClipmapLevels {
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(pagesPerAxis)         : UInt
+        Add(flags)                : UInt
+        Add(snappedOriginPageX)   : Int
+        Add(snappedOriginPageY)   : Int
+        Add(worldExtent)          : Float
+        Add(pageWorldSize)        : Float
+        Add(texelWorldSize)       : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(cameraLightZ)         : Float
+        Add(lightRightAndCenterX) : Vec4
+        Add(lightUpAndCenterY)    : Vec4
+        Add(lightDirAndExtrusion) : Vec4
+        Add(transitionAndPadding) : Vec4
+        Add(worldToLightViewCol0) : Vec4
+        Add(worldToLightViewCol1) : Vec4
+        Add(worldToLightViewCol2) : Vec4
+        Add(worldToLightViewCol3) : Vec4
+        Add(lightViewToWorldCol0) : Vec4
+        Add(lightViewToWorldCol1) : Vec4
+        Add(lightViewToWorldCol2) : Vec4
+        Add(lightViewToWorldCol3) : Vec4
+    }
+    RWStructuredBuffer VirtualPageTable {
+        Add(stateAndFlags)        : UInt
+        Add(physicalPageIndex)    : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(lastTouchedFrame)     : UInt
+    }
+    RWStructuredBuffer PhysicalPageTable {
+        Add(stateAndFlags)         : UInt
+        Add(ownerVirtualFlatIndex) : UInt
+        Add(ownerVirtualAddress)   : UInt
+        Add(physicalGeneration)    : UInt
+        Add(lastUsedFrame)         : UInt
+        Add(allocatedFrame)        : UInt
+        Add(minEvictableFrame)     : UInt
+        Add(metaAux)               : UInt
+    }
+    RWStructuredBuffer OutDirtyPhysicalSlices {
+        Add(sliceIndex) : UInt
+    }
+    RWStructuredBuffer OutDirtySliceCount {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutSelectiveClearIndirectArgs {
+        Add(arg) : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(requestedCount)           : UInt
+        Add(validRequestCount)        : UInt
+        Add(invalidRequestCount)      : UInt
+        Add(uniqueRequestCount)       : UInt
+        Add(duplicateRequestCount)    : UInt
+        Add(cacheHitCount)            : UInt
+        Add(cacheMissCount)           : UInt
+        Add(allocatedFromFreeCount)   : UInt
+        Add(evictedCount)             : UInt
+        Add(overflowCount)            : UInt
+        Add(invalidatedCount)         : UInt
+        Add(dirtyClearSliceCount)     : UInt
+        Add(residentValidPages)       : UInt
+        Add(allocatedNotClearedPages) : UInt
+        Add(clearedNotRenderedPages)  : UInt
+        Add(freePhysicalPages)        : UInt
+    }
+    RWStructuredBuffer InOutSparsePageHierarchy {
+        Add(nodeValue) : UInt
+    }
+    RWStructuredBuffer InOutMissRecords {
+        Add(prioritySortKey)   : UInt
+        Add(virtualFlatIndex)  : UInt
+        Add(viewIndex)         : UInt
+        Add(packedCoordAndPin) : UInt
+    }
+}
+
+SHADER {
+    groupshared UInt gs_ValidRequestCount;
+    groupshared UInt gs_InvalidRequestCount;
+    groupshared UInt gs_UniqueRequestCount;
+    groupshared UInt gs_DuplicateRequestCount;
+    groupshared UInt gs_CacheHitCount;
+    groupshared UInt gs_CacheMissCount;
+    groupshared UInt gs_RecordedMissCount;
+    groupshared UInt gs_InvalidatedCount;
+    groupshared UInt gs_EmittedDirtyCount;
+    groupshared UInt gs_ResidentValidCount;
+    groupshared UInt gs_AllocatedNotClearedCount;
+    groupshared UInt gs_ClearedNotRenderedCount;
+    groupshared UInt gs_FreePhysicalCount;
+    groupshared UInt gs_DirTailSnapshot;
+    groupshared UInt gs_BlkTailSnapshot;
+    groupshared UInt gs_EffectiveReqCount;
+    groupshared UInt gs_MissBlockMask[64];
+    groupshared UInt gs_MissPageBitmask[2048];
+    groupshared UInt gs_PhysKey[2048];
+    groupshared UInt gs_AllocPacked[2048];
+
+    void ComputeSparseTileAndLocalIndex(
+        UInt mipLevel,
+        UInt vx,
+        UInt vy,
+        out UInt outTileOffset,
+        out UInt outLocalIdx)
+    {
+        if (mipLevel <= 4u) {
+            UInt tileX        = vx >> 3u;
+            UInt tileY        = vy >> 3u;
+            UInt localX       = vx & 7u;
+            UInt localY       = vy & 7u;
+            UInt tilesPerAxis = 16u >> mipLevel;
+            UInt baseOffset   = 0u;
+            if (mipLevel == 1u)      { baseOffset = 256u; }
+            else if (mipLevel == 2u) { baseOffset = 320u; }
+            else if (mipLevel == 3u) { baseOffset = 336u; }
+            else if (mipLevel == 4u) { baseOffset = 340u; }
+            outTileOffset = baseOffset + tileY * tilesPerAxis + tileX;
+            outLocalIdx   = (localY << 3u) | localX;
+        } else {
+            outTileOffset = 341u;
+            if (mipLevel == 5u) {
+                outLocalIdx = (vy << 2u) + vx;
+            } else if (mipLevel == 6u) {
+                outLocalIdx = 16u + (vy << 1u) + vx;
+            } else {
+                outLocalIdx = 20u;
+            }
+        }
+    }
+
+    UInt BumpPackedGeneration(UInt oldAddr, Bool isExtended) {
+        UInt result = 0u;
+        if (isExtended) {
+            UInt oldGen = ((oldAddr >> 20u) & 4095u) + 1u;
+            if (oldGen > 4095u) {
+                oldGen = 1u;
+            }
+            result = (oldAddr & 1048575u) | (oldGen << 20u);
+        } else {
+            UInt oldGen8 = ((oldAddr >> 24u) & 255u) + 1u;
+            if (oldGen8 > 255u) {
+                oldGen8 = 1u;
+            }
+            result = (oldAddr & 16777215u) | (oldGen8 << 24u);
+        }
+        return result;
+    }
+
+    Int FloorDivPow2(Int value, UInt shift) {
+        Int res = value;
+        if (shift > 0u) {
+            if (value >= 0) {
+                res = Int(UInt(value) >> shift);
+            } else {
+                res = -Int((UInt(-1 - value) >> shift) + 1u);
+            }
+        }
+        return res;
+    }
+
+    Int OrthoSnapOriginAtMip(Int originMip0, UInt mip) {
+        Int roundBias = (mip > 0u) ? Int(1u << (mip - 1u)) : 0;
+        return FloorDivPow2(originMip0 + roundBias, mip);
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt tid           = gtid.x;
+        UInt dispatchMode  = NVSResidencyParams.Config.dispatchMode;
+        UInt currentFrame  = NVSResidencyParams.Config.currentFrame;
+        UInt protectFrames = NVSResidencyParams.Config.minInFlightProtectFrames;
+        UInt reqCount      = NVSResidencyParams.Config.requestCount;
+        UInt pagesPerAxis  = NVSResidencyParams.Config.pagesPerAxis;
+        UInt levelCount    = NVSResidencyParams.Config.clipmapLevelCount;
+        UInt maxLights     = NVSResidencyParams.Config.maxLightCount;
+        UInt physCap       = Min(NVSResidencyParams.Config.physicalPoolCapacity, 2048u);
+        UInt maxClearOut   = NVSResidencyParams.Config.maxDirtyClearOutput;
+        UInt gpuReqCfg     = NVSResidencyParams.Config.gpuRequestConfig;
+        UInt sparseMode    = NVSResidencyParams.Config.sparseMode;
+        UInt rootCap       = NVSResidencyParams.Config.sparseRootCapacity;
+        UInt dirCap        = NVSResidencyParams.Config.sparseDirCapacity;
+        UInt blkCap        = NVSResidencyParams.Config.sparseBlockCapacity;
+        UInt invCmdCount   = NVSResidencyParams.Config.invalidationCmdCount;
+        UInt maxMissCap    = NVSResidencyParams.Config.maxMissRecordsCapacity;
+        UInt viewTableCap  = NVSResidencyParams.Config.clipmapTableSize;
+        UInt subMode       = NVSResidencyParams.Config.residencySubMode;
+
+        UInt allocHeaderBase = rootCap + (dirCap * 352u);
+        UInt dirFreeBase     = allocHeaderBase + 16u;
+        UInt blkFreeBase     = dirFreeBase + dirCap;
+
+        if (pagesPerAxis == 0u) {
+            pagesPerAxis = 32u;
+        }
+        if (levelCount == 0u || levelCount > 4u) {
+            levelCount = 4u;
+        }
+        if (maxLights == 0u) {
+            maxLights = 1u;
+        }
+        if (maxClearOut > physCap) {
+            maxClearOut = physCap;
+        }
+
+        UInt pagesPerLevel     = pagesPerAxis * pagesPerAxis;
+        UInt totalVirtualPages = (sparseMode != 0u) ? (blkCap * 64u) : (maxLights * levelCount * pagesPerLevel);
+
+        // =================================================================
+        //  MODE 5: O(1) Batch View Invalidation & Sparse Reclamation
+        //    subMode == 0: Stamp pending invalidation descriptors on view directories
+        //    subMode == 1: O(1) per-physical-page invalidation check & release
+        //    subMode == 2: Reclaim 64-page blocks & 352-word directories to free rings
+        // =================================================================
+        if (dispatchMode == 5u) {
+            UInt linearGid = gid.x + gid.y * 65535u;
+            UInt linearTid = linearGid * 64u + tid;
+
+            if (sparseMode != 0u && dirCap > 0u && blkCap > 0u) {
+                if (subMode == 0u) {
+                    if (linearTid < invCmdCount) {
+                        UInt cmdMode   = NVSResidencyParams.InInvalidationCommands[linearTid].mode;
+                        UInt baseView  = NVSResidencyParams.InInvalidationCommands[linearTid].viewIndex;
+                        UInt viewCnt   = Max(NVSResidencyParams.InInvalidationCommands[linearTid].viewCount, 1u);
+                        UInt regOrAxis = NVSResidencyParams.InInvalidationCommands[linearTid].regionOrPagesAxis;
+                        Int  sDX       = NVSResidencyParams.InInvalidationCommands[linearTid].originShiftDeltaX;
+                        Int  sDY       = NVSResidencyParams.InInvalidationCommands[linearTid].originShiftDeltaY;
+                        Int  origX     = NVSResidencyParams.InInvalidationCommands[linearTid].snappedOriginX;
+                        Int  origY     = NVSResidencyParams.InInvalidationCommands[linearTid].snappedOriginY;
+
+                        if (cmdMode == 1u) {
+                            // NVS_INVALIDATE_ALL: flag global sentinel in allocHeaderBase + 8u
+                            NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 8u].nodeValue = 1u;
+                        } else {
+                            for (UInt vOff = 0u; vOff < viewCnt; vOff = vOff + 1u) {
+                                UInt vSlot = baseView + vOff;
+                                if (vSlot < rootCap) {
+                                    UInt dSlot = NVSResidencyParams.InOutSparsePageHierarchy[vSlot].nodeValue;
+                                    if (dSlot < dirCap) {
+                                        UInt dBase = rootCap + (dSlot * 352u);
+                                        // Escalate command priority: RECLAIM (7) > VIEW_SLOT/LIGHT (6/2) > ORIGIN_SHIFT (5/8) > RANGE (4)
+                                        UInt prevMode = 0u;
+                                        if (cmdMode == 7u) {
+                                            InterlockedExchange(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 346u].nodeValue, 7u, prevMode);
+                                        } else if (cmdMode == 2u || cmdMode == 6u) {
+                                            InterlockedMax(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 346u].nodeValue, 6u, prevMode);
+                                        } else if (cmdMode == 5u || cmdMode == 8u) {
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 347u].nodeValue = regOrAxis;
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 348u].nodeValue = asuint(sDX);
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 349u].nodeValue = asuint(sDY);
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 350u].nodeValue = asuint(origX);
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 351u].nodeValue = asuint(origY);
+                                            InterlockedMax(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 346u].nodeValue, 5u, prevMode);
+                                        } else if (cmdMode == 4u) {
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 347u].nodeValue = regOrAxis;
+                                            InterlockedMax(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 346u].nodeValue, 4u, prevMode);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (subMode == 1u) {
+                    if (linearTid < physCap) {
+                        UInt psf    = NVSResidencyParams.PhysicalPageTable[linearTid].stateAndFlags;
+                        UInt pstate = psf & 15u;
+                        UInt vFlat  = NVSResidencyParams.PhysicalPageTable[linearTid].ownerVirtualFlatIndex;
+                        if (pstate >= 1u && pstate <= 3u && vFlat < totalVirtualPages) {
+                            Bool isExt = ((psf & 128u) != 0u);
+                            UInt pView = isExt ? NVSResidencyParams.PhysicalPageTable[linearTid].metaAux : 0u;
+                            UInt addr  = NVSResidencyParams.PhysicalPageTable[linearTid].ownerVirtualAddress;
+                            UInt px    = addr & 255u;
+                            UInt py    = (addr >> 8u) & 255u;
+                            UInt pmip  = isExt ? ((addr >> 16u) & 15u) : 0u;
+                            if (!isExt) {
+                                UInt plvl = (addr >> 16u) & 3u;
+                                UInt plgt = (addr >> 18u) & 63u;
+                                pView     = plgt * levelCount + plvl;
+                            }
+
+                            UInt globalAll = NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 8u].nodeValue;
+                            Bool doInv     = (globalAll != 0u);
+
+                            if (!doInv) {
+                                if (pView >= rootCap) {
+                                    doInv = true;
+                                } else {
+                                    UInt dSlot = NVSResidencyParams.InOutSparsePageHierarchy[pView].nodeValue;
+                                    if (dSlot >= dirCap) {
+                                        doInv = true;
+                                    } else {
+                                        UInt dBase = rootCap + (dSlot * 352u);
+                                        UInt pCmd  = NVSResidencyParams.InOutSparsePageHierarchy[dBase + 346u].nodeValue;
+                                        if (pCmd == 7u || pCmd == 6u) {
+                                            doInv = true;
+                                        } else if (pCmd == 5u) {
+                                            UInt baseAxis = NVSResidencyParams.InOutSparsePageHierarchy[dBase + 347u].nodeValue;
+                                            UInt mipAxis  = Max(baseAxis >> pmip, 1u);
+                                            Int  lim      = Int(mipAxis);
+                                            Int  sDX      = asint(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 348u].nodeValue);
+                                            Int  sDY      = asint(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 349u].nodeValue);
+                                            Int  oX       = asint(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 350u].nodeValue);
+                                            Int  oY       = asint(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 351u].nodeValue);
+                                            if (lim <= 1) {
+                                                if (sDX != 0 || sDY != 0) {
+                                                    doInv = true;
+                                                }
+                                            } else {
+                                                Int curSnapX  = OrthoSnapOriginAtMip(oX, pmip);
+                                                Int curSnapY  = OrthoSnapOriginAtMip(oY, pmip);
+                                                Int prevSnapX = OrthoSnapOriginAtMip(oX - sDX, pmip);
+                                                Int prevSnapY = OrthoSnapOriginAtMip(oY - sDY, pmip);
+                                                Int mipDX     = curSnapX - prevSnapX;
+                                                Int mipDY     = curSnapY - prevSnapY;
+                                                Int relX      = (Int(px) - curSnapX) % lim;
+                                                if (relX < 0) { relX = relX + lim; }
+                                                Int relY      = (Int(py) - curSnapY) % lim;
+                                                if (relY < 0) { relY = relY + lim; }
+                                                Int srcX      = relX + mipDX;
+                                                Int srcY      = relY + mipDY;
+                                                if (srcX < 0 || srcX >= lim || srcY < 0 || srcY >= lim) {
+                                                    doInv = true;
+                                                }
+                                            }
+                                        } else if (pCmd == 4u) {
+                                            UInt reg  = NVSResidencyParams.InOutSparsePageHierarchy[dBase + 347u].nodeValue;
+                                            UInt minX = (reg & 255u) >> pmip;
+                                            UInt minY = ((reg >> 8u) & 255u) >> pmip;
+                                            UInt maxX = ((reg >> 16u) & 255u) >> pmip;
+                                            UInt maxY = ((reg >> 24u) & 255u) >> pmip;
+                                            if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+                                                doInv = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (doInv) {
+                                UInt oldVAddr = NVSResidencyParams.VirtualPageTable[vFlat].virtualAddressPacked;
+                                UInt newVAddr = BumpPackedGeneration(oldVAddr, isExt);
+                                NVSResidencyParams.VirtualPageTable[vFlat].stateAndFlags        = isExt ? (4u | 512u) : 4u;
+                                NVSResidencyParams.VirtualPageTable[vFlat].physicalPageIndex    = 4294967295u;
+                                NVSResidencyParams.VirtualPageTable[vFlat].virtualAddressPacked = newVAddr;
+
+                                NVSResidencyParams.PhysicalPageTable[linearTid].stateAndFlags         = 0u;
+                                NVSResidencyParams.PhysicalPageTable[linearTid].ownerVirtualFlatIndex = 4294967295u;
+                                NVSResidencyParams.PhysicalPageTable[linearTid].ownerVirtualAddress   = 0u;
+                                NVSResidencyParams.PhysicalPageTable[linearTid].metaAux               = 0u;
+
+                                UInt prevInv  = 0u;
+                                UInt prevAcc  = 0u;
+                                InterlockedAdd(NVSResidencyParams.OutTelemetry[0u].invalidatedCount, 1u, prevInv);
+                                InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 9u].nodeValue, 1u, prevAcc);
+                            }
+                        }
+                    }
+                } else if (subMode == 2u) {
+                    // Clean pending command markers & reclaim blocks/directories for mode == 7 (RECLAIM_VIEW)
+                    if (linearGid == 0u && tid == 0u) {
+                        NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 8u].nodeValue = 0u;
+                    }
+                    UInt cmdIdx2 = (linearGid * 64u) + tid;
+                    if (cmdIdx2 < invCmdCount) {
+                        UInt baseView2 = NVSResidencyParams.InInvalidationCommands[cmdIdx2].viewIndex;
+                        UInt viewCnt2  = Max(NVSResidencyParams.InInvalidationCommands[cmdIdx2].viewCount, 1u);
+
+                        for (UInt vOff2 = 0u; vOff2 < viewCnt2; vOff2 = vOff2 + 1u) {
+                            UInt vSlot2 = baseView2 + vOff2;
+                            if (vSlot2 < rootCap) {
+                                UInt dSlot2 = NVSResidencyParams.InOutSparsePageHierarchy[vSlot2].nodeValue;
+                                if (dSlot2 < dirCap) {
+                                    UInt dBase2 = rootCap + (dSlot2 * 352u);
+                                    UInt pCmd2  = NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 346u].nodeValue;
+                                    if (pCmd2 == 7u) {
+                                        UInt prevRoot = 0u;
+                                        InterlockedCompareExchange(NVSResidencyParams.InOutSparsePageHierarchy[vSlot2].nodeValue, dSlot2, 4294967295u, prevRoot);
+                                        if (prevRoot == dSlot2) {
+                                            for (UInt t = 0u; t < 342u; t = t + 1u) {
+                                                UInt bSlot = NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + t].nodeValue;
+                                                if (bSlot < blkCap) {
+                                                    NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + t].nodeValue = 4294967295u;
+                                                    UInt blkPush = 0u;
+                                                    InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 3u].nodeValue, 1u, blkPush);
+                                                    NVSResidencyParams.InOutSparsePageHierarchy[blkFreeBase + (blkPush % blkCap)].nodeValue = bSlot;
+                                                    UInt prevRecB = 0u;
+                                                    InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 7u].nodeValue, 1u, prevRecB);
+                                                }
+                                            }
+                                            for (UInt m = 342u; m < 352u; m = m + 1u) {
+                                                NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + m].nodeValue = 0u;
+                                            }
+                                            UInt dirPush = 0u;
+                                            InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 1u].nodeValue, 1u, dirPush);
+                                            NVSResidencyParams.InOutSparsePageHierarchy[dirFreeBase + (dirPush % dirCap)].nodeValue = dSlot2;
+                                            UInt prevRecD = 0u;
+                                            InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 6u].nodeValue, 1u, prevRecD);
+                                        }
+                                    } else if (pCmd2 != 0u) {
+                                        NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 346u].nodeValue = 0u;
+                                        NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 347u].nodeValue = 0u;
+                                        NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 348u].nodeValue = 0u;
+                                        NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 349u].nodeValue = 0u;
+                                        NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 350u].nodeValue = 0u;
+                                        NVSResidencyParams.InOutSparsePageHierarchy[dBase2 + 351u].nodeValue = 0u;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 3: Reset All Virtual, Physical & Sparse Tables on GPU
+        // =================================================================
+        if (dispatchMode == 3u) {
+            if (sparseMode != 0u) {
+                UInt linearGid   = gid.x + gid.y * 65535u;
+                UInt groupCount  = Max(subMode, 1u);
+                UInt totalStride = groupCount * 64u;
+                UInt startIdx    = linearGid * 64u + tid;
+
+                UInt treeWords = rootCap + (dirCap * 352u);
+                for (UInt s = startIdx; s < treeWords; s = s + totalStride) {
+                    NVSResidencyParams.InOutSparsePageHierarchy[s].nodeValue = 4294967295u;
+                }
+                for (UInt d = startIdx; d < dirCap; d = d + totalStride) {
+                    NVSResidencyParams.InOutSparsePageHierarchy[dirFreeBase + d].nodeValue = d;
+                }
+                for (UInt b = startIdx; b < blkCap; b = b + totalStride) {
+                    NVSResidencyParams.InOutSparsePageHierarchy[blkFreeBase + b].nodeValue = b;
+                }
+                for (UInt v = startIdx; v < totalVirtualPages; v = v + totalStride) {
+                    NVSResidencyParams.VirtualPageTable[v].stateAndFlags        = 512u;
+                    NVSResidencyParams.VirtualPageTable[v].physicalPageIndex    = 4294967295u;
+                    NVSResidencyParams.VirtualPageTable[v].virtualAddressPacked = 1u << 20u;
+                    NVSResidencyParams.VirtualPageTable[v].lastTouchedFrame     = 0u;
+                }
+                for (UInt p = startIdx; p < physCap; p = p + totalStride) {
+                    NVSResidencyParams.PhysicalPageTable[p].stateAndFlags         = 0u;
+                    NVSResidencyParams.PhysicalPageTable[p].ownerVirtualFlatIndex = 4294967295u;
+                    NVSResidencyParams.PhysicalPageTable[p].ownerVirtualAddress   = 0u;
+                    NVSResidencyParams.PhysicalPageTable[p].physicalGeneration    = 0u;
+                    NVSResidencyParams.PhysicalPageTable[p].lastUsedFrame         = 0u;
+                    NVSResidencyParams.PhysicalPageTable[p].allocatedFrame        = 0u;
+                    NVSResidencyParams.PhysicalPageTable[p].minEvictableFrame     = 0u;
+                    NVSResidencyParams.PhysicalPageTable[p].metaAux               = 0u;
+                    NVSResidencyParams.OutDirtyPhysicalSlices[p].sliceIndex       = 4294967295u;
+                }
+                if (linearGid == 0u && tid == 0u) {
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 0u].nodeValue = 0u;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 1u].nodeValue = dirCap;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 2u].nodeValue = 0u;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 3u].nodeValue = blkCap;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 4u].nodeValue = 0u;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 5u].nodeValue = 0u;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 6u].nodeValue = 0u;
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 7u].nodeValue = 0u;
+                    for (UInt h = 8u; h < 16u; h = h + 1u) {
+                        NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + h].nodeValue = 0u;
+                    }
+
+                    NVSResidencyParams.OutDirtySliceCount[0u].count = 0u;
+                    NVSResidencyParams.OutDirtySliceCount[1u].count = 0u;
+                    NVSResidencyParams.OutDirtySliceCount[2u].count = 0u;
+                    NVSResidencyParams.OutDirtySliceCount[3u].count = 0u;
+
+                    NVSResidencyParams.OutSelectiveClearIndirectArgs[0u].arg = 3u;
+                    NVSResidencyParams.OutSelectiveClearIndirectArgs[1u].arg = 0u;
+                    NVSResidencyParams.OutSelectiveClearIndirectArgs[2u].arg = 0u;
+                    NVSResidencyParams.OutSelectiveClearIndirectArgs[3u].arg = 0u;
+
+                    NVSResidencyParams.OutTelemetry[0u].requestedCount           = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].validRequestCount        = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].invalidRequestCount      = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].uniqueRequestCount       = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].duplicateRequestCount    = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].cacheHitCount            = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].cacheMissCount           = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].allocatedFromFreeCount   = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].evictedCount             = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].overflowCount            = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].invalidatedCount         = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].dirtyClearSliceCount     = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].residentValidPages       = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].allocatedNotClearedPages = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].clearedNotRenderedPages  = 0u;
+                    NVSResidencyParams.OutTelemetry[0u].freePhysicalPages        = physCap;
+                }
+                return;
+            }
+
+            if (gid.x > 0u || gid.y > 0u || gid.z > 0u) {
+                return;
+            }
+
+            for (UInt v = tid; v < totalVirtualPages; v = v + 64u) {
+                UInt rem       = v;
+                UInt pageX     = rem % pagesPerAxis;
+                rem            = rem / pagesPerAxis;
+                UInt pageY     = rem % pagesPerAxis;
+                rem            = rem / pagesPerAxis;
+                UInt clipLevel = rem % levelCount;
+                UInt lightId   = rem / levelCount;
+                UInt packedAddr = (pageX & 255u) |
+                                  ((pageY & 255u) << 8u) |
+                                  ((clipLevel & 3u) << 16u) |
+                                  ((lightId & 63u) << 18u) |
+                                  (1u << 24u);
+
+                NVSResidencyParams.VirtualPageTable[v].stateAndFlags        = 0u;
+                NVSResidencyParams.VirtualPageTable[v].physicalPageIndex    = 4294967295u;
+                NVSResidencyParams.VirtualPageTable[v].virtualAddressPacked = packedAddr;
+                NVSResidencyParams.VirtualPageTable[v].lastTouchedFrame     = 0u;
+            }
+
+            for (UInt p = tid; p < physCap; p = p + 64u) {
+                NVSResidencyParams.PhysicalPageTable[p].stateAndFlags         = 0u;
+                NVSResidencyParams.PhysicalPageTable[p].ownerVirtualFlatIndex = 4294967295u;
+                NVSResidencyParams.PhysicalPageTable[p].ownerVirtualAddress   = 0u;
+                NVSResidencyParams.PhysicalPageTable[p].physicalGeneration    = 0u;
+                NVSResidencyParams.PhysicalPageTable[p].lastUsedFrame         = 0u;
+                NVSResidencyParams.PhysicalPageTable[p].allocatedFrame        = 0u;
+                NVSResidencyParams.PhysicalPageTable[p].minEvictableFrame     = 0u;
+                NVSResidencyParams.PhysicalPageTable[p].metaAux               = 0u;
+                NVSResidencyParams.OutDirtyPhysicalSlices[p].sliceIndex       = 4294967295u;
+            }
+
+            if (tid == 0u) {
+                NVSResidencyParams.OutDirtySliceCount[0u].count = 0u;
+                NVSResidencyParams.OutDirtySliceCount[1u].count = 0u;
+                NVSResidencyParams.OutDirtySliceCount[2u].count = 0u;
+                NVSResidencyParams.OutDirtySliceCount[3u].count = 0u;
+
+                NVSResidencyParams.OutSelectiveClearIndirectArgs[0u].arg = 3u;
+                NVSResidencyParams.OutSelectiveClearIndirectArgs[1u].arg = 0u;
+                NVSResidencyParams.OutSelectiveClearIndirectArgs[2u].arg = 0u;
+                NVSResidencyParams.OutSelectiveClearIndirectArgs[3u].arg = 0u;
+
+                NVSResidencyParams.OutTelemetry[0u].requestedCount           = 0u;
+                NVSResidencyParams.OutTelemetry[0u].validRequestCount        = 0u;
+                NVSResidencyParams.OutTelemetry[0u].invalidRequestCount      = 0u;
+                NVSResidencyParams.OutTelemetry[0u].uniqueRequestCount       = 0u;
+                NVSResidencyParams.OutTelemetry[0u].duplicateRequestCount    = 0u;
+                NVSResidencyParams.OutTelemetry[0u].cacheHitCount            = 0u;
+                NVSResidencyParams.OutTelemetry[0u].cacheMissCount           = 0u;
+                NVSResidencyParams.OutTelemetry[0u].allocatedFromFreeCount   = 0u;
+                NVSResidencyParams.OutTelemetry[0u].evictedCount             = 0u;
+                NVSResidencyParams.OutTelemetry[0u].overflowCount            = 0u;
+                NVSResidencyParams.OutTelemetry[0u].invalidatedCount         = 0u;
+                NVSResidencyParams.OutTelemetry[0u].dirtyClearSliceCount     = 0u;
+                NVSResidencyParams.OutTelemetry[0u].residentValidPages       = 0u;
+                NVSResidencyParams.OutTelemetry[0u].allocatedNotClearedPages = 0u;
+                NVSResidencyParams.OutTelemetry[0u].clearedNotRenderedPages  = 0u;
+                NVSResidencyParams.OutTelemetry[0u].freePhysicalPages        = physCap;
+            }
+
+            AllMemoryBarrierWithGroupSync();
+            return;
+        }
+
+        if (gid.x > 0u || gid.y > 0u || gid.z > 0u) {
+            return;
+        }
+
+        // =================================================================
+        //  MODE 4: Page Validity Contract — Generation-Checked Render Commit
+        // =================================================================
+        if (dispatchMode == 4u) {
+            if (tid == 0u) {
+                gs_ResidentValidCount       = 0u;
+                gs_AllocatedNotClearedCount = 0u;
+                gs_ClearedNotRenderedCount  = 0u;
+                gs_FreePhysicalCount        = 0u;
+
+                UInt committedCount = 0u;
+                UInt rejectedState  = 0u;
+                UInt rejectedIdent  = 0u;
+                UInt keptCount      = 0u;
+
+                for (UInt c = 0u; c < reqCount; c = c + 1u) {
+                    UInt cPhys   = NVSResidencyParams.PageRequests[c].virtualAddressPacked;
+                    UInt cResult = NVSResidencyParams.PageRequests[c].requestFlags;
+                    UInt cGen    = NVSResidencyParams.PageRequests[c].requestPriority;
+                    UInt cVirt   = NVSResidencyParams.PageRequests[c].requestUserData;
+
+                    if ((gpuReqCfg & 1u) != 0u && cPhys == 4294967295u && cResult == 2147483648u) {
+                        reqCount = c;
+                        break;
+                    }
+
+                    if (cPhys >= physCap) {
+                        rejectedState = rejectedState + 1u;
+                    } else {
+                        UInt cPsf   = NVSResidencyParams.PhysicalPageTable[cPhys].stateAndFlags;
+                        UInt cPst   = cPsf & 15u;
+                        UInt cOwner = NVSResidencyParams.PhysicalPageTable[cPhys].ownerVirtualFlatIndex;
+                        UInt cPGen  = NVSResidencyParams.PhysicalPageTable[cPhys].physicalGeneration;
+
+                        if (cPst != 2u) {
+                            rejectedState = rejectedState + 1u;
+                        } else if (cPGen != cGen || cOwner != cVirt || cOwner >= totalVirtualPages) {
+                            rejectedIdent = rejectedIdent + 1u;
+                        } else {
+                            UInt cVsf  = NVSResidencyParams.VirtualPageTable[cOwner].stateAndFlags;
+                            UInt cVPhy = NVSResidencyParams.VirtualPageTable[cOwner].physicalPageIndex;
+                            if (cVPhy != cPhys || (cVsf & 15u) != 2u) {
+                                rejectedIdent = rejectedIdent + 1u;
+                            } else if ((cResult & 1u) == 0u || (cResult & 6u) != 0u) {
+                                keptCount = keptCount + 1u;
+                            } else {
+                                // CLEARED_NOT_RENDERED (2) -> VALID_SHADOW_DATA (3); preserves EXTENDED_VIEW_ADDR bits (128 / 512)
+                                NVSResidencyParams.PhysicalPageTable[cPhys].stateAndFlags = (cPsf & 4294967248u) | 3u;
+                                NVSResidencyParams.VirtualPageTable[cOwner].stateAndFlags = (cVsf & 4294967248u) | 3u;
+                                committedCount = committedCount + 1u;
+                            }
+                        }
+                    }
+                }
+
+                NVSResidencyParams.OutTelemetry[0u].requestedCount        = reqCount;
+                NVSResidencyParams.OutTelemetry[0u].validRequestCount     = committedCount;
+                NVSResidencyParams.OutTelemetry[0u].invalidRequestCount   = rejectedState;
+                NVSResidencyParams.OutTelemetry[0u].duplicateRequestCount = rejectedIdent;
+                NVSResidencyParams.OutTelemetry[0u].uniqueRequestCount    = keptCount;
+            }
+
+            AllMemoryBarrierWithGroupSync();
+
+            for (UInt pc = tid; pc < physCap; pc = pc + 64u) {
+                UInt pstc  = NVSResidencyParams.PhysicalPageTable[pc].stateAndFlags & 15u;
+                UInt prevc = 0u;
+                if (pstc == 0u) {
+                    InterlockedAdd(gs_FreePhysicalCount, 1u, prevc);
+                } else if (pstc == 1u) {
+                    InterlockedAdd(gs_AllocatedNotClearedCount, 1u, prevc);
+                } else if (pstc == 2u) {
+                    InterlockedAdd(gs_ClearedNotRenderedCount, 1u, prevc);
+                } else if (pstc == 3u) {
+                    InterlockedAdd(gs_ResidentValidCount, 1u, prevc);
+                }
+            }
+
+            AllMemoryBarrierWithGroupSync();
+
+            if (tid == 0u) {
+                NVSResidencyParams.OutTelemetry[0u].residentValidPages       = gs_ResidentValidCount;
+                NVSResidencyParams.OutTelemetry[0u].allocatedNotClearedPages = gs_AllocatedNotClearedCount;
+                NVSResidencyParams.OutTelemetry[0u].clearedNotRenderedPages  = gs_ClearedNotRenderedCount;
+                NVSResidencyParams.OutTelemetry[0u].freePhysicalPages        = gs_FreePhysicalCount;
+            }
+
+            AllMemoryBarrierWithGroupSync();
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1 (Post-Clear: ALLOCATED_NOT_CLEARED -> CLEARED_NOT_RENDERED)
+        //  MODE 2 (Direct State Promotion: CLEARED_NOT_RENDERED -> VALID_SHADOW_DATA)
+        // =================================================================
+        if (dispatchMode == 1u || dispatchMode == 2u) {
+            if (tid == 0u) {
+                gs_ResidentValidCount       = 0u;
+                gs_AllocatedNotClearedCount = 0u;
+                gs_ClearedNotRenderedCount  = 0u;
+                gs_FreePhysicalCount        = 0u;
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt targetFromState = (dispatchMode == 1u) ? 1u : 2u;
+            UInt targetToState   = (dispatchMode == 1u) ? 2u : 3u;
+
+            for (UInt p = tid; p < physCap; p = p + 64u) {
+                UInt psf    = NVSResidencyParams.PhysicalPageTable[p].stateAndFlags;
+                UInt pstate = psf & 15u;
+                if (pstate == targetFromState) {
+                    pstate = targetToState;
+                    UInt newPsf = (psf & 4294967248u) | pstate;
+                    NVSResidencyParams.PhysicalPageTable[p].stateAndFlags = newPsf;
+
+                    UInt ownerV = NVSResidencyParams.PhysicalPageTable[p].ownerVirtualFlatIndex;
+                    if (ownerV < totalVirtualPages) {
+                        UInt vsf    = NVSResidencyParams.VirtualPageTable[ownerV].stateAndFlags;
+                        UInt newVsf = (vsf & 4294967248u) | pstate;
+                        NVSResidencyParams.VirtualPageTable[ownerV].stateAndFlags = newVsf;
+                    }
+                }
+
+                UInt prev = 0u;
+                if (pstate == 0u) {
+                    InterlockedAdd(gs_FreePhysicalCount, 1u, prev);
+                } else if (pstate == 1u) {
+                    InterlockedAdd(gs_AllocatedNotClearedCount, 1u, prev);
+                } else if (pstate == 2u) {
+                    InterlockedAdd(gs_ClearedNotRenderedCount, 1u, prev);
+                } else if (pstate == 3u) {
+                    InterlockedAdd(gs_ResidentValidCount, 1u, prev);
+                }
+            }
+
+            AllMemoryBarrierWithGroupSync();
+
+            if (tid == 0u) {
+                NVSResidencyParams.OutTelemetry[0u].residentValidPages       = gs_ResidentValidCount;
+                NVSResidencyParams.OutTelemetry[0u].allocatedNotClearedPages = gs_AllocatedNotClearedCount;
+                NVSResidencyParams.OutTelemetry[0u].clearedNotRenderedPages  = gs_ClearedNotRenderedCount;
+                NVSResidencyParams.OutTelemetry[0u].freePhysicalPages        = gs_FreePhysicalCount;
+            }
+
+            AllMemoryBarrierWithGroupSync();
+            return;
+        }
+
+        // =================================================================
+        //  MODE 0: Full GPU Residency Pass
+        //    Phase 0: Reset per-frame transient flags & groupshared counters
+        // =================================================================
+        if (tid == 0u) {
+            UInt effReq = reqCount;
+            if ((gpuReqCfg & 1u) != 0u) {
+                UInt gpuReqCount = NVSResidencyParams.OutTelemetry[0u].requestedCount;
+                UInt maxGpuCap   = gpuReqCfg >> 1u;
+                if (maxGpuCap > 0u && gpuReqCount > maxGpuCap) {
+                    gpuReqCount = maxGpuCap;
+                }
+                effReq = gpuReqCount;
+            }
+            gs_EffectiveReqCount        = effReq;
+            gs_ValidRequestCount        = 0u;
+            gs_InvalidRequestCount      = 0u;
+            gs_UniqueRequestCount       = 0u;
+            gs_DuplicateRequestCount    = 0u;
+            gs_CacheHitCount            = 0u;
+            gs_CacheMissCount           = 0u;
+            gs_RecordedMissCount        = 0u;
+            UInt pendingBatchInv = 0u;
+            if (sparseMode != 0u) {
+                InterlockedExchange(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 9u].nodeValue, 0u, pendingBatchInv);
+            }
+            gs_InvalidatedCount         = pendingBatchInv;
+            gs_EmittedDirtyCount        = 0u;
+            gs_ResidentValidCount       = 0u;
+            gs_AllocatedNotClearedCount = 0u;
+            gs_ClearedNotRenderedCount  = 0u;
+            gs_FreePhysicalCount        = 0u;
+            gs_DirTailSnapshot          = (sparseMode != 0u) ? NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 1u].nodeValue : 0u;
+            gs_BlkTailSnapshot          = (sparseMode != 0u) ? NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 3u].nodeValue : 0u;
+        }
+
+        if (sparseMode == 0u) {
+            UInt activePageWords = (totalVirtualPages + 31u) >> 5u;
+            if (activePageWords > 2048u) {
+                activePageWords = 2048u;
+            }
+            if (tid < 64u) {
+                gs_MissBlockMask[tid] = 0u;
+            }
+            for (UInt mw = tid; mw < activePageWords; mw = mw + 64u) {
+                gs_MissPageBitmask[mw] = 0u;
+            }
+            for (UInt v0 = tid; v0 < totalVirtualPages; v0 = v0 + 64u) {
+                UInt sf0 = NVSResidencyParams.VirtualPageTable[v0].stateAndFlags;
+                NVSResidencyParams.VirtualPageTable[v0].stateAndFlags = sf0 & 527u;
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+        reqCount = gs_EffectiveReqCount;
+
+        for (UInt p0 = tid; p0 < physCap; p0 = p0 + 64u) {
+            UInt psf0 = NVSResidencyParams.PhysicalPageTable[p0].stateAndFlags;
+            // Preserve persistent state [0..3], PINNED [4], EXTENDED_VIEW_ADDR [7], and resPrio8 [16..23] (mask 16711839u = 0x00FF009F)
+            NVSResidencyParams.PhysicalPageTable[p0].stateAndFlags = psf0 & 16711839u;
+            if (sparseMode != 0u) {
+                UInt pst0 = psf0 & 15u;
+                if (pst0 >= 1u && pst0 <= 3u) {
+                    UInt ownV0 = NVSResidencyParams.PhysicalPageTable[p0].ownerVirtualFlatIndex;
+                    if (ownV0 < totalVirtualPages) {
+                        UInt vsf0 = NVSResidencyParams.VirtualPageTable[ownV0].stateAndFlags;
+                        NVSResidencyParams.VirtualPageTable[ownV0].stateAndFlags = vsf0 & 527u;
+                    }
+                }
+            }
+        }
+
+        AllMemoryBarrierWithGroupSync();
+
+        // =================================================================
+        //  Phase 1: Selective Page Invalidation & Clipmap Origin Scrolling
+        // =================================================================
+        UInt invMode  = NVSResidencyParams.Config.invalidationMode;
+        UInt invLight = NVSResidencyParams.Config.invalidateLightId;
+        UInt invLevel = NVSResidencyParams.Config.invalidateClipmapLevel;
+        UInt invReg   = NVSResidencyParams.Config.invalidateRegionPacked;
+        Int  shiftDX  = NVSResidencyParams.Config.originShiftDeltaX;
+        Int  shiftDY  = NVSResidencyParams.Config.originShiftDeltaY;
+        Int  originX  = NVSResidencyParams.Config.snappedOriginPageX;
+        Int  originY  = NVSResidencyParams.Config.snappedOriginPageY;
+
+        if (invMode != 0u) {
+            UInt regMinX = invReg & 255u;
+            UInt regMinY = (invReg >> 8u) & 255u;
+            UInt regMaxX = (invReg >> 16u) & 255u;
+            UInt regMaxY = (invReg >> 24u) & 255u;
+
+            for (UInt p1 = tid; p1 < physCap; p1 = p1 + 64u) {
+                UInt psf1    = NVSResidencyParams.PhysicalPageTable[p1].stateAndFlags;
+                UInt pstate1 = psf1 & 15u;
+                if (pstate1 >= 1u && pstate1 <= 3u) {
+                    UInt v1    = NVSResidencyParams.PhysicalPageTable[p1].ownerVirtualFlatIndex;
+                    Bool isExt = ((psf1 & 128u) != 0u);
+                    if (v1 < totalVirtualPages) {
+                        UInt pageX1     = 0u;
+                        UInt pageY1     = 0u;
+                        UInt clipLevel1 = 0u;
+                        UInt lightId1   = 0u;
+                        UInt viewIdx1   = 0u;
+                        UInt pmip1      = 0u;
+
+                        if (isExt) {
+                            UInt ownAddr1 = NVSResidencyParams.PhysicalPageTable[p1].ownerVirtualAddress;
+                            pageX1        = ownAddr1 & 255u;
+                            pageY1        = (ownAddr1 >> 8u) & 255u;
+                            pmip1         = (ownAddr1 >> 16u) & 15u;
+                            viewIdx1      = NVSResidencyParams.PhysicalPageTable[p1].metaAux;
+                            clipLevel1    = viewIdx1 % levelCount;
+                            lightId1      = viewIdx1 / levelCount;
+                        } else {
+                            UInt rem1  = v1;
+                            pageX1     = rem1 % pagesPerAxis;
+                            rem1       = rem1 / pagesPerAxis;
+                            pageY1     = rem1 % pagesPerAxis;
+                            rem1       = rem1 / pagesPerAxis;
+                            clipLevel1 = rem1 % levelCount;
+                            lightId1   = rem1 / levelCount;
+                            viewIdx1   = lightId1 * levelCount + clipLevel1;
+                        }
+
+                        UInt shouldInv = 0u;
+                        if (invMode == 1u) {
+                            shouldInv = 1u;
+                        } else if (invMode == 2u) {
+                            if (lightId1 == invLight) {
+                                shouldInv = 1u;
+                            }
+                        } else if (invMode == 3u) {
+                            if (lightId1 == invLight && clipLevel1 == invLevel) {
+                                shouldInv = 1u;
+                            }
+                        } else if (invMode == 4u) {
+                            if (lightId1 == invLight && clipLevel1 == invLevel &&
+                                pageX1 >= (regMinX >> pmip1) && pageX1 <= (regMaxX >> pmip1) &&
+                                pageY1 >= (regMinY >> pmip1) && pageY1 <= (regMaxY >> pmip1)) {
+                                shouldInv = 1u;
+                            }
+                        } else if (invMode == 5u) {
+                            if (lightId1 == invLight && clipLevel1 == invLevel) {
+                                UInt effAxis = Max(pagesPerAxis >> pmip1, 1u);
+                                Int  lim     = Int(effAxis);
+                                if (lim <= 1) {
+                                    if (shiftDX != 0 || shiftDY != 0) {
+                                        shouldInv = 1u;
+                                    }
+                                } else {
+                                    Int curSnapX  = OrthoSnapOriginAtMip(originX, pmip1);
+                                    Int curSnapY  = OrthoSnapOriginAtMip(originY, pmip1);
+                                    Int prevSnapX = OrthoSnapOriginAtMip(originX - shiftDX, pmip1);
+                                    Int prevSnapY = OrthoSnapOriginAtMip(originY - shiftDY, pmip1);
+                                    Int mipDX     = curSnapX - prevSnapX;
+                                    Int mipDY     = curSnapY - prevSnapY;
+                                    Int relX      = (Int(pageX1) - curSnapX) % lim;
+                                    if (relX < 0) { relX = relX + lim; }
+                                    Int relY      = (Int(pageY1) - curSnapY) % lim;
+                                    if (relY < 0) { relY = relY + lim; }
+                                    Int srcX      = relX + mipDX;
+                                    Int srcY      = relY + mipDY;
+                                    if (srcX < 0 || srcX >= lim || srcY < 0 || srcY >= lim) {
+                                        shouldInv = 1u;
+                                    }
+                                }
+                            }
+                        } else if (invMode == 6u) {
+                            if (viewIdx1 == invLight) {
+                                shouldInv = 1u;
+                            }
+                        }
+
+                        if (shouldInv != 0u) {
+                            UInt addr1    = NVSResidencyParams.VirtualPageTable[v1].virtualAddressPacked;
+                            UInt newAddr1 = BumpPackedGeneration(addr1, isExt);
+
+                            NVSResidencyParams.VirtualPageTable[v1].stateAndFlags        = isExt ? (4u | 512u) : 4u;
+                            NVSResidencyParams.VirtualPageTable[v1].physicalPageIndex    = 4294967295u;
+                            NVSResidencyParams.VirtualPageTable[v1].virtualAddressPacked = newAddr1;
+
+                            NVSResidencyParams.PhysicalPageTable[p1].stateAndFlags         = 0u;
+                            NVSResidencyParams.PhysicalPageTable[p1].ownerVirtualFlatIndex = 4294967295u;
+                            NVSResidencyParams.PhysicalPageTable[p1].ownerVirtualAddress   = 0u;
+                            NVSResidencyParams.PhysicalPageTable[p1].metaAux               = 0u;
+
+                            UInt prevInv = 0u;
+                            InterlockedAdd(gs_InvalidatedCount, 1u, prevInv);
+                        }
+                    }
+                }
+            }
+        }
+
+        AllMemoryBarrierWithGroupSync();
+
+        // =================================================================
+        //  Phase 2: Request Validation, Demand-Driven Sparse Directory/Block
+        //           Allocation, Atomic Deduplication & Hit/Miss Classification
+        // =================================================================
+        if (sparseMode != 0u) {
+            UInt dirTail = gs_DirTailSnapshot;
+            UInt blkTail = gs_BlkTailSnapshot;
+
+            for (UInt base = 0u; base < reqCount; base = base + 64u) {
+                UInt r          = base + tid;
+                Bool activeLane = (r < reqCount);
+                Bool validReq   = false;
+                UInt reqAddr    = 0u;
+                UInt reqFlags   = 0u;
+                UInt reqPrio    = 0u;
+                UInt reqView    = 0u;
+                UInt reqPageX   = 0u;
+                UInt reqPageY   = 0u;
+                UInt reqMip     = 0u;
+                UInt reqGen     = 1u;
+
+                if (activeLane) {
+                    reqAddr  = NVSResidencyParams.PageRequests[r].virtualAddressPacked;
+                    reqFlags = NVSResidencyParams.PageRequests[r].requestFlags;
+                    reqPrio  = NVSResidencyParams.PageRequests[r].requestPriority;
+
+                    if ((reqFlags & 4u) != 0u) {
+                        reqView  = NVSResidencyParams.PageRequests[r].requestUserData;
+                        reqPageX = reqAddr & 255u;
+                        reqPageY = (reqAddr >> 8u) & 255u;
+                        reqMip   = (reqAddr >> 16u) & 15u;
+                        reqGen   = (reqAddr >> 20u) & 4095u;
+                        if (reqGen == 0u) {
+                            reqGen = 1u;
+                        }
+                    } else {
+                        reqPageX      = reqAddr & 255u;
+                        reqPageY      = (reqAddr >> 8u) & 255u;
+                        UInt reqLevel = (reqAddr >> 16u) & 3u;
+                        UInt reqLight = (reqAddr >> 18u) & 63u;
+                        reqGen        = (reqAddr >> 24u) & 255u;
+                        if (reqGen == 0u) {
+                            reqGen = 1u;
+                        }
+                        reqMip  = 0u;
+                        reqView = (reqLevel < levelCount && reqLight < maxLights) ? ((reqLight * levelCount) + reqLevel) : 4294967295u;
+                        reqAddr = (reqPageX & 255u) | ((reqPageY & 255u) << 8u) | (reqGen << 20u);
+                    }
+
+                    if ((reqFlags & 1u) == 0u && reqView < rootCap && reqMip < 8u) {
+                        if (viewTableCap > 0u) {
+                            if (reqView < viewTableCap) {
+                                UInt vFlags = NVSResidencyParams.InClipmapLevels[reqView].flags;
+                                UInt vAxis  = NVSResidencyParams.InClipmapLevels[reqView].pagesPerAxis;
+                                UInt maxMip = (vFlags >> 12u) & 15u;
+                                if ((vFlags & 1u) != 0u && vAxis > 0u && reqMip <= maxMip) {
+                                    UInt mipAxis = Max(vAxis >> reqMip, 1u);
+                                    if (reqPageX < mipAxis && reqPageY < mipAxis) {
+                                        validReq = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            UInt mipAxis0 = Max(pagesPerAxis >> reqMip, 1u);
+                            if (reqView < (maxLights * levelCount) && reqPageX < mipAxis0 && reqPageY < mipAxis0) {
+                                validReq = true;
+                            }
+                        }
+                    }
+
+                    if (!validReq) {
+                        UInt prevBad = 0u;
+                        InterlockedAdd(gs_InvalidRequestCount, 1u, prevBad);
+                    } else {
+                        UInt prevGood = 0u;
+                        InterlockedAdd(gs_ValidRequestCount, 1u, prevGood);
+                    }
+                }
+
+                // Step 2A: Zero-spin demand allocation of Level-1 View Directory (352 words)
+                if (validReq) {
+                    UInt curDir = NVSResidencyParams.InOutSparsePageHierarchy[reqView].nodeValue;
+                    if (curDir == 4294967295u) {
+                        UInt prevRoot = 0u;
+                        InterlockedCompareExchange(NVSResidencyParams.InOutSparsePageHierarchy[reqView].nodeValue, 4294967295u, 4294967294u, prevRoot);
+                        if (prevRoot == 4294967295u) {
+                            UInt dirTicket = 0u;
+                            InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 0u].nodeValue, 1u, dirTicket);
+                            if (dirTicket < dirTail) {
+                                UInt newDir = NVSResidencyParams.InOutSparsePageHierarchy[dirFreeBase + (dirTicket % dirCap)].nodeValue;
+                                UInt dBase  = rootCap + (newDir * 352u);
+                                NVSResidencyParams.InOutSparsePageHierarchy[dBase + 342u].nodeValue = reqView;
+                                NVSResidencyParams.InOutSparsePageHierarchy[dBase + 343u].nodeValue = reqGen;
+                                NVSResidencyParams.InOutSparsePageHierarchy[dBase + 344u].nodeValue = currentFrame;
+                                NVSResidencyParams.InOutSparsePageHierarchy[dBase + 345u].nodeValue = 0u;
+                                NVSResidencyParams.InOutSparsePageHierarchy[dBase + 346u].nodeValue = 0u;
+                                NVSResidencyParams.InOutSparsePageHierarchy[reqView].nodeValue      = newDir;
+                            } else {
+                                NVSResidencyParams.InOutSparsePageHierarchy[reqView].nodeValue = 4294967295u;
+                                UInt prevOvfD = 0u;
+                                InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 4u].nodeValue, 1u, prevOvfD);
+                            }
+                        }
+                    }
+                }
+
+                AllMemoryBarrierWithGroupSync();
+
+                UInt dirSlot   = 4294967295u;
+                UInt tileOff   = 0u;
+                UInt localIdx  = 0u;
+                UInt tileEntry = 0u;
+
+                if (validReq) {
+                    dirSlot = NVSResidencyParams.InOutSparsePageHierarchy[reqView].nodeValue;
+                    if (dirSlot < dirCap) {
+                        UInt dBase = rootCap + (dirSlot * 352u);
+                        UInt prevFrameStamp = 0u;
+                        InterlockedExchange(NVSResidencyParams.InOutSparsePageHierarchy[dBase + 344u].nodeValue, currentFrame, prevFrameStamp);
+                        if (prevFrameStamp != currentFrame) {
+                            NVSResidencyParams.InOutSparsePageHierarchy[dBase + 345u].nodeValue = 0u;
+                        }
+                        ComputeSparseTileAndLocalIndex(reqMip, reqPageX, reqPageY, tileOff, localIdx);
+                        tileEntry = dBase + tileOff;
+                        UInt curBlk = NVSResidencyParams.InOutSparsePageHierarchy[tileEntry].nodeValue;
+                        if (curBlk == 4294967295u) {
+                            UInt prevBlk = 0u;
+                            InterlockedCompareExchange(NVSResidencyParams.InOutSparsePageHierarchy[tileEntry].nodeValue, 4294967295u, 4294967294u, prevBlk);
+                            if (prevBlk == 4294967295u) {
+                                UInt blkTicket = 0u;
+                                InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 2u].nodeValue, 1u, blkTicket);
+                                if (blkTicket < blkTail) {
+                                    UInt newBlk = NVSResidencyParams.InOutSparsePageHierarchy[blkFreeBase + (blkTicket % blkCap)].nodeValue;
+                                    UInt vBase  = newBlk << 6u;
+                                    for (UInt k = 0u; k < 64u; k = k + 1u) {
+                                        NVSResidencyParams.VirtualPageTable[vBase + k].stateAndFlags        = 512u;
+                                        NVSResidencyParams.VirtualPageTable[vBase + k].physicalPageIndex    = 4294967295u;
+                                        NVSResidencyParams.VirtualPageTable[vBase + k].virtualAddressPacked = 1u << 20u;
+                                        NVSResidencyParams.VirtualPageTable[vBase + k].lastTouchedFrame     = 0u;
+                                    }
+                                    NVSResidencyParams.InOutSparsePageHierarchy[tileEntry].nodeValue = newBlk;
+                                } else {
+                                    NVSResidencyParams.InOutSparsePageHierarchy[tileEntry].nodeValue = 4294967295u;
+                                    UInt prevOvfB = 0u;
+                                    InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 5u].nodeValue, 1u, prevOvfB);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                AllMemoryBarrierWithGroupSync();
+
+                // Step 2B: Leaf VirtualPageEntry deduplication & hit/miss classification
+                if (validReq) {
+                    UInt blkSlot = (dirSlot < dirCap) ? NVSResidencyParams.InOutSparsePageHierarchy[tileEntry].nodeValue : 4294967295u;
+                    if (blkSlot >= blkCap) {
+                        // Sparse directory or leaf block pool exhausted: count as deterministic overflow miss
+                        UInt prevUniqO = 0u;
+                        InterlockedAdd(gs_UniqueRequestCount, 1u, prevUniqO);
+                        UInt prevMissO = 0u;
+                        InterlockedAdd(gs_CacheMissCount, 1u, prevMissO);
+                    } else {
+                        UInt vIdx = (blkSlot << 6u) + localIdx;
+                        UInt orFlags = 16u | 512u;
+                        if ((reqFlags & 2u) != 0u) {
+                            orFlags = orFlags | 256u;
+                        }
+
+                        UInt prevSf = 0u;
+                        InterlockedOr(NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags, orFlags, prevSf);
+
+                        if ((prevSf & 16u) != 0u) {
+                            UInt prevDup = 0u;
+                            InterlockedAdd(gs_DuplicateRequestCount, 1u, prevDup);
+                        } else {
+                            UInt prevUniq = 0u;
+                            InterlockedAdd(gs_UniqueRequestCount, 1u, prevUniq);
+
+                            UInt curState     = prevSf & 15u;
+                            UInt physIdx      = NVSResidencyParams.VirtualPageTable[vIdx].physicalPageIndex;
+                            UInt existingAddr = NVSResidencyParams.VirtualPageTable[vIdx].virtualAddressPacked;
+                            UInt existingGen  = (existingAddr >> 20u) & 4095u;
+                            UInt genCycle     = (reqGen > 255u || existingGen > 255u) ? 4095u : 255u;
+                            UInt genDiff      = (reqGen >= existingGen) ? (reqGen - existingGen) : (reqGen + genCycle - existingGen);
+                            Bool genMismatch  = (reqGen != 0u) && (existingGen != 0u) && (genDiff > 0u) && (genDiff <= (genCycle / 2u));
+                            Bool isCacheHit   = false;
+
+                            if ((curState == 2u || curState == 3u) && physIdx < physCap) {
+                                UInt pOwnerFlat = NVSResidencyParams.PhysicalPageTable[physIdx].ownerVirtualFlatIndex;
+                                UInt pOwnerView = NVSResidencyParams.PhysicalPageTable[physIdx].metaAux;
+                                UInt pCurState  = NVSResidencyParams.PhysicalPageTable[physIdx].stateAndFlags & 15u;
+                                if (pOwnerFlat == vIdx && pOwnerView == reqView) {
+                                    if (!genMismatch && (pCurState == 2u || pCurState == 3u)) {
+                                        isCacheHit = true;
+                                    } else if (genMismatch) {
+                                        // Stale generation resident page still owned by this virtual entry: release old physical slot cleanly
+                                        NVSResidencyParams.PhysicalPageTable[physIdx].stateAndFlags         = 0u;
+                                        NVSResidencyParams.PhysicalPageTable[physIdx].ownerVirtualFlatIndex = 4294967295u;
+                                        NVSResidencyParams.PhysicalPageTable[physIdx].ownerVirtualAddress   = 0u;
+                                        NVSResidencyParams.PhysicalPageTable[physIdx].metaAux               = 0u;
+                                    }
+                                }
+                            }
+
+                            if (isCacheHit) {
+                                // Cache Hit
+                                UInt dummyPrev = 0u;
+                                InterlockedOr(NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags, 64u, dummyPrev);
+                                NVSResidencyParams.VirtualPageTable[vIdx].lastTouchedFrame = currentFrame;
+
+                                NVSResidencyParams.PhysicalPageTable[physIdx].lastUsedFrame     = currentFrame;
+                                NVSResidencyParams.PhysicalPageTable[physIdx].minEvictableFrame = currentFrame + protectFrames;
+                                UInt hitPrio8  = ((reqFlags & 8u) != 0u)
+                                    ? 255u
+                                    : Min((reqPrio > 255u) ? (reqPrio >> 8u) : reqPrio, 254u);
+                                UInt curPhysSf = NVSResidencyParams.PhysicalPageTable[physIdx].stateAndFlags;
+                                UInt pinOr     = ((reqFlags & 2u) != 0u) ? 16u : 0u;
+                                NVSResidencyParams.PhysicalPageTable[physIdx].stateAndFlags = (curPhysSf & 4278255615u) | pinOr | (hitPrio8 << 16u);
+
+                                UInt prevHit = 0u;
+                                InterlockedAdd(gs_CacheHitCount, 1u, prevHit);
+                            } else {
+                                Bool takeReqGen  = (reqGen != 0u) && (existingGen == 0u || genMismatch);
+                                UInt finalGen    = takeReqGen ? reqGen : ((existingGen == 0u) ? 1u : existingGen);
+                                UInt packedFinal = (reqAddr & 1048575u) | ((finalGen & 4095u) << 20u);
+                                NVSResidencyParams.VirtualPageTable[vIdx].virtualAddressPacked = packedFinal;
+
+                                UInt dBaseRank    = rootCap + (dirSlot * 352u);
+                                UInt viewMissRank = 0u;
+                                InterlockedAdd(NVSResidencyParams.InOutSparsePageHierarchy[dBaseRank + 345u].nodeValue, 1u, viewMissRank);
+
+                                UInt prevMiss = 0u;
+                                InterlockedAdd(gs_CacheMissCount, 1u, prevMiss);
+
+                                if (prevMiss < maxMissCap) {
+                                    Bool isPerspReq  = true;
+                                    UInt orthoSubLvl = reqView & 3u;
+                                    if (viewTableCap > 0u && reqView < viewTableCap) {
+                                        UInt rvFlags = NVSResidencyParams.InClipmapLevels[reqView].flags;
+                                        isPerspReq   = ((rvFlags & 4u) != 0u);
+                                        orthoSubLvl  = NVSResidencyParams.InClipmapLevels[reqView].clipmapLevel & 3u;
+                                    }
+                                    UInt anchorTier = ((reqFlags & 8u) != 0u) ? 0u : 1u;
+                                    UInt quotaTier  = isPerspReq
+                                        ? Min(viewMissRank >> 2u, 63u)
+                                        : Min((orthoSubLvl * 12u) + (viewMissRank >> 5u), 63u);
+                                    UInt prio8      = Min((reqPrio > 255u) ? (reqPrio >> 8u) : reqPrio, 255u);
+                                    UInt invPrio    = 255u - prio8;
+                                    UInt sortKey    = (anchorTier << 30u) | (quotaTier << 24u) | (invPrio << 16u) | (prevMiss & 65535u);
+
+                                    NVSResidencyParams.InOutMissRecords[prevMiss].prioritySortKey   = sortKey;
+                                    NVSResidencyParams.InOutMissRecords[prevMiss].virtualFlatIndex  = vIdx;
+                                    NVSResidencyParams.InOutMissRecords[prevMiss].viewIndex         = reqView;
+                                    NVSResidencyParams.InOutMissRecords[prevMiss].packedCoordAndPin = packedFinal;
+
+                                    UInt prevRecM = 0u;
+                                    InterlockedAdd(gs_RecordedMissCount, 1u, prevRecM);
+                                } else {
+                                    // Clear REQUESTED_THIS_FRAME on unrecorded overflow entry so next frame is clean
+                                    UInt clrPrev = 0u;
+                                    InterlockedAnd(NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags, ~16u, clrPrev);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                AllMemoryBarrierWithGroupSync();
+            }
+
+            if (tid == 0u) {
+                UInt finalDirHead = NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 0u].nodeValue;
+                if (finalDirHead > dirTail) {
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 0u].nodeValue = dirTail;
+                }
+                UInt finalBlkHead = NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 2u].nodeValue;
+                if (finalBlkHead > blkTail) {
+                    NVSResidencyParams.InOutSparsePageHierarchy[allocHeaderBase + 2u].nodeValue = blkTail;
+                }
+            }
+        } else {
+            for (UInt r = tid; r < reqCount; r = r + 64u) {
+                UInt reqAddr  = NVSResidencyParams.PageRequests[r].virtualAddressPacked;
+                UInt reqFlags = NVSResidencyParams.PageRequests[r].requestFlags;
+
+                UInt reqPageX = reqAddr & 255u;
+                UInt reqPageY = (reqAddr >> 8u) & 255u;
+                UInt reqLevel = (reqAddr >> 16u) & 3u;
+                UInt reqLight = (reqAddr >> 18u) & 63u;
+                UInt reqGen   = (reqAddr >> 24u) & 255u;
+                UInt extMip   = 0u;
+
+                if ((reqFlags & 4u) != 0u) {
+                    UInt viewSlot = NVSResidencyParams.PageRequests[r].requestUserData;
+                    extMip   = (reqAddr >> 16u) & 15u;
+                    reqLevel = viewSlot & 3u;
+                    reqLight = viewSlot >> 2u;
+                    reqGen   = (reqAddr >> 20u) & 255u;
+                    if (reqGen == 0u) {
+                        reqGen = 1u;
+                    }
+                    reqAddr  = (reqPageX & 255u) |
+                               ((reqPageY & 255u) << 8u) |
+                               ((reqLevel & 3u) << 16u) |
+                               ((reqLight & 63u) << 18u) |
+                               (reqGen << 24u);
+                }
+
+                if ((reqFlags & 1u) != 0u ||
+                    extMip != 0u ||
+                    reqPageX >= pagesPerAxis ||
+                    reqPageY >= pagesPerAxis ||
+                    reqLevel >= levelCount ||
+                    reqLight >= maxLights) {
+                    UInt prevBad = 0u;
+                    InterlockedAdd(gs_InvalidRequestCount, 1u, prevBad);
+                } else {
+                    UInt prevGood = 0u;
+                    InterlockedAdd(gs_ValidRequestCount, 1u, prevGood);
+
+                    UInt globalLevel = (reqLight * levelCount) + reqLevel;
+                    UInt vIdx        = (globalLevel * pagesPerLevel) + (reqPageY * pagesPerAxis) + reqPageX;
+
+                    UInt orFlags = 16u;
+                    if ((reqFlags & 2u) != 0u) {
+                        orFlags = orFlags | 256u;
+                    }
+
+                    UInt prevSf = 0u;
+                    InterlockedOr(NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags, orFlags, prevSf);
+
+                    if ((prevSf & 16u) != 0u) {
+                        UInt prevDup = 0u;
+                        InterlockedAdd(gs_DuplicateRequestCount, 1u, prevDup);
+                    } else {
+                        UInt prevUniq = 0u;
+                        InterlockedAdd(gs_UniqueRequestCount, 1u, prevUniq);
+
+                        UInt curState = prevSf & 15u;
+                        UInt physIdx  = NVSResidencyParams.VirtualPageTable[vIdx].physicalPageIndex;
+
+                        if ((curState == 2u || curState == 3u) && physIdx < physCap) {
+                            UInt dummyPrev = 0u;
+                            InterlockedOr(NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags, 64u, dummyPrev);
+                            NVSResidencyParams.VirtualPageTable[vIdx].lastTouchedFrame = currentFrame;
+
+                            NVSResidencyParams.PhysicalPageTable[physIdx].lastUsedFrame     = currentFrame;
+                            NVSResidencyParams.PhysicalPageTable[physIdx].minEvictableFrame = currentFrame + protectFrames;
+                            if ((reqFlags & 2u) != 0u) {
+                                UInt prevPhysSf = 0u;
+                                InterlockedOr(NVSResidencyParams.PhysicalPageTable[physIdx].stateAndFlags, 16u, prevPhysSf);
+                            }
+
+                            UInt prevHit = 0u;
+                            InterlockedAdd(gs_CacheHitCount, 1u, prevHit);
+                        } else {
+                            UInt existingAddr = NVSResidencyParams.VirtualPageTable[vIdx].virtualAddressPacked;
+                            UInt existingGen  = (existingAddr >> 24u) & 255u;
+                            UInt legDiff      = (reqGen >= existingGen) ? (reqGen - existingGen) : (reqGen + 255u - existingGen);
+                            Bool takeLegGen   = (reqGen != 0u) && (existingGen == 0u || (legDiff > 0u && legDiff <= 127u));
+                            UInt finalGen     = takeLegGen ? reqGen : ((existingGen == 0u) ? 1u : existingGen);
+                            UInt packedFinal  = (reqAddr & 16777215u) | (finalGen << 24u);
+                            NVSResidencyParams.VirtualPageTable[vIdx].virtualAddressPacked = packedFinal;
+
+                            UInt missOrderIdx = (((reqLevel * maxLights) + reqLight) * pagesPerLevel) + (reqPageY * pagesPerAxis) + reqPageX;
+                            UInt pageWordIdx  = missOrderIdx >> 5u;
+                            UInt pageBitIdx   = missOrderIdx & 31u;
+                            if (pageWordIdx < 2048u) {
+                                UInt prevPageMask = 0u;
+                                InterlockedOr(gs_MissPageBitmask[pageWordIdx], 1u << pageBitIdx, prevPageMask);
+
+                                UInt blockWordIdx = pageWordIdx >> 5u;
+                                UInt blockBitIdx  = pageWordIdx & 31u;
+                                UInt prevBlkMask  = 0u;
+                                InterlockedOr(gs_MissBlockMask[blockWordIdx], 1u << blockBitIdx, prevBlkMask);
+                            }
+
+                            UInt prevMiss = 0u;
+                            InterlockedAdd(gs_CacheMissCount, 1u, prevMiss);
+                        }
+                    }
+                }
+            }
+        }
+
+        AllMemoryBarrierWithGroupSync();
+
+        // =================================================================
+        //  Phase 2B: 64-Wide Parallel Physical Candidate Key Build + Bitonic Sort
+        // =================================================================
+        UInt sortN = 1u;
+        while (sortN < physCap) {
+            sortN = sortN << 1u;
+        }
+        UInt sortActiveN = (gs_CacheMissCount > 0u) ? sortN : 0u;
+
+        for (UInt pk = tid; pk < sortActiveN; pk = pk + 64u) {
+            UInt keyVal = 4294967295u;
+            if (pk < physCap) {
+                UInt psfK  = NVSResidencyParams.PhysicalPageTable[pk].stateAndFlags;
+                UInt pStK  = psfK & 15u;
+                UInt pPinK = psfK & 16u;
+                if (pStK == 0u) {
+                    keyVal = pk;
+                } else if (pPinK == 0u) {
+                    UInt pLastUsed = NVSResidencyParams.PhysicalPageTable[pk].lastUsedFrame;
+                    UInt pMinEvict = NVSResidencyParams.PhysicalPageTable[pk].minEvictableFrame;
+                    if (pLastUsed < currentFrame && currentFrame >= pMinEvict) {
+                        UInt ageM1   = currentFrame - pLastUsed - 1u;
+                        UInt ageClmp = (ageM1 < 524285u) ? ageM1 : 524285u;
+                        UInt ageTerm = 524286u - ageClmp;
+                        keyVal       = 1073741824u | (ageTerm << 11u) | pk;
+                    } else if (sparseMode != 0u && pStK == 3u && pLastUsed == currentFrame) {
+                        UInt pAlloc   = NVSResidencyParams.PhysicalPageTable[pk].allocatedFrame;
+                        UInt resPrio8 = (psfK >> 16u) & 255u;
+                        if (resPrio8 < 255u && currentFrame >= (pAlloc + protectFrames + 8u)) {
+                            keyVal = 2147483648u | (resPrio8 << 11u) | pk;
+                        }
+                    }
+                }
+            }
+            gs_PhysKey[pk] = keyVal;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        for (UInt bk = 2u; bk <= sortN; bk = bk << 1u) {
+            for (UInt bj = bk >> 1u; bj > 0u; bj = bj >> 1u) {
+                for (UInt bi = tid; bi < sortActiveN; bi = bi + 64u) {
+                    UInt bixj = bi ^ bj;
+                    if (bixj > bi) {
+                        UInt keyA = gs_PhysKey[bi];
+                        UInt keyB = gs_PhysKey[bixj];
+                        Bool ascendingRun = (bi & bk) == 0u;
+                        if ((ascendingRun && keyA > keyB) || (!ascendingRun && keyA < keyB)) {
+                            gs_PhysKey[bi]   = keyB;
+                            gs_PhysKey[bixj] = keyA;
+                        }
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // =================================================================
+        //  Phase 2C (Sparse Mode): Fair Priority Bitonic Sort on Miss Records
+        //    Fast path (recMiss <= 2048): 100% on-chip SRAM sort using
+        //    gs_MissPageBitmask (keys) and gs_MissBlockMask/indirection.
+        //    Large cold-start path (recMiss > 2048): in-place global bitonic sort.
+        // =================================================================
+        UInt recMiss   = (sparseMode != 0u) ? Min(gs_RecordedMissCount, maxMissCap) : 0u;
+        UInt sortMissN = 1u;
+        while (sortMissN < recMiss && sortMissN < maxMissCap) {
+            sortMissN = sortMissN << 1u;
+        }
+        UInt activeMissSortN = (recMiss > 1u) ? sortMissN : 0u;
+
+        if (activeMissSortN > 0u && sortMissN <= 2048u) {
+            for (UInt mi = tid; mi < sortMissN; mi = mi + 64u) {
+                if (mi < recMiss) {
+                    gs_MissPageBitmask[mi] = NVSResidencyParams.InOutMissRecords[mi].prioritySortKey;
+                    gs_AllocPacked[mi]     = mi;
+                } else {
+                    gs_MissPageBitmask[mi] = 4294967295u;
+                    gs_AllocPacked[mi]     = 4294967295u;
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            for (UInt mk = 2u; mk <= sortMissN; mk = mk << 1u) {
+                for (UInt mj = mk >> 1u; mj > 0u; mj = mj >> 1u) {
+                    for (UInt mIdx = tid; mIdx < sortMissN; mIdx = mIdx + 64u) {
+                        UInt mxj = mIdx ^ mj;
+                        if (mxj > mIdx) {
+                            UInt kA = gs_MissPageBitmask[mIdx];
+                            UInt kB = gs_MissPageBitmask[mxj];
+                            Bool asc = (mIdx & mk) == 0u;
+                            if ((asc && kA > kB) || (!asc && kA < kB)) {
+                                gs_MissPageBitmask[mIdx] = kB;
+                                gs_MissPageBitmask[mxj]  = kA;
+                                UInt idxA                = gs_AllocPacked[mIdx];
+                                gs_AllocPacked[mIdx]     = gs_AllocPacked[mxj];
+                                gs_AllocPacked[mxj]      = idxA;
+                            }
+                        }
+                    }
+                    GroupMemoryBarrierWithGroupSync();
+                }
+            }
+        } else if (activeMissSortN > 2048u) {
+            UInt maxPow2Cap = 1u;
+            while ((maxPow2Cap << 1u) <= maxMissCap) {
+                maxPow2Cap = maxPow2Cap << 1u;
+            }
+            UInt padCap = Min(sortMissN, maxPow2Cap);
+            for (UInt padM = recMiss + tid; padM < padCap; padM = padM + 64u) {
+                NVSResidencyParams.InOutMissRecords[padM].prioritySortKey  = 4294967295u;
+                NVSResidencyParams.InOutMissRecords[padM].virtualFlatIndex = 4294967295u;
+            }
+            AllMemoryBarrierWithGroupSync();
+
+            for (UInt gk = 2u; gk <= padCap; gk = gk << 1u) {
+                for (UInt gj = gk >> 1u; gj > 0u; gj = gj >> 1u) {
+                    for (UInt gIdx = tid; gIdx < padCap; gIdx = gIdx + 64u) {
+                        UInt gxj = gIdx ^ gj;
+                        if (gxj > gIdx && gxj < padCap) {
+                            UInt gkA = NVSResidencyParams.InOutMissRecords[gIdx].prioritySortKey;
+                            UInt gkB = NVSResidencyParams.InOutMissRecords[gxj].prioritySortKey;
+                            Bool gasc = (gIdx & gk) == 0u;
+                            if ((gasc && gkA > gkB) || (!gasc && gkA < gkB)) {
+                                UInt vA = NVSResidencyParams.InOutMissRecords[gIdx].virtualFlatIndex;
+                                UInt wA = NVSResidencyParams.InOutMissRecords[gIdx].viewIndex;
+                                UInt cA = NVSResidencyParams.InOutMissRecords[gIdx].packedCoordAndPin;
+
+                                NVSResidencyParams.InOutMissRecords[gIdx].prioritySortKey   = gkB;
+                                NVSResidencyParams.InOutMissRecords[gIdx].virtualFlatIndex  = NVSResidencyParams.InOutMissRecords[gxj].virtualFlatIndex;
+                                NVSResidencyParams.InOutMissRecords[gIdx].viewIndex         = NVSResidencyParams.InOutMissRecords[gxj].viewIndex;
+                                NVSResidencyParams.InOutMissRecords[gIdx].packedCoordAndPin = NVSResidencyParams.InOutMissRecords[gxj].packedCoordAndPin;
+
+                                NVSResidencyParams.InOutMissRecords[gxj].prioritySortKey   = gkA;
+                                NVSResidencyParams.InOutMissRecords[gxj].virtualFlatIndex  = vA;
+                                NVSResidencyParams.InOutMissRecords[gxj].viewIndex         = wA;
+                                NVSResidencyParams.InOutMissRecords[gxj].packedCoordAndPin = cA;
+                            }
+                        }
+                    }
+                    AllMemoryBarrierWithGroupSync();
+                }
+            }
+        }
+
+        // =================================================================
+        //  Phase 3A: Deterministic Physical Allocation & Overflow Accounting
+        // =================================================================
+        if (tid == 0u) {
+            UInt allocatedFreeCount = 0u;
+            UInt evictedPagesCount  = 0u;
+            UInt overflowPagesCount = 0u;
+            UInt emittedDirtyCount  = 0u;
+
+            if (sparseMode != 0u) {
+                UInt totalMisses = gs_CacheMissCount;
+                UInt unrecorded  = (totalMisses > recMiss) ? (totalMisses - recMiss) : 0u;
+                overflowPagesCount = unrecorded;
+
+                UInt candCursor         = 0u;
+                UInt maxPreemptions     = Max(physCap >> 3u, 8u);
+                UInt maxFinePreemptions = Min(maxPreemptions, 32u);
+                UInt preemptedSoFar     = 0u;
+                UInt finePreemptedSoFar = 0u;
+                for (UInt mOrd = 0u; mOrd < recMiss; mOrd = mOrd + 1u) {
+                    UInt recIdx = mOrd;
+                    if (activeMissSortN > 0u && sortMissN <= 2048u) {
+                        recIdx = gs_AllocPacked[mOrd];
+                    }
+                    UInt candKey  = (candCursor < sortN) ? gs_PhysKey[candCursor] : 4294967295u;
+                    Bool canAlloc = (candKey != 4294967295u) && (emittedDirtyCount < maxClearOut);
+                    Bool usedFinePreempt = false;
+                    if (canAlloc && ((candKey >> 30u) == 2u)) {
+                        UInt missSortKey  = NVSResidencyParams.InOutMissRecords[recIdx].prioritySortKey;
+                        Bool missIsAnchor = ((missSortKey >> 30u) == 0u);
+                        UInt missRawPrio8 = 255u - ((missSortKey >> 16u) & 255u);
+                        UInt missEffPrio8 = missIsAnchor ? 255u : Min(missRawPrio8, 254u);
+                        UInt candResPrio8 = (candKey >> 11u) & 255u;
+                        Bool allowPreempt = missIsAnchor
+                            ? ((preemptedSoFar < maxPreemptions) && (candResPrio8 < 255u))
+                            : ((preemptedSoFar < maxPreemptions) && (finePreemptedSoFar < maxFinePreemptions) && (missEffPrio8 > (candResPrio8 + 16u)));
+                        if (!allowPreempt) {
+                            canAlloc = false;
+                        } else if (!missIsAnchor) {
+                            usedFinePreempt = true;
+                        }
+                    }
+                    if (canAlloc) {
+                        UInt chosenPhys = candKey & 2047u;
+                        UInt candTier   = candKey >> 30u;
+                        UInt wasEvicted = (candTier != 0u) ? 1u : 0u;
+                        if (candTier == 2u) {
+                            preemptedSoFar = preemptedSoFar + 1u;
+                            if (usedFinePreempt) {
+                                finePreemptedSoFar = finePreemptedSoFar + 1u;
+                            }
+                        }
+                        // Pack 32-bit allocation command: [31] = wasEvicted, [15..30] = missRecordIdx, [0..14] = chosenPhys
+                        gs_AllocPacked[emittedDirtyCount] = ((wasEvicted & 1u) << 31u) | ((recIdx & 65535u) << 15u) | (chosenPhys & 32767u);
+                        if (wasEvicted != 0u) {
+                            evictedPagesCount = evictedPagesCount + 1u;
+                        } else {
+                            allocatedFreeCount = allocatedFreeCount + 1u;
+                        }
+                        emittedDirtyCount = emittedDirtyCount + 1u;
+                        candCursor        = candCursor + 1u;
+                    } else {
+                        // Clear REQUESTED_THIS_FRAME on overflowed virtual entry so next frame can re-request cleanly
+                        UInt ovfVIdx = NVSResidencyParams.InOutMissRecords[recIdx].virtualFlatIndex;
+                        if (ovfVIdx < totalVirtualPages) {
+                            UInt ovfSf = NVSResidencyParams.VirtualPageTable[ovfVIdx].stateAndFlags;
+                            NVSResidencyParams.VirtualPageTable[ovfVIdx].stateAndFlags = ovfSf & 527u;
+                        }
+                        overflowPagesCount = overflowPagesCount + 1u;
+                    }
+                }
+            } else if (gs_CacheMissCount > 0u) {
+                UInt candCursor = 0u;
+                UInt exhausted  = 0u;
+
+                UInt totalPageWords = (totalVirtualPages + 31u) >> 5u;
+                if (totalPageWords > 2048u) {
+                    totalPageWords = 2048u;
+                }
+                UInt totalBlockWords = (totalPageWords + 31u) >> 5u;
+                if (totalBlockWords > 64u) {
+                    totalBlockWords = 64u;
+                }
+
+                for (UInt bw = 0u; bw < totalBlockWords; bw = bw + 1u) {
+                    UInt blkMask = gs_MissBlockMask[bw];
+                    while (blkMask != 0u) {
+                        UInt bb = FirstBitLow(blkMask);
+                        blkMask = blkMask & (blkMask - 1u);
+                        UInt pw = (bw << 5u) + bb;
+                        if (pw < totalPageWords) {
+                            UInt pageMask = gs_MissPageBitmask[pw];
+                            if (exhausted != 0u) {
+                                overflowPagesCount = overflowPagesCount + CountBits(pageMask);
+                                pageMask = 0u;
+                            }
+                            while (pageMask != 0u) {
+                                UInt pb = FirstBitLow(pageMask);
+                                pageMask = pageMask & (pageMask - 1u);
+                                UInt missOrderIdx = (pw << 5u) + pb;
+                                if (missOrderIdx < totalVirtualPages) {
+                                    UInt pageInLevel   = missOrderIdx % pagesPerLevel;
+                                    UInt prioritySlice = missOrderIdx / pagesPerLevel;
+                                    UInt reqLightM     = prioritySlice % maxLights;
+                                    UInt reqLevelM     = prioritySlice / maxLights;
+                                    UInt vIdx          = (((reqLightM * levelCount) + reqLevelM) * pagesPerLevel) + pageInLevel;
+                                    UInt candKey       = (candCursor < sortN) ? gs_PhysKey[candCursor] : 4294967295u;
+
+                                    if (candKey != 4294967295u && emittedDirtyCount < maxClearOut) {
+                                        UInt chosenPhys = candKey & 2047u;
+                                        UInt wasEvicted = ((candKey >> 11u) != 0u) ? 1u : 0u;
+                                        gs_AllocPacked[emittedDirtyCount] = ((vIdx & 65535u) << 16u) | ((wasEvicted & 1u) << 15u) | (chosenPhys & 32767u);
+                                        if (wasEvicted != 0u) {
+                                            evictedPagesCount = evictedPagesCount + 1u;
+                                        } else {
+                                            allocatedFreeCount = allocatedFreeCount + 1u;
+                                        }
+                                        emittedDirtyCount = emittedDirtyCount + 1u;
+                                        candCursor        = candCursor + 1u;
+                                    } else {
+                                        exhausted          = 1u;
+                                        overflowPagesCount = overflowPagesCount + 1u + CountBits(pageMask);
+                                        pageMask           = 0u;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            gs_EmittedDirtyCount = emittedDirtyCount;
+
+            UInt hasOverflow = (overflowPagesCount > 0u) ? 1u : 0u;
+            NVSResidencyParams.OutDirtySliceCount[0u].count = emittedDirtyCount;
+            NVSResidencyParams.OutDirtySliceCount[1u].count = emittedDirtyCount + overflowPagesCount;
+            NVSResidencyParams.OutDirtySliceCount[2u].count = hasOverflow;
+            NVSResidencyParams.OutDirtySliceCount[3u].count = overflowPagesCount;
+
+            NVSResidencyParams.OutSelectiveClearIndirectArgs[0u].arg = 3u;
+            NVSResidencyParams.OutSelectiveClearIndirectArgs[1u].arg = emittedDirtyCount;
+            NVSResidencyParams.OutSelectiveClearIndirectArgs[2u].arg = 0u;
+            NVSResidencyParams.OutSelectiveClearIndirectArgs[3u].arg = 0u;
+
+            NVSResidencyParams.OutTelemetry[0u].requestedCount         = reqCount;
+            NVSResidencyParams.OutTelemetry[0u].validRequestCount      = gs_ValidRequestCount;
+            NVSResidencyParams.OutTelemetry[0u].invalidRequestCount    = gs_InvalidRequestCount;
+            NVSResidencyParams.OutTelemetry[0u].uniqueRequestCount     = gs_UniqueRequestCount;
+            NVSResidencyParams.OutTelemetry[0u].duplicateRequestCount  = gs_DuplicateRequestCount;
+            NVSResidencyParams.OutTelemetry[0u].cacheHitCount          = gs_CacheHitCount;
+            NVSResidencyParams.OutTelemetry[0u].cacheMissCount         = gs_CacheMissCount;
+            NVSResidencyParams.OutTelemetry[0u].allocatedFromFreeCount = allocatedFreeCount;
+            NVSResidencyParams.OutTelemetry[0u].evictedCount           = evictedPagesCount;
+            NVSResidencyParams.OutTelemetry[0u].overflowCount          = overflowPagesCount;
+            NVSResidencyParams.OutTelemetry[0u].invalidatedCount       = gs_InvalidatedCount;
+            NVSResidencyParams.OutTelemetry[0u].dirtyClearSliceCount   = emittedDirtyCount;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // =================================================================
+        //  Phase 3B: 64-Wide Parallel UAV Commit of Allocated/Evicted Pages
+        // =================================================================
+        UInt commitCount = gs_EmittedDirtyCount;
+        UInt markCleared = NVSResidencyParams.Config.markClearedInPass;
+        UInt allocState  = (markCleared != 0u) ? 2u : 1u;
+        UInt dirtyFlag   = (markCleared != 0u) ? 0u : 32u;
+
+        for (UInt m = tid; m < commitCount; m = m + 64u) {
+            UInt packedAlloc = gs_AllocPacked[m];
+            UInt vIdx        = 0u;
+            UInt wasEvicted  = 0u;
+            UInt chosenPhys  = packedAlloc & 32767u;
+            UInt viewIdx     = 0u;
+            Bool isExtCommit = (sparseMode != 0u);
+
+            UInt allocPrioBits = 0u;
+            if (isExtCommit) {
+                wasEvicted    = (packedAlloc >> 31u) & 1u;
+                UInt recIdx   = (packedAlloc >> 15u) & 65535u;
+                vIdx          = NVSResidencyParams.InOutMissRecords[recIdx].virtualFlatIndex;
+                viewIdx       = NVSResidencyParams.InOutMissRecords[recIdx].viewIndex;
+                UInt mSortKey = NVSResidencyParams.InOutMissRecords[recIdx].prioritySortKey;
+                Bool isAncAl  = ((mSortKey >> 30u) == 0u);
+                UInt rawPrio8 = 255u - ((mSortKey >> 16u) & 255u);
+                UInt effPrio8 = isAncAl ? 255u : Min(rawPrio8, 254u);
+                allocPrioBits = effPrio8 << 16u;
+            } else {
+                vIdx       = (packedAlloc >> 16u) & 65535u;
+                wasEvicted = (packedAlloc >> 15u) & 1u;
+            }
+
+            if (wasEvicted != 0u) {
+                UInt oldPsf   = NVSResidencyParams.PhysicalPageTable[chosenPhys].stateAndFlags;
+                Bool oldExt   = ((oldPsf & 128u) != 0u);
+                UInt oldOwner = NVSResidencyParams.PhysicalPageTable[chosenPhys].ownerVirtualFlatIndex;
+                if (oldOwner < totalVirtualPages) {
+                    UInt oldAddr = NVSResidencyParams.VirtualPageTable[oldOwner].virtualAddressPacked;
+                    UInt newOld  = BumpPackedGeneration(oldAddr, oldExt);
+                    NVSResidencyParams.VirtualPageTable[oldOwner].stateAndFlags        = oldExt ? (5u | 512u) : 5u;
+                    NVSResidencyParams.VirtualPageTable[oldOwner].physicalPageIndex    = 4294967295u;
+                    NVSResidencyParams.VirtualPageTable[oldOwner].virtualAddressPacked = newOld;
+                }
+            }
+
+            UInt vsf      = NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags;
+            UInt vAddr    = NVSResidencyParams.VirtualPageTable[vIdx].virtualAddressPacked;
+            UInt pinFlag  = ((vsf & 256u) != 0u) ? 16u : 0u;
+            UInt vPinFlag = ((vsf & 256u) != 0u) ? 256u : 0u;
+            UInt evFlag   = (wasEvicted != 0u) ? 64u : 0u;
+            UInt extPFlag = isExtCommit ? 128u : 0u;
+            UInt extVFlag = isExtCommit ? 512u : 0u;
+            UInt oldPGen  = NVSResidencyParams.PhysicalPageTable[chosenPhys].physicalGeneration;
+
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].stateAndFlags         = allocState | dirtyFlag | pinFlag | evFlag | extPFlag | allocPrioBits;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].ownerVirtualFlatIndex = vIdx;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].ownerVirtualAddress   = vAddr;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].physicalGeneration    = oldPGen + 1u;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].lastUsedFrame         = currentFrame;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].allocatedFrame        = currentFrame;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].minEvictableFrame     = currentFrame + protectFrames;
+            NVSResidencyParams.PhysicalPageTable[chosenPhys].metaAux               = viewIdx;
+
+            NVSResidencyParams.VirtualPageTable[vIdx].stateAndFlags     = allocState | 16u | dirtyFlag | 128u | vPinFlag | extVFlag;
+            NVSResidencyParams.VirtualPageTable[vIdx].physicalPageIndex = chosenPhys;
+            NVSResidencyParams.VirtualPageTable[vIdx].lastTouchedFrame  = currentFrame;
+
+            NVSResidencyParams.OutDirtyPhysicalSlices[m].sliceIndex = chosenPhys;
+        }
+
+        AllMemoryBarrierWithGroupSync();
+
+        // =================================================================
+        //  Phase 4: Disjoint Tail Sentinel Fill & Population Telemetry
+        // =================================================================
+        if (NVSResidencyParams.Config.clearTailSentinel != 0u) {
+            UInt startClear = gs_EmittedDirtyCount + tid;
+            for (UInt c = startClear; c < physCap; c = c + 64u) {
+                NVSResidencyParams.OutDirtyPhysicalSlices[c].sliceIndex = 4294967295u;
+            }
+        }
+
+        for (UInt p4 = tid; p4 < physCap; p4 = p4 + 64u) {
+            UInt pst4 = NVSResidencyParams.PhysicalPageTable[p4].stateAndFlags & 15u;
+            UInt prev = 0u;
+            if (pst4 == 0u) {
+                InterlockedAdd(gs_FreePhysicalCount, 1u, prev);
+            } else if (pst4 == 1u) {
+                InterlockedAdd(gs_AllocatedNotClearedCount, 1u, prev);
+            } else if (pst4 == 2u) {
+                InterlockedAdd(gs_ClearedNotRenderedCount, 1u, prev);
+            } else if (pst4 == 3u) {
+                InterlockedAdd(gs_ResidentValidCount, 1u, prev);
+            }
+        }
+
+        AllMemoryBarrierWithGroupSync();
+
+        if (tid == 0u) {
+            NVSResidencyParams.OutTelemetry[0u].residentValidPages       = gs_ResidentValidCount;
+            NVSResidencyParams.OutTelemetry[0u].allocatedNotClearedPages = gs_AllocatedNotClearedCount;
+            NVSResidencyParams.OutTelemetry[0u].clearedNotRenderedPages  = gs_ClearedNotRenderedCount;
+            NVSResidencyParams.OutTelemetry[0u].freePhysicalPages        = gs_FreePhysicalCount;
+        }
+
+        AllMemoryBarrierWithGroupSync();
+    }
+}

@@ -1,0 +1,30 @@
+// =====================================================================
+//  RuntimeBufferClear.nsl — NorthstarRuntime Internal GPU Buffer Clear
+//  Engine-internal compute kernel for clearing/filling uint32 UAV
+//  structured buffers (e.g., indirect command counts, atomic counters).
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY ClearParams {
+    Buffer Config {
+        Add(clearValue)   : UInt = 0
+        Add(elementCount) : UInt = 1
+        Add(dstOffset)    : UInt = 0
+    }
+    RWStructuredBuffer OutBuffer {
+        Add(value) : UInt
+    }
+}
+
+SHADER {
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt count = ClearParams.Config.elementCount;
+        if (dtid.x < count) {
+            UInt dstIdx = ClearParams.Config.dstOffset + dtid.x;
+            ClearParams.OutBuffer[dstIdx].value = ClearParams.Config.clearValue;
+        }
+    }
+}
+

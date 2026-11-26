@@ -1,0 +1,981 @@
+// =====================================================================
+//  RuntimeNVGShadowCull.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) x Northstar Virtual Shadows (NVS)
+//  Independent GPU Shadow Caster Culling, Shadow-Texel LOD Selection,
+//  Thin-Geometry Silhouette Preservation & Residency-Aware Shadow Fallback
+//
+//  Dispatch Modes:
+//    Mode 0 (PREPARE_SHADOW_VIEWS):
+//      Resets shadow queues & bucket counts, reads NVS active dirty page count,
+//      and populates OutShadowPageViews[0 .. activePageCount-1].
+//    Mode 1 (CULL_SHADOW_CASTERS):
+//      Scans InGPUSceneObjects for active GPU_SCENE_OBJ_VIRTUAL_GEOMETRY +
+//      GPU_SCENE_OBJ_CAST_SHADOW casters (NEVER camera-frustum-culled!), tests
+//      world AABB against every active NVS shadow page volume, and enqueues
+//      overlapping (objectSlot, rootNode, shadowBucket, shadowPageViewIdx).
+//    Mode 2 (TRAVERSE_SHADOW_BVH):
+//      Traverses BVH nodes per (objectSlot, shadowPageViewIdx), clipping node
+//      AABB against page clip volume and emitting child nodes or leaf clusters.
+//    Mode 3 (EVALUATE_SHADOW_CLUSTERS):
+//      Evaluates independent NVS shadow-texel LOD cut:
+//        shadowErrTexels = (E_world / page.texelWorldSize) * (1 + thinBoost * thinMetric)
+//      Independent of Camera Geometry LOD! Enforces crack-free residency
+//      fallback + GPU page faulting, emits shadow NVGVisibleClusterGPUData,
+//      and records independent shadowLODHistogram & shadowLODSum telemetry.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGShadowCullParams {
+    Buffer Config {
+        Add(dispatchMode)           : UInt  = 0
+        Add(sceneSlotCount)         : UInt  = 0
+        Add(meshTableCount)         : UInt  = 0
+        Add(materialTableCount)     : UInt  = 0
+        Add(bvhNodeCount)           : UInt  = 0
+        Add(clusterMetaCount)       : UInt  = 0
+        Add(clusterGroupCount)      : UInt  = 0
+        Add(virtualPageCount)       : UInt  = 0
+        Add(bucketCount)            : UInt  = 256
+        Add(maxActiveShadowPages)   : UInt  = 2048
+        Add(maxNodeQueueCapacity)   : UInt  = 131072
+        Add(maxCandidateCapacity)   : UInt  = 262144
+        Add(maxVisibleCapacity)     : UInt  = 262144
+        Add(srcCounterIndex)        : UInt  = 10
+        Add(dstNodeCounterIndex)    : UInt  = 11
+        Add(useGPUActivePageCount)  : UInt  = 1
+        Add(explicitActivePageCount): UInt  = 0
+        Add(shadowMaxTexelError)    : Float = 1.0
+        Add(thinFeatureShadowBoost) : Float = 3.0
+        Add(applyShaderBias)        : UInt  = 1
+        Add(depthBiasScale)         : Float = 1.0
+        Add(normalBiasScale)        : Float = 1.0
+        Add(hasCommitRecords)       : UInt  = 0
+        Add(clearPageRequests)      : UInt  = 0
+    }
+    StructuredBuffer InProjectionCounter {
+        Add(count) : UInt
+    }
+    StructuredBuffer InCasterPageRanges {
+        Add(virtualPageFlatIndex)   : UInt
+        Add(physicalPageIndex)      : UInt
+        Add(virtualAddressPacked)   : UInt
+        Add(lightId)                : UInt
+        Add(clipmapLevel)           : UInt
+        Add(firstCasterOffset)      : UInt
+        Add(casterCount)            : UInt
+        Add(rawCandidateCount)      : UInt
+        Add(pageFlags)              : UInt
+        Add(broadPhasePassedCount)  : UInt
+        Add(narrowPhasePassedCount) : UInt
+        Add(physicalGeneration)     : UInt
+    }
+    StructuredBuffer InPageRenderData {
+        Add(physicalPageIndex)    : UInt
+        Add(virtualFlatIndex)     : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(renderFlags)          : UInt
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(virtualPageX)         : UInt
+        Add(virtualPageY)         : UInt
+        Add(worldPageX)           : Int
+        Add(worldPageY)           : Int
+        Add(physicalGeneration)   : UInt
+        Add(lastUsedFrame)        : UInt
+        Add(lightMinX)            : Float
+        Add(lightMinY)            : Float
+        Add(lightMaxX)            : Float
+        Add(lightMaxY)            : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(worldCenterX)         : Float
+        Add(worldCenterY)         : Float
+        Add(worldCenterZ)         : Float
+        Add(pageWorldSize)        : Float
+        Add(worldBoundsMinX)      : Float
+        Add(worldBoundsMinY)      : Float
+        Add(worldBoundsMinZ)      : Float
+        Add(texelWorldSize)       : Float
+        Add(worldBoundsMaxX)      : Float
+        Add(worldBoundsMaxY)      : Float
+        Add(worldBoundsMaxZ)      : Float
+        Add(shadowVolumeRadius)   : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(viewportWidth)        : UInt
+        Add(viewportHeight)       : UInt
+        Add(worldToPageClipCol0)  : Vec4
+        Add(worldToPageClipCol1)  : Vec4
+        Add(worldToPageClipCol2)  : Vec4
+        Add(worldToPageClipCol3)  : Vec4
+        Add(lightViewCol0)        : Vec4
+        Add(lightViewCol1)        : Vec4
+        Add(lightViewCol2)        : Vec4
+        Add(lightViewCol3)        : Vec4
+        Add(pageProjCol0)         : Vec4
+        Add(pageProjCol1)         : Vec4
+        Add(pageProjCol2)         : Vec4
+        Add(pageProjCol3)         : Vec4
+    }
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : Int
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldMatrix)         : Mat4
+    }
+    StructuredBuffer InMeshTable {
+        Add(meshId)           : UInt
+        Add(flags)            : UInt
+        Add(rootNodeIndex)    : UInt
+        Add(nodeCount)        : UInt
+        Add(clusterBaseIndex) : UInt
+        Add(clusterCount)     : UInt
+        Add(groupBaseIndex)   : UInt
+        Add(groupCount)       : UInt
+        Add(localBoundsMin)   : Vec3
+        Add(virtualPageBase)  : UInt
+        Add(localBoundsMax)   : Vec3
+        Add(virtualPageCount) : UInt
+    }
+    StructuredBuffer InMaterialTable {
+        Add(materialId)               : UInt
+        Add(nvgFlags)                 : UInt
+        Add(opaqueBucketIndex)        : UInt
+        Add(depthBucketIndex)         : UInt
+        Add(transparentBucketIndex)   : UInt
+        Add(shadowBucketIndex)        : UInt
+        Add(opaqueInstBucketIndex)    : UInt
+        Add(shadowInstBucketIndex)    : UInt
+        Add(maxWorldDisplacement)     : Float
+        Add(lodErrorScale)            : Float
+        Add(shadowLodErrorScale)      : Float
+        Add(compatStatus)             : UInt
+        Add(depthInstBucketIndex)     : UInt
+        Add(transInstBucketIndex)     : UInt
+        Add(skinnedOpaqueBucketIndex) : UInt
+        Add(skinnedShadowBucketIndex) : UInt
+    }
+    StructuredBuffer InBVHNodes {
+        Add(boundsMin)          : Vec3
+        Add(childStart)         : UInt
+        Add(boundsMax)          : Vec3
+        Add(childCountAndFlags) : UInt
+        Add(lodSphere)          : Vec4
+        Add(maxParentError)     : Float
+        Add(minSelfError)       : Float
+        Add(meshId)             : UInt
+        Add(reserved)           : UInt
+    }
+    StructuredBuffer InClusterMeta {
+        Add(meshId)                   : UInt
+        Add(clusterLocalIndex)        : UInt
+        Add(virtualPageId)            : UInt
+        Add(clusterWordOffsetInPage)  : UInt
+        Add(countsAndLod)             : UInt
+        Add(selfGroupIndex)           : UInt
+        Add(parentGroupIndex)         : UInt
+        Add(refinedByChildGroupStart) : UInt
+        Add(aabbMin)                  : Vec3
+        Add(selfGroupError)           : Float
+        Add(aabbMax)                  : Vec3
+        Add(parentGroupError)         : Float
+        Add(selfGroupSphere)          : Vec4
+        Add(parentGroupSphere)        : Vec4
+        Add(normalConeAxisAndSin)     : Vec4
+        Add(thinFeatureMetric)        : Float
+        Add(maxEdgeLength)            : Float
+        Add(refinedByChildGroupCount) : UInt
+        Add(clusterFlags)             : UInt
+    }
+    StructuredBuffer InClusterGroups {
+        Add(meshId)             : UInt
+        Add(lodLevel)           : UInt
+        Add(clusterStart)       : UInt
+        Add(clusterCount)       : UInt
+        Add(parentGroupIndex)   : UInt
+        Add(childGroupStart)    : UInt
+        Add(childGroupCount)    : UInt
+        Add(firstVirtualPageId) : UInt
+        Add(groupSphere)        : Vec4
+    }
+    StructuredBuffer InVirtualPageTable {
+        Add(stateAndFlags)     : UInt
+        Add(physicalPageIndex) : UInt
+        Add(pageGeneration)    : UInt
+        Add(meshIdAndLod)      : UInt
+    }
+    StructuredBuffer InGroupActiveMask {
+        Add(active) : UInt
+    }
+    StructuredBuffer InNodeQueue {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutNodeQueue {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutCandidateClusters {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutShadowPageViews {
+        Add(vpCol0)            : Vec4
+        Add(vpCol1)            : Vec4
+        Add(vpCol2)            : Vec4
+        Add(vpCol3)            : Vec4
+        Add(physicalPageSlice) : UInt
+        Add(depthBiasNdc)      : Float
+        Add(normalBiasWorld)   : Float
+        Add(texelWorldSize)    : Float
+    }
+    RWStructuredBuffer OutVisibleClusters {
+        Add(objectSlotIndex)   : UInt
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(virtualPageId)     : UInt
+        Add(lodAndFlags)       : UInt
+        Add(geometricError)    : Float
+        Add(materialId)        : UInt
+        Add(bonePaletteOffset) : UInt
+        Add(boneCount)         : UInt
+        Add(drawBucketIndex)   : UInt
+        Add(viewDepthKey)      : Float
+    }
+    RWStructuredBuffer OutQueueCounters {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutBucketCounts {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutPageRequests {
+        Add(priority) : UInt
+    }
+    RWStructuredBuffer InOutPageCommitRecords {
+        Add(physicalPageIndex)          : UInt
+        Add(resultFlags)                : UInt
+        Add(expectedPhysicalGeneration) : UInt
+        Add(expectedVirtualFlatIndex)   : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+    void TransformLocalAABBToWorld(Mat4 worldMat, Vec3 lMin, Vec3 lMax, Float pad, out Vec3 wMin, out Vec3 wMax) {
+        Vec3 lCenter = (lMin + lMax) * 0.5;
+        Vec3 lExt    = (lMax - lMin) * 0.5;
+        Vec3 col0    = Mul(worldMat, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3 col1    = Mul(worldMat, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3 col2    = Mul(worldMat, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        Vec3 wCenter = Mul(worldMat, Vec4(lCenter, 1.0)).xyz;
+        Vec3 wExt    = Abs(col0) * lExt.x + Abs(col1) * lExt.y + Abs(col2) * lExt.z + Vec3(pad, pad, pad);
+        wMin = wCenter - wExt;
+        wMax = wCenter + wExt;
+    }
+
+    Float GetWorldMaxAxisScale(Mat4 worldMat) {
+        Vec3 col0  = Mul(worldMat, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3 col1  = Mul(worldMat, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3 col2  = Mul(worldMat, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        Float s0Sq = Dot(col0, col0);
+        Float s1Sq = Dot(col1, col1);
+        Float s2Sq = Dot(col2, col2);
+        Float maxSq = Max(Max(s0Sq, s1Sq), s2Sq);
+        Float offDiag = Abs(Dot(col0, col1)) + Abs(Dot(col0, col2)) + Abs(Dot(col1, col2));
+        if (offDiag > (0.0001 * maxSq)) {
+            return Sqrt(Max(s0Sq + s1Sq + s2Sq, 1.0e-10));
+        }
+        return Sqrt(Max(maxSq, 1.0e-10));
+    }
+
+    // Exact homogeneous clip-volume overlap test against page worldToPageClip (handles both ortho & perspective pages!).
+    // All 7 half-spaces (-w <= x <= w, -w <= y <= w, 0 <= z <= w, w > 0) are exact affine functions in R^3 even when
+    // clip.w <= 0, so behind-the-face Point Light cube casters are cleanly rejected while AABBs straddling w=0 stay intact.
+    Bool DoesWorldAABBOverlapShadowPageClip(Vec3 bMin, Vec3 bMax, Vec4 vp0, Vec4 vp1, Vec4 vp2, Vec4 vp3) {
+        UInt outMask = 127u;
+        for (UInt ci = 0u; ci < 8u; ci = ci + 1u) {
+            Vec3 p = Vec3(
+                ((ci & 1u) != 0u) ? bMax.x : bMin.x,
+                ((ci & 2u) != 0u) ? bMax.y : bMin.y,
+                ((ci & 4u) != 0u) ? bMax.z : bMin.z);
+            Vec4 clip = vp0 * p.x + vp1 * p.y + vp2 * p.z + vp3;
+            UInt cm = 0u;
+            if (clip.x < -clip.w) { cm = cm | 1u; }
+            if (clip.x >  clip.w) { cm = cm | 2u; }
+            if (clip.y < -clip.w) { cm = cm | 4u; }
+            if (clip.y >  clip.w) { cm = cm | 8u; }
+            if (clip.z <  0.0)    { cm = cm | 16u; }
+            if (clip.z >  clip.w) { cm = cm | 32u; }
+            if (clip.w <= 0.0)    { cm = cm | 64u; }
+            outMask = outMask & cm;
+            if (outMask == 0u) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Float ComputeShadowPageTexelWorldAtSphere(
+        Float baseTexelSize,
+        Vec4  localSphere,
+        Mat4  worldMat,
+        Float maxScale,
+        Vec4  vp0,
+        Vec4  vp1,
+        Vec4  vp2,
+        Vec4  vp3)
+    {
+        // Orthographic pages have vp[0..2].w == 0, vp3.w == 1 (baseTexelSize is already meters/texel).
+        // Perspective pages (Point/Spot) store angular tan-size in baseTexelSize and light-space depth in clip.w.
+        Float perspWMag = Abs(vp0.w) + Abs(vp1.w) + Abs(vp2.w);
+        if (perspWMag <= 0.00001) {
+            return baseTexelSize;
+        }
+        Vec3  wCenter = Mul(worldMat, Vec4(localSphere.xyz, 1.0)).xyz;
+        Float clipW   = vp0.w * wCenter.x + vp1.w * wCenter.y + vp2.w * wCenter.z + vp3.w;
+        Float wRadius = localSphere.w * maxScale;
+        Float safeZ   = Max(clipW - wRadius, 0.1);
+        return baseTexelSize * safeZ;
+    }
+
+    Float ComputeShadowErrorTexels(Float localError, Float maxScale, Float texelWorldSize, Float thinMetric) {
+        if (localError <= 0.0) {
+            return 0.0;
+        }
+        if (localError >= 1.0e20) {
+            return 1.0e20;
+        }
+        Float safeTexel = Max(texelWorldSize, 0.00001);
+        Float thinBoost = 1.0 + Max(NVGShadowCullParams.Config.thinFeatureShadowBoost, 0.0) * Max(thinMetric, 0.0);
+        return ((localError * maxScale) / safeTexel) * thinBoost;
+    }
+
+    void MarkShadowPageOverflow(UInt shViewIdx) {
+        UInt prev = 0u;
+        InterlockedAdd(NVGShadowCullParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+        if (NVGShadowCullParams.Config.hasCommitRecords != 0u &&
+            shViewIdx < NVGShadowCullParams.Config.maxActiveShadowPages) {
+            UInt prevFlags = 0u;
+            InterlockedOr(NVGShadowCullParams.InOutPageCommitRecords[shViewIdx].resultFlags, 2u, prevFlags);
+            if ((prevFlags & 2u) == 0u) {
+                InterlockedAdd(NVGShadowCullParams.OutTelemetry[38u].word, 1u, prev); // shadowOverflowPages
+            }
+        }
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt tid        = dtid.x;
+        UInt mode       = NVGShadowCullParams.Config.dispatchMode;
+        UInt invalidIdx = ~0u;
+        UInt prev       = 0u;
+
+        // =================================================================
+        //  MODE 0: Reset Shadow Queues & Populate OutShadowPageViews
+        // =================================================================
+        if (mode == 0u) {
+            UInt rawPageCnt = (NVGShadowCullParams.Config.useGPUActivePageCount != 0u)
+                ? NVGShadowCullParams.InProjectionCounter[4u].count
+                : NVGShadowCullParams.Config.explicitActivePageCount;
+            UInt activePages = Min(rawPageCnt, NVGShadowCullParams.Config.maxActiveShadowPages);
+
+            if (tid == 0u) {
+                NVGShadowCullParams.OutQueueCounters[9u].count  = activePages;
+                NVGShadowCullParams.OutQueueCounters[10u].count = 0u;
+                NVGShadowCullParams.OutQueueCounters[11u].count = 0u;
+                NVGShadowCullParams.OutQueueCounters[12u].count = 0u;
+                NVGShadowCullParams.OutQueueCounters[13u].count = 0u;
+                if (NVGShadowCullParams.Config.clearPageRequests != 0u) {
+                    NVGShadowCullParams.OutTelemetry[15u].word  = 0u;
+                }
+                NVGShadowCullParams.OutTelemetry[16u].word      = 0u;
+                NVGShadowCullParams.OutTelemetry[17u].word      = 0u;
+                NVGShadowCullParams.OutTelemetry[18u].word      = 0u;
+                NVGShadowCullParams.OutTelemetry[19u].word      = 0u;
+                NVGShadowCullParams.OutTelemetry[37u].word      = 0u;
+                NVGShadowCullParams.OutTelemetry[38u].word      = 0u;
+                NVGShadowCullParams.OutTelemetry[39u].word      = 0u;
+                for (UInt h = 0u; h < 8u; h = h + 1u) {
+                    NVGShadowCullParams.OutTelemetry[28u + h].word = 0u;
+                }
+            }
+            if (tid < NVGShadowCullParams.Config.bucketCount) {
+                NVGShadowCullParams.OutBucketCounts[tid].count = 0u;
+            }
+            if (NVGShadowCullParams.Config.clearPageRequests != 0u) {
+                UInt vpCnt = NVGShadowCullParams.Config.virtualPageCount;
+                for (UInt vpIdx = dtid.x; vpIdx < vpCnt; vpIdx = vpIdx + 4194240u) {
+                    NVGShadowCullParams.OutPageRequests[vpIdx].priority = 0u;
+                }
+            }
+            if (tid < activePages) {
+                UInt physIdx = NVGShadowCullParams.InCasterPageRanges[tid].physicalPageIndex;
+                UInt safeIdx = (physIdx < NVGShadowCullParams.Config.maxActiveShadowPages) ? physIdx : 0u;
+                Float biasScale  = (NVGShadowCullParams.Config.applyShaderBias != 0u) ? NVGShadowCullParams.Config.depthBiasScale : 0.0;
+                Float nBiasScale = (NVGShadowCullParams.Config.applyShaderBias != 0u) ? NVGShadowCullParams.Config.normalBiasScale : 0.0;
+
+                NVGShadowCullParams.OutShadowPageViews[tid].vpCol0            = NVGShadowCullParams.InPageRenderData[safeIdx].worldToPageClipCol0;
+                NVGShadowCullParams.OutShadowPageViews[tid].vpCol1            = NVGShadowCullParams.InPageRenderData[safeIdx].worldToPageClipCol1;
+                NVGShadowCullParams.OutShadowPageViews[tid].vpCol2            = NVGShadowCullParams.InPageRenderData[safeIdx].worldToPageClipCol2;
+                NVGShadowCullParams.OutShadowPageViews[tid].vpCol3            = NVGShadowCullParams.InPageRenderData[safeIdx].worldToPageClipCol3;
+                NVGShadowCullParams.OutShadowPageViews[tid].physicalPageSlice = NVGShadowCullParams.InPageRenderData[safeIdx].physicalPageIndex;
+                NVGShadowCullParams.OutShadowPageViews[tid].depthBiasNdc      = NVGShadowCullParams.InPageRenderData[safeIdx].depthBiasNdc * biasScale;
+                NVGShadowCullParams.OutShadowPageViews[tid].normalBiasWorld   = NVGShadowCullParams.InPageRenderData[safeIdx].normalBiasWorld * nBiasScale;
+                NVGShadowCullParams.OutShadowPageViews[tid].texelWorldSize    = NVGShadowCullParams.InPageRenderData[safeIdx].texelWorldSize;
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1: Virtual Shadow Caster Broad-Phase Over Active NVS Pages
+        //  (NEVER rejects off-screen camera casters! Grid-Stride Unlimited)
+        // =================================================================
+        if (mode == 1u) {
+            UInt activePages = NVGShadowCullParams.OutQueueCounters[9u].count;
+            if (activePages == 0u) {
+                return;
+            }
+            Bool hasUnionBox = false;
+            Vec3 uMin = Vec3(0.0, 0.0, 0.0);
+            Vec3 uMax = Vec3(0.0, 0.0, 0.0);
+            if (NVGShadowCullParams.Config.useGPUActivePageCount != 0u) {
+                UInt projElemCnt = 0u;
+                UInt projStride  = 0u;
+                GetDimensions(NVGShadowCullParams.InProjectionCounter, projElemCnt, projStride);
+                if (projElemCnt >= 16u && NVGShadowCullParams.InProjectionCounter[15u].count != 0u) {
+                    hasUnionBox = true;
+                    uMin = Vec3(
+                        AsFloat(NVGShadowCullParams.InProjectionCounter[8u].count),
+                        AsFloat(NVGShadowCullParams.InProjectionCounter[9u].count),
+                        AsFloat(NVGShadowCullParams.InProjectionCounter[10u].count));
+                    uMax = Vec3(
+                        AsFloat(NVGShadowCullParams.InProjectionCounter[11u].count),
+                        AsFloat(NVGShadowCullParams.InProjectionCounter[12u].count),
+                        AsFloat(NVGShadowCullParams.InProjectionCounter[13u].count));
+                }
+            }
+
+            UInt slotCount = NVGShadowCullParams.Config.sceneSlotCount;
+            for (UInt curSlot = dtid.x; curSlot < slotCount; curSlot = curSlot + 4194240u) {
+                UInt recSlot = NVGShadowCullParams.InGPUSceneObjects[curSlot].slotIndex;
+                UInt gen     = NVGShadowCullParams.InGPUSceneObjects[curSlot].generation;
+                UInt flags   = NVGShadowCullParams.InGPUSceneObjects[curSlot].objectFlags;
+                // Require OCCUPIED (1), VISIBLE (2), CAST_SHADOW (8), VIRTUAL_GEOMETRY (1048576) = 1048587
+                if (recSlot != curSlot || gen == 0u || (flags & 1048587u) != 1048587u) {
+                    continue;
+                }
+
+                UInt meshId = NVGShadowCullParams.InGPUSceneObjects[curSlot].meshId;
+                UInt matId  = NVGShadowCullParams.InGPUSceneObjects[curSlot].materialId;
+                if (meshId == 0u || meshId >= NVGShadowCullParams.Config.meshTableCount ||
+                    matId == 0u  || matId  >= NVGShadowCullParams.Config.materialTableCount) {
+                    continue;
+                }
+                if ((NVGShadowCullParams.InMeshTable[meshId].flags & 1u) == 0u) {
+                    continue;
+                }
+
+                UInt matFlags = NVGShadowCullParams.InMaterialTable[matId].nvgFlags;
+                if ((matFlags & 129u) != 129u) { // NVG_MAT_FLAG_VALID | NVG_MAT_FLAG_HAS_SHADOW_PASS
+                    continue;
+                }
+                Bool isSkinned = ((flags & 1024u) != 0u);
+                UInt shBucket  = isSkinned
+                    ? NVGShadowCullParams.InMaterialTable[matId].skinnedShadowBucketIndex
+                    : NVGShadowCullParams.InMaterialTable[matId].shadowBucketIndex;
+                if (shBucket == invalidIdx) {
+                    shBucket = NVGShadowCullParams.InMaterialTable[matId].shadowBucketIndex;
+                }
+                if (shBucket == invalidIdx) {
+                    continue;
+                }
+
+                InterlockedAdd(NVGShadowCullParams.OutTelemetry[16u].word, 1u, prev); // shadowCastersEvaluated
+
+                Float disp = Max(NVGShadowCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                Vec3 bMin  = NVGShadowCullParams.InGPUSceneObjects[curSlot].aabbMin - Vec3(disp, disp, disp);
+                Vec3 bMax  = NVGShadowCullParams.InGPUSceneObjects[curSlot].aabbMax + Vec3(disp, disp, disp);
+
+                if (hasUnionBox) {
+                    if (bMax.x < uMin.x || bMin.x > uMax.x ||
+                        bMax.y < uMin.y || bMin.y > uMax.y ||
+                        bMax.z < uMin.z || bMin.z > uMax.z) {
+                        continue;
+                    }
+                }
+
+                UInt rootNode = NVGShadowCullParams.InMeshTable[meshId].rootNodeIndex;
+
+                for (UInt pi = 0u; pi < activePages; pi = pi + 1u) {
+                    Vec4 vp0 = NVGShadowCullParams.OutShadowPageViews[pi].vpCol0;
+                    Vec4 vp1 = NVGShadowCullParams.OutShadowPageViews[pi].vpCol1;
+                    Vec4 vp2 = NVGShadowCullParams.OutShadowPageViews[pi].vpCol2;
+                    Vec4 vp3 = NVGShadowCullParams.OutShadowPageViews[pi].vpCol3;
+
+                    if (DoesWorldAABBOverlapShadowPageClip(bMin, bMax, vp0, vp1, vp2, vp3)) {
+                        UInt dstIdx = 0u;
+                        InterlockedAdd(NVGShadowCullParams.OutQueueCounters[10u].count, 1u, dstIdx);
+                        InterlockedMax(NVGShadowCullParams.OutTelemetry[39u].word, dstIdx + 1u, prev);
+                        if (dstIdx < NVGShadowCullParams.Config.maxNodeQueueCapacity) {
+                            NVGShadowCullParams.OutNodeQueue[dstIdx].objectSlotIndex = curSlot;
+                            NVGShadowCullParams.OutNodeQueue[dstIdx].nodeOrClusterId = rootNode;
+                            NVGShadowCullParams.OutNodeQueue[dstIdx].drawBucketHint  = shBucket;
+                            NVGShadowCullParams.OutNodeQueue[dstIdx].auxData         = pi; // shadowPageViewIndex
+                        } else {
+                            MarkShadowPageOverflow(pi);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 2: Shadow BVH Traversal Step
+        // =================================================================
+        if (mode == 2u) {
+            UInt srcCntIdx = NVGShadowCullParams.Config.srcCounterIndex;
+            UInt srcCount  = Min(NVGShadowCullParams.OutQueueCounters[srcCntIdx].count,
+                                 NVGShadowCullParams.Config.maxNodeQueueCapacity);
+            for (UInt itemIdx = dtid.x; itemIdx < srcCount; itemIdx = itemIdx + 4194240u) {
+                UInt objSlot   = NVGShadowCullParams.InNodeQueue[itemIdx].objectSlotIndex;
+                UInt nodeId    = NVGShadowCullParams.InNodeQueue[itemIdx].nodeOrClusterId;
+                UInt shBucket  = NVGShadowCullParams.InNodeQueue[itemIdx].drawBucketHint;
+                UInt shViewIdx = NVGShadowCullParams.InNodeQueue[itemIdx].auxData;
+
+                if (nodeId >= NVGShadowCullParams.Config.bvhNodeCount ||
+                    shViewIdx >= NVGShadowCullParams.OutQueueCounters[9u].count) {
+                    continue;
+                }
+
+                Mat4  worldMat      = NVGShadowCullParams.InGPUSceneObjects[objSlot].worldMatrix;
+                UInt  matId         = NVGShadowCullParams.InGPUSceneObjects[objSlot].materialId;
+                Float disp          = 0.0;
+                Float shLodErrScale = 1.0;
+                UInt  matFlags      = 0u;
+                if (matId < NVGShadowCullParams.Config.materialTableCount) {
+                    disp          = Max(NVGShadowCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                    shLodErrScale = Max(NVGShadowCullParams.InMaterialTable[matId].shadowLodErrorScale, 0.001);
+                    matFlags      = NVGShadowCullParams.InMaterialTable[matId].nvgFlags;
+                }
+
+                Vec3 wMin = Vec3(0.0, 0.0, 0.0);
+                Vec3 wMax = Vec3(0.0, 0.0, 0.0);
+                TransformLocalAABBToWorld(
+                    worldMat,
+                    NVGShadowCullParams.InBVHNodes[nodeId].boundsMin,
+                    NVGShadowCullParams.InBVHNodes[nodeId].boundsMax,
+                    disp, wMin, wMax);
+
+                Vec4 vp0 = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol0;
+                Vec4 vp1 = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol1;
+                Vec4 vp2 = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol2;
+                Vec4 vp3 = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol3;
+                if (!DoesWorldAABBOverlapShadowPageClip(wMin, wMax, vp0, vp1, vp2, vp3)) {
+                    continue;
+                }
+
+                Float maxScale       = GetWorldMaxAxisScale(worldMat);
+                Float baseTexelWorld = NVGShadowCullParams.OutShadowPageViews[shViewIdx].texelWorldSize;
+                Float threshold      = Max(NVGShadowCullParams.Config.shadowMaxTexelError * shLodErrScale, 0.001);
+                Bool  lockLod0       = ((matFlags & 64u) != 0u);
+                UInt  nodeReserved   = NVGShadowCullParams.InBVHNodes[nodeId].reserved;
+                if (!lockLod0 && (nodeReserved & 2147483648u) != 0u) {
+                    Float maxParentThin = Float(nodeReserved & 16383u) * (4.0 / 16383.0);
+                    Float subTexelWorld = ComputeShadowPageTexelWorldAtSphere(
+                        baseTexelWorld,
+                        NVGShadowCullParams.InBVHNodes[nodeId].lodSphere,
+                        worldMat, maxScale, vp0, vp1, vp2, vp3);
+                    Float maxSubtreeErr = ComputeShadowErrorTexels(
+                        NVGShadowCullParams.InBVHNodes[nodeId].maxParentError,
+                        maxScale, subTexelWorld, maxParentThin);
+                    if (maxSubtreeErr <= threshold) {
+                        continue;
+                    }
+                }
+
+                UInt childStart = NVGShadowCullParams.InBVHNodes[nodeId].childStart;
+                UInt cPacked    = NVGShadowCullParams.InBVHNodes[nodeId].childCountAndFlags;
+                UInt childCount = cPacked & 65535u;
+                Bool isLeaf     = ((cPacked & 65536u) != 0u);
+
+                if (isLeaf) {
+                    UInt clampedLeafCnt = Min(childCount, 16u);
+                    UInt passMask       = 0u;
+                    UInt passCount      = 0u;
+
+                    for (UInt c = 0u; c < clampedLeafCnt; c = c + 1u) {
+                        UInt cid = childStart + c;
+                        if (cid >= NVGShadowCullParams.Config.clusterMetaCount) {
+                            continue;
+                        }
+                        UInt selfGrp = NVGShadowCullParams.InClusterMeta[cid].selfGroupIndex;
+                        if (selfGrp >= NVGShadowCullParams.Config.clusterGroupCount ||
+                            NVGShadowCullParams.InGroupActiveMask[selfGrp].active == 0u) {
+                            continue;
+                        }
+                        if (!lockLod0) {
+                            UInt  cFlags = NVGShadowCullParams.InClusterMeta[cid].clusterFlags;
+                            Float pThin  = ((cFlags & 2u) != 0u)
+                                ? (Float((cFlags >> 16u) & 16383u) * (4.0 / 16383.0))
+                                : 0.0;
+                            Float pTexel = ComputeShadowPageTexelWorldAtSphere(
+                                baseTexelWorld,
+                                NVGShadowCullParams.InClusterMeta[cid].parentGroupSphere,
+                                worldMat, maxScale, vp0, vp1, vp2, vp3);
+                            Float pErr   = ComputeShadowErrorTexels(
+                                NVGShadowCullParams.InClusterMeta[cid].parentGroupError,
+                                maxScale, pTexel, pThin);
+                            if (pErr <= threshold) {
+                                continue;
+                            }
+                        }
+
+                        // Pre-filter refined ancestors whose children are already active in the cut
+                        UInt childGrpCnt = NVGShadowCullParams.InClusterMeta[cid].refinedByChildGroupCount;
+                        if (childGrpCnt > 0u) {
+                            UInt  countsLod  = NVGShadowCullParams.InClusterMeta[cid].countsAndLod;
+                            UInt  cLod       = (countsLod >> 16u) & 255u;
+                            UInt  cFlagsSelf = NVGShadowCullParams.InClusterMeta[cid].clusterFlags;
+                            Float sThin      = ((cFlagsSelf & 2u) != 0u)
+                                ? (Float((cFlagsSelf >> 2u) & 16383u) * (4.0 / 16383.0))
+                                : 0.0;
+                            Float sTexel     = ComputeShadowPageTexelWorldAtSphere(
+                                baseTexelWorld,
+                                NVGShadowCullParams.InClusterMeta[cid].selfGroupSphere,
+                                worldMat, maxScale, vp0, vp1, vp2, vp3);
+                            Float sErr       = ComputeShadowErrorTexels(
+                                NVGShadowCullParams.InClusterMeta[cid].selfGroupError,
+                                maxScale, sTexel, sThin);
+                            Bool wantsRef = lockLod0 ? (cLod > 0u) : (sErr > threshold);
+                            if (wantsRef) {
+                                UInt childGrpId = NVGShadowCullParams.InClusterMeta[cid].refinedByChildGroupStart;
+                                Bool chActive   = (childGrpId < NVGShadowCullParams.Config.clusterGroupCount);
+                                UInt clChCnt    = Min(childGrpCnt, 16u);
+                                for (UInt cg = 0u; cg < clChCnt; cg = cg + 1u) {
+                                    UInt curCg = childGrpId + cg;
+                                    if (curCg >= NVGShadowCullParams.Config.clusterGroupCount ||
+                                        NVGShadowCullParams.InGroupActiveMask[curCg].active == 0u) {
+                                        chActive = false;
+                                        break;
+                                    }
+                                }
+                                if (chActive) {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Pre-filter cluster world AABB against shadow page clip volume before candidate enqueue
+                        Vec3 clMin = Vec3(0.0, 0.0, 0.0);
+                        Vec3 clMax = Vec3(0.0, 0.0, 0.0);
+                        TransformLocalAABBToWorld(
+                            worldMat,
+                            NVGShadowCullParams.InClusterMeta[cid].aabbMin,
+                            NVGShadowCullParams.InClusterMeta[cid].aabbMax,
+                            disp, clMin, clMax);
+                        if (!DoesWorldAABBOverlapShadowPageClip(clMin, clMax, vp0, vp1, vp2, vp3)) {
+                            continue;
+                        }
+                        passMask  = passMask | (1u << c);
+                        passCount = passCount + 1u;
+                    }
+
+                    if (passCount > 0u) {
+                        UInt baseDst = 0u;
+                        InterlockedAdd(NVGShadowCullParams.OutQueueCounters[12u].count, passCount, baseDst);
+                        InterlockedMax(NVGShadowCullParams.OutTelemetry[39u].word, baseDst + passCount, prev);
+                        if (baseDst + passCount > NVGShadowCullParams.Config.maxCandidateCapacity) {
+                            MarkShadowPageOverflow(shViewIdx);
+                        }
+                        UInt localOut = 0u;
+                        for (UInt c = 0u; c < clampedLeafCnt; c = c + 1u) {
+                            if ((passMask & (1u << c)) != 0u) {
+                                UInt wIdx = baseDst + localOut;
+                                localOut  = localOut + 1u;
+                                if (wIdx < NVGShadowCullParams.Config.maxCandidateCapacity) {
+                                    NVGShadowCullParams.OutCandidateClusters[wIdx].objectSlotIndex = objSlot;
+                                    NVGShadowCullParams.OutCandidateClusters[wIdx].nodeOrClusterId = childStart + c;
+                                    NVGShadowCullParams.OutCandidateClusters[wIdx].drawBucketHint  = shBucket;
+                                    NVGShadowCullParams.OutCandidateClusters[wIdx].auxData         = shViewIdx;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Pre-cull 8-ary child BVH nodes against shadow page clip volume & subtree LOD BEFORE enqueueing
+                    // (reduces peak OutNodeQueue occupancy by 5x-8x on Billion-Polygon scenes!)
+                    UInt clampedChildCnt = Min(childCount, 16u);
+                    UInt childMask       = 0u;
+                    UInt childPassCnt    = 0u;
+                    for (UInt c = 0u; c < clampedChildCnt; c = c + 1u) {
+                        UInt childNodeId = childStart + c;
+                        if (childNodeId >= NVGShadowCullParams.Config.bvhNodeCount) {
+                            continue;
+                        }
+                        Vec3 cwMin = Vec3(0.0, 0.0, 0.0);
+                        Vec3 cwMax = Vec3(0.0, 0.0, 0.0);
+                        TransformLocalAABBToWorld(
+                            worldMat,
+                            NVGShadowCullParams.InBVHNodes[childNodeId].boundsMin,
+                            NVGShadowCullParams.InBVHNodes[childNodeId].boundsMax,
+                            disp, cwMin, cwMax);
+                        if (!DoesWorldAABBOverlapShadowPageClip(cwMin, cwMax, vp0, vp1, vp2, vp3)) {
+                            continue;
+                        }
+                        UInt chRes = NVGShadowCullParams.InBVHNodes[childNodeId].reserved;
+                        if (!lockLod0 && (chRes & 2147483648u) != 0u) {
+                            Float chThin  = Float(chRes & 16383u) * (4.0 / 16383.0);
+                            Float chTexel = ComputeShadowPageTexelWorldAtSphere(
+                                baseTexelWorld,
+                                NVGShadowCullParams.InBVHNodes[childNodeId].lodSphere,
+                                worldMat, maxScale, vp0, vp1, vp2, vp3);
+                            Float chErr   = ComputeShadowErrorTexels(
+                                NVGShadowCullParams.InBVHNodes[childNodeId].maxParentError,
+                                maxScale, chTexel, chThin);
+                            if (chErr <= threshold) {
+                                continue;
+                            }
+                        }
+                        childMask    = childMask | (1u << c);
+                        childPassCnt = childPassCnt + 1u;
+                    }
+
+                    if (childPassCnt > 0u) {
+                        UInt dstCntIdx = NVGShadowCullParams.Config.dstNodeCounterIndex;
+                        UInt baseDst   = 0u;
+                        InterlockedAdd(NVGShadowCullParams.OutQueueCounters[dstCntIdx].count, childPassCnt, baseDst);
+                        InterlockedMax(NVGShadowCullParams.OutTelemetry[39u].word, baseDst + childPassCnt, prev);
+                        if (baseDst + childPassCnt > NVGShadowCullParams.Config.maxNodeQueueCapacity) {
+                            MarkShadowPageOverflow(shViewIdx);
+                        }
+                        UInt localOut = 0u;
+                        for (UInt c = 0u; c < clampedChildCnt; c = c + 1u) {
+                            if ((childMask & (1u << c)) != 0u) {
+                                UInt wIdx = baseDst + localOut;
+                                localOut  = localOut + 1u;
+                                if (wIdx < NVGShadowCullParams.Config.maxNodeQueueCapacity) {
+                                    NVGShadowCullParams.OutNodeQueue[wIdx].objectSlotIndex = objSlot;
+                                    NVGShadowCullParams.OutNodeQueue[wIdx].nodeOrClusterId = childStart + c;
+                                    NVGShadowCullParams.OutNodeQueue[wIdx].drawBucketHint  = shBucket;
+                                    NVGShadowCullParams.OutNodeQueue[wIdx].auxData         = shViewIdx;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 3: Independent Shadow-Texel LOD Cut & Thin-Feature Preservation
+        // =================================================================
+        if (mode == 3u) {
+            UInt candCount = Min(NVGShadowCullParams.OutQueueCounters[12u].count,
+                                 NVGShadowCullParams.Config.maxCandidateCapacity);
+            for (UInt curTid = dtid.x; curTid < candCount; curTid = curTid + 4194240u) {
+                UInt objSlot   = NVGShadowCullParams.OutCandidateClusters[curTid].objectSlotIndex;
+                UInt clusterId = NVGShadowCullParams.OutCandidateClusters[curTid].nodeOrClusterId;
+                UInt shBucket  = NVGShadowCullParams.OutCandidateClusters[curTid].drawBucketHint;
+                UInt shViewIdx = NVGShadowCullParams.OutCandidateClusters[curTid].auxData;
+
+                if (clusterId >= NVGShadowCullParams.Config.clusterMetaCount ||
+                    shViewIdx >= NVGShadowCullParams.OutQueueCounters[9u].count) {
+                    continue;
+                }
+
+                UInt selfGroup = NVGShadowCullParams.InClusterMeta[clusterId].selfGroupIndex;
+                if (selfGroup >= NVGShadowCullParams.Config.clusterGroupCount ||
+                    NVGShadowCullParams.InGroupActiveMask[selfGroup].active == 0u) {
+                    continue;
+                }
+
+                InterlockedAdd(NVGShadowCullParams.OutTelemetry[17u].word, 1u, prev); // shadowClustersTested
+
+                Mat4 worldMat = NVGShadowCullParams.InGPUSceneObjects[objSlot].worldMatrix;
+                UInt objFlags = NVGShadowCullParams.InGPUSceneObjects[objSlot].objectFlags;
+                UInt batchGrp = NVGShadowCullParams.InGPUSceneObjects[objSlot].batchGroupId;
+                UInt matId    = NVGShadowCullParams.InGPUSceneObjects[objSlot].materialId;
+
+                Float disp          = 0.0;
+                Float shLodErrScale = 1.0;
+                UInt  matFlags      = 0u;
+                if (matId < NVGShadowCullParams.Config.materialTableCount) {
+                    disp          = Max(NVGShadowCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                    shLodErrScale = Max(NVGShadowCullParams.InMaterialTable[matId].shadowLodErrorScale, 0.001);
+                    matFlags      = NVGShadowCullParams.InMaterialTable[matId].nvgFlags;
+                }
+
+                Vec4  vp0        = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol0;
+                Vec4  vp1        = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol1;
+                Vec4  vp2        = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol2;
+                Vec4  vp3        = NVGShadowCullParams.OutShadowPageViews[shViewIdx].vpCol3;
+                Float texelWorld = NVGShadowCullParams.OutShadowPageViews[shViewIdx].texelWorldSize;
+                UInt  cFlags     = NVGShadowCullParams.InClusterMeta[clusterId].clusterFlags;
+                Float selfThin   = 0.0;
+                Float parentThin = 0.0;
+                if ((cFlags & 2u) != 0u) {
+                    selfThin   = Float((cFlags >> 2u) & 16383u) * (4.0 / 16383.0);
+                    parentThin = Float((cFlags >> 16u) & 16383u) * (4.0 / 16383.0);
+                }
+                Float maxScale = GetWorldMaxAxisScale(worldMat);
+
+                Float selfTexelWorld = ComputeShadowPageTexelWorldAtSphere(
+                    texelWorld,
+                    NVGShadowCullParams.InClusterMeta[clusterId].selfGroupSphere,
+                    worldMat, maxScale, vp0, vp1, vp2, vp3);
+                Float parentTexelWorld = ComputeShadowPageTexelWorldAtSphere(
+                    texelWorld,
+                    NVGShadowCullParams.InClusterMeta[clusterId].parentGroupSphere,
+                    worldMat, maxScale, vp0, vp1, vp2, vp3);
+
+                Float selfErrTexels   = ComputeShadowErrorTexels(NVGShadowCullParams.InClusterMeta[clusterId].selfGroupError, maxScale, selfTexelWorld, selfThin);
+                Float parentErrTexels = ComputeShadowErrorTexels(NVGShadowCullParams.InClusterMeta[clusterId].parentGroupError, maxScale, parentTexelWorld, parentThin);
+                Float threshold       = Max(NVGShadowCullParams.Config.shadowMaxTexelError * shLodErrScale, 0.001);
+
+                UInt countsLod   = NVGShadowCullParams.InClusterMeta[clusterId].countsAndLod;
+                UInt lodLevel    = (countsLod >> 16u) & 255u;
+                UInt selfVP      = NVGShadowCullParams.InClusterMeta[clusterId].virtualPageId;
+                UInt wordOff     = NVGShadowCullParams.InClusterMeta[clusterId].clusterWordOffsetInPage;
+                UInt childGrpId  = NVGShadowCullParams.InClusterMeta[clusterId].refinedByChildGroupStart;
+                UInt childGrpCnt = NVGShadowCullParams.InClusterMeta[clusterId].refinedByChildGroupCount;
+
+                Bool lockLod0 = ((matFlags & 64u) != 0u);
+                if (!lockLod0 && parentErrTexels <= threshold) {
+                    continue;
+                }
+
+                Bool wantsRefine = (childGrpCnt > 0u) && (lockLod0 ? (lodLevel > 0u) : (selfErrTexels > threshold));
+                UInt visFlags    = 4u; // NVG_VIS_FLAG_SHADOW_CASTER
+                if ((objFlags & 1024u) != 0u) { visFlags = visFlags | 16u; }
+
+                if (wantsRefine) {
+                    Bool childActive = (childGrpCnt > 0u) && (childGrpId < NVGShadowCullParams.Config.clusterGroupCount);
+                    UInt clampedChildGrps = Min(childGrpCnt, 16u);
+                    for (UInt cg = 0u; cg < clampedChildGrps; cg = cg + 1u) {
+                        UInt curCg = childGrpId + cg;
+                        if (curCg >= NVGShadowCullParams.Config.clusterGroupCount ||
+                            NVGShadowCullParams.InGroupActiveMask[curCg].active == 0u) {
+                            childActive = false;
+                            break;
+                        }
+                    }
+                    if (childActive) {
+                        continue;
+                    }
+                    // Symmetric shadow residency priority [1 .. 262143]: strictly below camera priority (>= 262144)
+                    // so visible camera geometry never starves under constrained VRAM, while matching keepPrio 1:1!
+                    UInt childLod = (lodLevel > 0u) ? (lodLevel - 1u) : 0u;
+                    UInt prio = Clamp(UInt(Min(selfErrTexels, 7500.0) * 32.0) + (Min(childLod, 31u) * 512u), 1u, 262143u);
+                    for (UInt cg = 0u; cg < clampedChildGrps; cg = cg + 1u) {
+                        UInt curCg = childGrpId + cg;
+                        if (curCg < NVGShadowCullParams.Config.clusterGroupCount) {
+                            UInt reqVP      = NVGShadowCullParams.InClusterGroups[curCg].firstVirtualPageId;
+                            UInt cgLodMeta  = NVGShadowCullParams.InClusterGroups[curCg].lodLevel;
+                            UInt reqPageCnt = Min(Max((cgLodMeta >> 16u) & 65535u, 1u), 64u);
+                            for (UInt rp = 0u; rp < reqPageCnt; rp = rp + 1u) {
+                                UInt targetVP = reqVP + rp;
+                                if (reqVP != invalidIdx && targetVP < NVGShadowCullParams.Config.virtualPageCount) {
+                                    UInt vpFl = NVGShadowCullParams.InVirtualPageTable[targetVP].stateAndFlags;
+                                    if ((vpFl & 1u) == 0u) {
+                                        if (NVGShadowCullParams.OutPageRequests[targetVP].priority < prio) {
+                                            InterlockedMax(NVGShadowCullParams.OutPageRequests[targetVP].priority, prio, prev);
+                                        }
+                                        InterlockedAdd(NVGShadowCullParams.OutTelemetry[12u].word, 1u, prev);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    visFlags = visFlags | 1u; // NVG_VIS_FLAG_RESIDENCY_FALLBACK
+                }
+
+                if (selfVP >= NVGShadowCullParams.Config.virtualPageCount) {
+                    continue;
+                }
+                UInt physPageIdx = NVGShadowCullParams.InVirtualPageTable[selfVP].physicalPageIndex;
+                if (physPageIdx == invalidIdx) {
+                    continue;
+                }
+
+                Vec3 wMin = Vec3(0.0, 0.0, 0.0);
+                Vec3 wMax = Vec3(0.0, 0.0, 0.0);
+                TransformLocalAABBToWorld(
+                    worldMat,
+                    NVGShadowCullParams.InClusterMeta[clusterId].aabbMin,
+                    NVGShadowCullParams.InClusterMeta[clusterId].aabbMax,
+                    disp, wMin, wMax);
+
+                if (!DoesWorldAABBOverlapShadowPageClip(wMin, wMax, vp0, vp1, vp2, vp3)) {
+                    continue;
+                }
+
+                UInt keepPrio = Clamp(UInt(Min(parentErrTexels, 7500.0) * 32.0) + (Min(lodLevel, 31u) * 512u), 1u, 262143u);
+                if (NVGShadowCullParams.OutPageRequests[selfVP].priority < keepPrio) {
+                    InterlockedMax(NVGShadowCullParams.OutPageRequests[selfVP].priority, keepPrio, prev);
+                }
+
+                UInt dst = 0u;
+                InterlockedAdd(NVGShadowCullParams.OutQueueCounters[13u].count, 1u, dst);
+                InterlockedMax(NVGShadowCullParams.OutTelemetry[39u].word, dst + 1u, prev);
+                if (dst >= NVGShadowCullParams.Config.maxVisibleCapacity) {
+                    MarkShadowPageOverflow(shViewIdx);
+                    continue;
+                }
+
+                UInt boneOff = 0u;
+                UInt boneCnt = 0u;
+                if ((objFlags & 1024u) != 0u) {
+                    boneOff = batchGrp;
+                    boneCnt = (NVGShadowCullParams.InGPUSceneObjects[objSlot].renderObjectFlags >> 16u) & 65535u;
+                }
+
+                NVGShadowCullParams.OutVisibleClusters[dst].objectSlotIndex   = objSlot;
+                NVGShadowCullParams.OutVisibleClusters[dst].clusterId         = clusterId;
+                NVGShadowCullParams.OutVisibleClusters[dst].physicalPageIndex = physPageIdx;
+                NVGShadowCullParams.OutVisibleClusters[dst].clusterWordOffset = wordOff;
+                NVGShadowCullParams.OutVisibleClusters[dst].virtualPageId     = selfVP;
+                NVGShadowCullParams.OutVisibleClusters[dst].lodAndFlags       = (lodLevel & 255u) | ((visFlags & 255u) << 8u) | ((shViewIdx & 65535u) << 16u);
+                NVGShadowCullParams.OutVisibleClusters[dst].geometricError    = selfErrTexels;
+                NVGShadowCullParams.OutVisibleClusters[dst].materialId        = matId;
+                NVGShadowCullParams.OutVisibleClusters[dst].bonePaletteOffset = boneOff;
+                NVGShadowCullParams.OutVisibleClusters[dst].boneCount         = boneCnt;
+                NVGShadowCullParams.OutVisibleClusters[dst].drawBucketIndex   = shBucket;
+                NVGShadowCullParams.OutVisibleClusters[dst].viewDepthKey      = Float(shViewIdx);
+
+                InterlockedAdd(NVGShadowCullParams.OutBucketCounts[shBucket].count, 1u, prev);
+                InterlockedAdd(NVGShadowCullParams.OutTelemetry[18u].word, 1u, prev); // shadowClustersVisible
+                UInt histBin = Min(lodLevel, 7u);
+                InterlockedAdd(NVGShadowCullParams.OutTelemetry[28u + histBin].word, 1u, prev); // shadowLODHistogram
+                InterlockedAdd(NVGShadowCullParams.OutTelemetry[37u].word, lodLevel, prev);     // shadowLODSum
+            }
+        }
+    }
+}

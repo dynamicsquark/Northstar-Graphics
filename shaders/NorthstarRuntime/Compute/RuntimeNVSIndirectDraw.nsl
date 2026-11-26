@@ -1,0 +1,1469 @@
+// =====================================================================
+//  RuntimeNVSIndirectDraw.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Shadows (NVS)
+//  GPU-Driven Indirect Draw Command Generation, Reflected Per-Draw CBV &
+//  Per-Batch Instance SRV Population, PSO Group Routing & Page Commit
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVSIndirectDrawParams {
+    Buffer Config {
+        Add(dispatchMode)             : UInt = 0
+        Add(currentFrame)             : UInt = 1
+        Add(maxActivePages)           : UInt = 2048
+        Add(maxWorklistEntries)       : UInt = 65536
+        Add(maxSceneSlots)            : UInt = 65536
+        Add(maxMeshDescriptors)       : UInt = 4096
+        Add(maxMaterialDescriptors)   : UInt = 1024
+        Add(maxRenderDataSlots)       : UInt = 2048
+        Add(maxCommandsPerBucket)     : UInt = 8192
+        Add(maxDrawContexts)          : UInt = 65536
+        Add(physicalPoolCapacity)     : UInt = 2048
+        Add(enableHardwareInstancing) : UInt = 1
+        Add(useGPUActivePageCount)    : UInt = 1
+        Add(explicitActivePageCount)  : UInt = 0
+        Add(maxShadowBuckets)         : UInt = 8
+        Add(drawGroupBindingCount)    : UInt = 0
+        Add(cbvPoolBaseLo)            : UInt = 0
+        Add(cbvPoolBaseHi)            : UInt = 0
+        Add(instancePoolBaseLo)       : UInt = 0
+        Add(instancePoolBaseHi)       : UInt = 0
+        Add(bonePaletteBaseLo)        : UInt  = 0
+        Add(bonePaletteBaseHi)        : UInt  = 0
+        Add(maxPerDrawCBVWords)       : UInt  = 0
+        Add(maxPerBatchInstanceWords) : UInt  = 0
+        Add(applyShaderBias)          : UInt  = 0
+        Add(depthBiasScale)           : Float = 1.0
+        Add(normalBiasScale)          : Float = 1.0
+        Add(passTimeSeconds)          : Float = 0.0
+    }
+    StructuredBuffer InProjectionCounter {
+        Add(count) : UInt
+    }
+    StructuredBuffer InCasterPageRanges {
+        Add(virtualPageFlatIndex)   : UInt
+        Add(physicalPageIndex)      : UInt
+        Add(virtualAddressPacked)   : UInt
+        Add(lightId)                : UInt
+        Add(clipmapLevel)           : UInt
+        Add(firstCasterOffset)      : UInt
+        Add(casterCount)            : UInt
+        Add(rawCandidateCount)      : UInt
+        Add(pageFlags)              : UInt
+        Add(broadPhasePassedCount)  : UInt
+        Add(narrowPhasePassedCount) : UInt
+        Add(physicalGeneration)     : UInt
+    }
+    StructuredBuffer InCasterWorklist {
+        Add(gpuSceneSlotIndex)      : UInt
+        Add(renderObjectHandle)     : UInt
+        Add(virtualPageFlatIndex)   : UInt
+        Add(physicalPageIndex)      : UInt
+        Add(virtualAddressPacked)   : UInt
+        Add(lightIdAndClipmapLevel) : UInt
+        Add(meshId)                 : UInt
+        Add(submeshIndex)           : UInt
+        Add(materialId)             : UInt
+        Add(pipelineVariantFlags)   : UInt
+        Add(selectedLODIndex)       : UInt
+        Add(instanceGroupId)        : UInt
+        Add(batchGroupId)           : UInt
+        Add(startIndex)             : UInt
+        Add(indexCount)             : UInt
+        Add(casterDepthSortKey)     : Float
+    }
+    StructuredBuffer InPageRenderData {
+        Add(physicalPageIndex)    : UInt
+        Add(virtualFlatIndex)     : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(renderFlags)          : UInt
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(virtualPageX)         : UInt
+        Add(virtualPageY)         : UInt
+        Add(worldPageX)           : Int
+        Add(worldPageY)           : Int
+        Add(physicalGeneration)   : UInt
+        Add(lastUsedFrame)        : UInt
+        Add(lightMinX)            : Float
+        Add(lightMinY)            : Float
+        Add(lightMaxX)            : Float
+        Add(lightMaxY)            : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(worldCenterX)         : Float
+        Add(worldCenterY)         : Float
+        Add(worldCenterZ)         : Float
+        Add(pageWorldSize)        : Float
+        Add(worldBoundsMinX)      : Float
+        Add(worldBoundsMinY)      : Float
+        Add(worldBoundsMinZ)      : Float
+        Add(texelWorldSize)       : Float
+        Add(worldBoundsMaxX)      : Float
+        Add(worldBoundsMaxY)      : Float
+        Add(worldBoundsMaxZ)      : Float
+        Add(shadowVolumeRadius)   : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(viewportWidth)        : UInt
+        Add(viewportHeight)       : UInt
+        Add(worldToPageClipCol0)  : Vec4
+        Add(worldToPageClipCol1)  : Vec4
+        Add(worldToPageClipCol2)  : Vec4
+        Add(worldToPageClipCol3)  : Vec4
+        Add(lightViewCol0)        : Vec4
+        Add(lightViewCol1)        : Vec4
+        Add(lightViewCol2)        : Vec4
+        Add(lightViewCol3)        : Vec4
+        Add(pageProjCol0)         : Vec4
+        Add(pageProjCol1)         : Vec4
+        Add(pageProjCol2)         : Vec4
+        Add(pageProjCol3)         : Vec4
+    }
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : Int
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldCol0)           : Vec4
+        Add(worldCol1)           : Vec4
+        Add(worldCol2)           : Vec4
+        Add(worldCol3)           : Vec4
+    }
+    StructuredBuffer InMeshDescriptors {
+        Add(meshId)              : UInt
+        Add(submeshAndLodPacked) : UInt
+        Add(descriptorFlags)     : UInt
+        Add(meshGeneration)      : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : Int
+        Add(vertexCount)         : UInt
+        Add(vbAddressLo)         : UInt
+        Add(vbAddressHi)         : UInt
+        Add(vbSizeInBytes)       : UInt
+        Add(vbStrideInBytes)     : UInt
+        Add(ibAddressLo)         : UInt
+        Add(ibAddressHi)         : UInt
+        Add(ibSizeInBytes)       : UInt
+        Add(ibFormat)            : UInt
+    }
+    StructuredBuffer InMaterialDescriptors {
+        Add(materialId)           : UInt
+        Add(materialFlags)        : UInt
+        Add(materialGeneration)   : UInt
+        Add(shaderSetId)          : UInt
+        Add(defaultBucketIndex)   : UInt
+        Add(instancedBucketIndex) : UInt
+        Add(skinnedBucketIndex)   : UInt
+        Add(customBucketIndex)    : UInt
+        Add(alphaCutoff)          : Float
+        Add(deformAmplitude)      : Float
+        Add(deformFrequency)      : Float
+        Add(normalBiasScale)      : Float
+        Add(uvScaleX)             : Float
+        Add(uvScaleY)             : Float
+        Add(uvOffsetX)            : Float
+        Add(uvOffsetY)            : Float
+    }
+    StructuredBuffer InDrawGroupBindings {
+        Add(bindingFlags)               : UInt
+        Add(patchFirstIndex)            : UInt
+        Add(patchCount)                 : UInt
+        Add(instanceStrideBytes)        : UInt
+        Add(cbv0ByteSize)               : UInt
+        Add(cbv1ByteSize)               : UInt
+        Add(cbv2ByteSize)               : UInt
+        Add(instanceTemplateWordOffset) : UInt
+        Add(cbv0TemplateWordOffset)     : UInt
+        Add(cbv1TemplateWordOffset)     : UInt
+        Add(cbv2TemplateWordOffset)     : UInt
+        Add(shaderSetId)                : UInt
+        Add(activeStageMask)            : UInt
+        Add(cbvCount)                   : UInt
+        Add(srvMode)                    : UInt
+        Add(drawGroupIndex)             : UInt
+    }
+    StructuredBuffer InDrawGroupFieldPatches {
+        Add(semanticId) : UInt
+        Add(targetSlot) : UInt
+        Add(byteOffset) : UInt
+        Add(byteSize)   : UInt
+    }
+    StructuredBuffer InTemplateWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutShadowDrawContexts {
+        Add(gpuSceneSlotIndex)        : UInt
+        Add(expectedObjectGeneration) : UInt
+        Add(physicalPageIndex)        : UInt
+        Add(renderDataIndex)          : UInt
+        Add(virtualPageFlatIndex)     : UInt
+        Add(lightIdAndClipmapLevel)   : UInt
+        Add(meshDescriptorIndex)      : UInt
+        Add(materialId)               : UInt
+        Add(bucketIndex)              : UInt
+        Add(drawFlags)                : UInt
+        Add(bonePayloadIndex)         : UInt
+        Add(instanceOrdinalAndCount)  : UInt
+        Add(alphaCutoff)              : Float
+        Add(deformAmplitude)          : Float
+        Add(deformFrequency)          : Float
+        Add(uvScaleX)                 : Float
+    }
+    RWStructuredBuffer OutIndirectDrawCommands {
+        Add(vbAddressLo)           : UInt
+        Add(vbAddressHi)           : UInt
+        Add(vbSizeInBytes)         : UInt
+        Add(vbStrideInBytes)       : UInt
+        Add(ibAddressLo)           : UInt
+        Add(ibAddressHi)           : UInt
+        Add(ibSizeInBytes)         : UInt
+        Add(ibFormat)              : UInt
+        Add(cbv0AddressLo)         : UInt
+        Add(cbv0AddressHi)         : UInt
+        Add(cbv1AddressLo)         : UInt
+        Add(cbv1AddressHi)         : UInt
+        Add(cbv2AddressLo)         : UInt
+        Add(cbv2AddressHi)         : UInt
+        Add(srv0AddressLo)         : UInt
+        Add(srv0AddressHi)         : UInt
+        Add(indexCountPerInstance) : UInt
+        Add(instanceCount)         : UInt
+        Add(startIndexLocation)    : UInt
+        Add(baseVertexLocation)    : Int
+        Add(startInstanceLocation) : UInt
+        Add(drawContextIndex)      : UInt
+        Add(meshDescriptorIndex)   : UInt
+        Add(commandFlags)          : UInt
+    }
+    RWStructuredBuffer OutPerDrawCBVWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutPerBatchInstanceWords {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutAllocationCounters {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutBucketCommandCounts {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutPageCommitRecords {
+        Add(physicalPageIndex)          : UInt
+        Add(resultFlags)                : UInt
+        Add(expectedPhysicalGeneration) : UInt
+        Add(expectedVirtualFlatIndex)   : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(activePagesEvaluated)             : UInt
+        Add(candidateDrawsProcessed)          : UInt
+        Add(validIndirectCommandsEmitted)     : UInt
+        Add(totalInstancesEmitted)            : UInt
+        Add(rejectedStaleObjectHandle)        : UInt
+        Add(rejectedInvalidMeshDescriptor)    : UInt
+        Add(rejectedInvalidMaterialOrVariant) : UInt
+        Add(rejectedInvalidPageOrSlice)       : UInt
+        Add(overflowDroppedCommands)          : UInt
+        Add(instancedBatchMergedDraws)        : UInt
+        Add(committablePagesCount)            : UInt
+        Add(nonCommittablePagesCount)         : UInt
+        Add(bucketCount0)                     : UInt
+        Add(bucketCount1)                     : UInt
+        Add(bucketCount2)                     : UInt
+        Add(bucketCount3)                     : UInt
+        Add(bucketCount4)                     : UInt
+        Add(bucketCount5)                     : UInt
+        Add(bucketCount6)                     : UInt
+        Add(bucketCount7)                     : UInt
+    }
+}
+
+SHADER {
+    void AddGpuAddressWords(UInt baseLo, UInt baseHi, UInt wordOffset, out UInt outLo, out UInt outHi) {
+        UInt addLo = wordOffset << 2u;
+        UInt addHi = wordOffset >> 30u;
+        UInt sumLo = baseLo + addLo;
+        UInt carry = (sumLo < baseLo) ? 1u : 0u;
+        outLo = sumLo;
+        outHi = baseHi + addHi + carry;
+    }
+
+    void AddGpuAddressMatrices64B(UInt baseLo, UInt baseHi, UInt matrixIndex, out UInt outLo, out UInt outHi) {
+        UInt addLo = matrixIndex << 6u;
+        UInt addHi = matrixIndex >> 26u;
+        UInt sumLo = baseLo + addLo;
+        UInt carry = (sumLo < baseLo) ? 1u : 0u;
+        outLo = sumLo;
+        outHi = baseHi + addHi + carry;
+    }
+
+    void MulMat4Cols(
+        Vec4 a0, Vec4 a1, Vec4 a2, Vec4 a3,
+        Vec4 b0, Vec4 b1, Vec4 b2, Vec4 b3,
+        out Vec4 out0, out Vec4 out1, out Vec4 out2, out Vec4 out3)
+    {
+        out0 = a0 * b0.x + a1 * b0.y + a2 * b0.z + a3 * b0.w;
+        out1 = a0 * b1.x + a1 * b1.y + a2 * b1.z + a3 * b1.w;
+        out2 = a0 * b2.x + a1 * b2.y + a2 * b2.z + a3 * b2.w;
+        out3 = a0 * b3.x + a1 * b3.y + a2 * b3.z + a3 * b3.w;
+    }
+
+    void InvertMat4Cols(
+        Vec4 c0, Vec4 c1, Vec4 c2, Vec4 c3,
+        out Vec4 out0, out Vec4 out1, out Vec4 out2, out Vec4 out3)
+    {
+        Float m00 = c0.x; Float m01 = c1.x; Float m02 = c2.x; Float m03 = c3.x;
+        Float m10 = c0.y; Float m11 = c1.y; Float m12 = c2.y; Float m13 = c3.y;
+        Float m20 = c0.z; Float m21 = c1.z; Float m22 = c2.z; Float m23 = c3.z;
+        Float m30 = c0.w; Float m31 = c1.w; Float m32 = c2.w; Float m33 = c3.w;
+
+        Float s0 = m00 * m11 - m10 * m01;
+        Float s1 = m00 * m12 - m10 * m02;
+        Float s2 = m00 * m13 - m10 * m03;
+        Float s3 = m01 * m12 - m11 * m02;
+        Float s4 = m01 * m13 - m11 * m03;
+        Float s5 = m02 * m13 - m12 * m03;
+
+        Float k5 = m22 * m33 - m32 * m23;
+        Float k4 = m21 * m33 - m31 * m23;
+        Float k3 = m21 * m32 - m31 * m22;
+        Float k2 = m20 * m33 - m30 * m23;
+        Float k1 = m20 * m32 - m30 * m22;
+        Float k0 = m20 * m31 - m30 * m21;
+
+        Float det = s0 * k5 - s1 * k4 + s2 * k3 + s3 * k2 - s4 * k1 + s5 * k0;
+        if (abs(det) <= 0.00000000000000000001) {
+            out0 = Vec4(1.0, 0.0, 0.0, 0.0);
+            out1 = Vec4(0.0, 1.0, 0.0, 0.0);
+            out2 = Vec4(0.0, 0.0, 1.0, 0.0);
+            out3 = Vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+
+        Float invDet = 1.0 / det;
+
+        Float i00 = ( m11 * k5 - m12 * k4 + m13 * k3) * invDet;
+        Float i01 = (-m01 * k5 + m02 * k4 - m03 * k3) * invDet;
+        Float i02 = ( m31 * s5 - m32 * s4 + m33 * s3) * invDet;
+        Float i03 = (-m21 * s5 + m22 * s4 - m23 * s3) * invDet;
+
+        Float i10 = (-m10 * k5 + m12 * k2 - m13 * k1) * invDet;
+        Float i11 = ( m00 * k5 - m02 * k2 + m03 * k1) * invDet;
+        Float i12 = (-m30 * s5 + m32 * s2 - m33 * s1) * invDet;
+        Float i13 = ( m20 * s5 - m22 * s2 + m23 * s1) * invDet;
+
+        Float i20 = ( m10 * k4 - m11 * k2 + m13 * k0) * invDet;
+        Float i21 = (-m00 * k4 + m01 * k2 - m03 * k0) * invDet;
+        Float i22 = ( m30 * s4 - m31 * s2 + m33 * s0) * invDet;
+        Float i23 = (-m20 * s4 + m21 * s2 - m23 * s0) * invDet;
+
+        Float i30 = (-m10 * k3 + m11 * k1 - m12 * k0) * invDet;
+        Float i31 = ( m00 * k3 - m01 * k1 + m02 * k0) * invDet;
+        Float i32 = (-m30 * s3 + m31 * s1 - m32 * s0) * invDet;
+        Float i33 = ( m20 * s3 - m21 * s1 + m22 * s0) * invDet;
+
+        out0 = Vec4(i00, i10, i20, i30);
+        out1 = Vec4(i01, i11, i21, i31);
+        out2 = Vec4(i02, i12, i22, i32);
+        out3 = Vec4(i03, i13, i23, i33);
+    }
+
+    void ComputeNormalMatrixCols(
+        Vec4 w0, Vec4 w1, Vec4 w2,
+        out Vec4 n0, out Vec4 n1, out Vec4 n2)
+    {
+        Vec3 c0   = w0.xyz;
+        Vec3 c1   = w1.xyz;
+        Vec3 c2   = w2.xyz;
+        Vec3 r0   = Cross(c1, c2);
+        Float det = Dot(c0, r0);
+        if (abs(det) <= 0.000000000001) {
+            n0 = Vec4(c0, 0.0);
+            n1 = Vec4(c1, 0.0);
+            n2 = Vec4(c2, 0.0);
+            return;
+        }
+        Float invDet = 1.0 / det;
+        n0 = Vec4(r0 * invDet, 0.0);
+        n1 = Vec4(Cross(c2, c0) * invDet, 0.0);
+        n2 = Vec4(Cross(c0, c1) * invDet, 0.0);
+    }
+
+    void WriteCBVVec4(UInt baseWord, UInt relWord, UInt maxWords, UInt reqWords, Vec4 v) {
+        if (reqWords >= 1u && (relWord + 0u) < maxWords) { NVSIndirectDrawParams.OutPerDrawCBVWords[baseWord + relWord + 0u].word = asuint(v.x); }
+        if (reqWords >= 2u && (relWord + 1u) < maxWords) { NVSIndirectDrawParams.OutPerDrawCBVWords[baseWord + relWord + 1u].word = asuint(v.y); }
+        if (reqWords >= 3u && (relWord + 2u) < maxWords) { NVSIndirectDrawParams.OutPerDrawCBVWords[baseWord + relWord + 2u].word = asuint(v.z); }
+        if (reqWords >= 4u && (relWord + 3u) < maxWords) { NVSIndirectDrawParams.OutPerDrawCBVWords[baseWord + relWord + 3u].word = asuint(v.w); }
+    }
+
+    void WriteCBVMat4(UInt baseWord, UInt relWord, UInt maxWords, UInt reqWords, Vec4 c0, Vec4 c1, Vec4 c2, Vec4 c3) {
+        UInt rem0 = reqWords;
+        WriteCBVVec4(baseWord, relWord + 0u,  maxWords, rem0, c0);
+        if (reqWords > 4u)  { WriteCBVVec4(baseWord, relWord + 4u,  maxWords, reqWords - 4u,  c1); }
+        if (reqWords > 8u)  { WriteCBVVec4(baseWord, relWord + 8u,  maxWords, reqWords - 8u,  c2); }
+        if (reqWords > 12u) { WriteCBVVec4(baseWord, relWord + 12u, maxWords, reqWords - 12u, c3); }
+    }
+
+    void WriteInstanceVec4(UInt baseWord, UInt relWord, UInt maxWords, UInt reqWords, Vec4 v) {
+        if (reqWords >= 1u && (relWord + 0u) < maxWords) { NVSIndirectDrawParams.OutPerBatchInstanceWords[baseWord + relWord + 0u].word = asuint(v.x); }
+        if (reqWords >= 2u && (relWord + 1u) < maxWords) { NVSIndirectDrawParams.OutPerBatchInstanceWords[baseWord + relWord + 1u].word = asuint(v.y); }
+        if (reqWords >= 3u && (relWord + 2u) < maxWords) { NVSIndirectDrawParams.OutPerBatchInstanceWords[baseWord + relWord + 2u].word = asuint(v.z); }
+        if (reqWords >= 4u && (relWord + 3u) < maxWords) { NVSIndirectDrawParams.OutPerBatchInstanceWords[baseWord + relWord + 3u].word = asuint(v.w); }
+    }
+
+    void PatchInstanceElementFields(
+        UInt instElemWordBase,
+        UInt strideWords,
+        UInt patchFirst,
+        UInt patchEnd,
+        UInt instOrd,
+        UInt sSlot,
+        Bool isPretransformed)
+    {
+        UInt sObjFlags    = NVSIndirectDrawParams.InGPUSceneObjects[sSlot].objectFlags;
+        UInt sRenderFlags = NVSIndirectDrawParams.InGPUSceneObjects[sSlot].renderObjectFlags;
+        UInt sBatchGrp    = NVSIndirectDrawParams.InGPUSceneObjects[sSlot].batchGroupId;
+        UInt sBoneCnt     = (sRenderFlags >> 16u) & 65535u;
+        UInt sBoneOff     = ((sObjFlags & 1024u) != 0u) ? sBatchGrp : 0u;
+        UInt sCustom      = (sBoneCnt > 0u) ? ((sBoneOff & 65535u) | ((sBoneCnt & 65535u) << 16u)) : 0u;
+        Vec4 w0           = isPretransformed ? Vec4(1.0, 0.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol0;
+        Vec4 w1           = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol1;
+        Vec4 w2           = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol2;
+        Vec4 w3           = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol3;
+
+        for (UInt pIdx = patchFirst; pIdx < patchEnd; pIdx = pIdx + 1u) {
+            UInt tSlot = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].targetSlot;
+            if (tSlot != 3u) {
+                continue;
+            }
+            UInt semId    = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].semanticId;
+            UInt relWord  = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].byteOffset >> 2u;
+            UInt reqWords = (NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].byteSize + 3u) >> 2u;
+            if (relWord >= strideWords || reqWords == 0u) {
+                continue;
+            }
+
+            if (semId == 32u) {
+                WriteInstanceVec4(instElemWordBase, relWord + 0u,  strideWords, reqWords, w0);
+                if (reqWords > 4u)  { WriteInstanceVec4(instElemWordBase, relWord + 4u,  strideWords, reqWords - 4u,  w1); }
+                if (reqWords > 8u)  { WriteInstanceVec4(instElemWordBase, relWord + 8u,  strideWords, reqWords - 8u,  w2); }
+                if (reqWords > 12u) { WriteInstanceVec4(instElemWordBase, relWord + 12u, strideWords, reqWords - 12u, w3); }
+            } else if (semId == 33u) {
+                NVSIndirectDrawParams.OutPerBatchInstanceWords[instElemWordBase + relWord].word = instOrd;
+            } else if (semId == 34u) {
+                NVSIndirectDrawParams.OutPerBatchInstanceWords[instElemWordBase + relWord].word = sCustom;
+            } else if (semId == 35u) {
+                NVSIndirectDrawParams.OutPerBatchInstanceWords[instElemWordBase + relWord].word = sBoneOff;
+            } else if (semId == 36u) {
+                NVSIndirectDrawParams.OutPerBatchInstanceWords[instElemWordBase + relWord].word = sBoneCnt;
+            }
+        }
+    }
+
+    Bool ResolveMeshDescriptor(
+        UInt meshId,
+        UInt submeshIdx,
+        UInt lodIdx,
+        UInt maxMeshDescriptors,
+        out UInt outDescIdx)
+    {
+        outDescIdx = 0u;
+        if (meshId >= maxMeshDescriptors) {
+            return false;
+        }
+
+        UInt baseFlags = NVSIndirectDrawParams.InMeshDescriptors[meshId].descriptorFlags;
+        UInt baseGen   = NVSIndirectDrawParams.InMeshDescriptors[meshId].meshGeneration & 65535u;
+        UInt varOffset = (NVSIndirectDrawParams.InMeshDescriptors[meshId].meshGeneration >> 16u) & 65535u;
+
+        if ((baseFlags & 1u) == 0u || (baseFlags & 2u) != 0u || baseGen == 0u) {
+            return false;
+        }
+        if (NVSIndirectDrawParams.InMeshDescriptors[meshId].meshId != meshId) {
+            return false;
+        }
+
+        UInt reqPacked = (submeshIdx & 65535u) | ((lodIdx & 65535u) << 16u);
+        if (NVSIndirectDrawParams.InMeshDescriptors[meshId].submeshAndLodPacked == reqPacked) {
+            outDescIdx = meshId;
+        } else if (varOffset > 0u && varOffset < maxMeshDescriptors) {
+            Bool found = false;
+            for (UInt k = 0u; k < 16u; k = k + 1u) {
+                UInt probeIdx = varOffset + k;
+                if (probeIdx < maxMeshDescriptors) {
+                    UInt pFlags = NVSIndirectDrawParams.InMeshDescriptors[probeIdx].descriptorFlags;
+                    if (NVSIndirectDrawParams.InMeshDescriptors[probeIdx].meshId == meshId &&
+                        NVSIndirectDrawParams.InMeshDescriptors[probeIdx].submeshAndLodPacked == reqPacked) {
+                        if ((pFlags & 1u) == 0u || (pFlags & 2u) != 0u) {
+                            return false;
+                        }
+                        outDescIdx = probeIdx;
+                        found      = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        } else {
+            outDescIdx = meshId;
+        }
+
+        UInt dFlags  = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].descriptorFlags;
+        UInt idxCnt  = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].indexCount;
+        UInt vbSize  = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].vbSizeInBytes;
+        UInt vbStrd  = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].vbStrideInBytes;
+        UInt ibSize  = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].ibSizeInBytes;
+        UInt vbLo    = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].vbAddressLo;
+        UInt vbHi    = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].vbAddressHi;
+        UInt ibLo    = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].ibAddressLo;
+        UInt ibHi    = NVSIndirectDrawParams.InMeshDescriptors[outDescIdx].ibAddressHi;
+
+        if ((dFlags & 1u) == 0u || (dFlags & 2u) != 0u ||
+            idxCnt == 0u || vbSize == 0u || vbStrd == 0u || ibSize == 0u ||
+            (vbLo == 0u && vbHi == 0u) || (ibLo == 0u && ibHi == 0u)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    Bool ResolveMaterialAndBucket(
+        UInt candVariantFlags,
+        UInt objFlags,
+        UInt renderObjFlags,
+        UInt meshDescFlags,
+        UInt materialId,
+        UInt maxMaterialDescriptors,
+        UInt maxShadowBuckets,
+        out UInt outBucketIdx,
+        out UInt outDrawFlags)
+    {
+        outBucketIdx = 0u;
+        outDrawFlags = 0u;
+
+        if (materialId >= maxMaterialDescriptors) {
+            return false;
+        }
+
+        UInt matFlags = NVSIndirectDrawParams.InMaterialDescriptors[materialId].materialFlags;
+        UInt matGen   = NVSIndirectDrawParams.InMaterialDescriptors[materialId].materialGeneration;
+
+        // GPU_MAT_SHADOW_FLAG_VALID (1), MISSING_VARIANT (64), DESTROYED_DEPENDENCY (128), NO_SHADOW_PASS (4096)
+        if ((matFlags & 1u) == 0u || (matFlags & 64u) != 0u || (matFlags & 128u) != 0u || (matFlags & 4096u) != 0u || matGen == 0u) {
+            return false;
+        }
+
+        Bool isSkinned = ((candVariantFlags & 128u) != 0u) ||
+                         ((objFlags & 1024u) != 0u) ||
+                         ((renderObjFlags & 256u) != 0u) ||
+                         ((meshDescFlags & 32u) != 0u);
+        Bool isInstanced = ((candVariantFlags & 8u) != 0u) ||
+                           ((objFlags & 8192u) != 0u);
+        Bool isAlphaTest = ((candVariantFlags & 1u) != 0u) ||
+                           ((objFlags & 16384u) != 0u) ||
+                           ((matFlags & 2u) != 0u);
+        Bool isDoubleSided = ((candVariantFlags & 2u) != 0u) ||
+                             ((objFlags & 65536u) != 0u) ||
+                             ((matFlags & 4u) != 0u);
+        Bool isCustomShadow = ((candVariantFlags & 4u) != 0u) ||
+                              ((matFlags & 8u) != 0u);
+        Bool isCustomDeform = ((matFlags & 256u) != 0u);
+
+        if (isSkinned && (matFlags & 16u) == 0u) {
+            return false;
+        }
+        if (isInstanced && (matFlags & 32u) == 0u) {
+            return false;
+        }
+        Bool reqSkinData = ((matFlags & 1024u) != 0u) || (isSkinned && ((matFlags & 2048u) != 0u));
+        if (reqSkinData && ((renderObjFlags >> 16u) & 65535u) == 0u) {
+            return false;
+        }
+
+        UInt dFlags = 1u; // NVS_SHADOW_DRAW_FLAG_VALID
+        if (isAlphaTest)    { dFlags = dFlags | 2u; }
+        if (isDoubleSided)  { dFlags = dFlags | 4u; }
+        if (isCustomShadow) { dFlags = dFlags | 8u; }
+        if (isSkinned)      { dFlags = dFlags | 16u; }
+        if (isInstanced)    { dFlags = dFlags | 32u; }
+        if ((candVariantFlags & 48u) != 0u || (meshDescFlags & 16u) != 0u) { dFlags = dFlags | 64u; }
+        if (isCustomDeform) { dFlags = dFlags | 128u; }
+        if ((meshDescFlags & 16u) != 0u) { dFlags = dFlags | 256u; }
+
+        outDrawFlags = dFlags;
+
+        // GPU_MAT_SHADOW_FLAG_EXPLICIT_BUCKETS (512): route via explicit per-material draw group indices
+        if ((matFlags & 512u) != 0u) {
+            if (isSkinned && isInstanced) {
+                outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].customBucketIndex;
+                if (outBucketIdx >= maxShadowBuckets) {
+                    outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].skinnedBucketIndex;
+                }
+            } else if (isSkinned) {
+                outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].skinnedBucketIndex;
+                if (outBucketIdx >= maxShadowBuckets) {
+                    outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].customBucketIndex;
+                }
+            } else if (isInstanced) {
+                outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].instancedBucketIndex;
+                if (outBucketIdx >= maxShadowBuckets) {
+                    outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].defaultBucketIndex;
+                }
+            } else {
+                outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].defaultBucketIndex;
+                if (outBucketIdx >= maxShadowBuckets) {
+                    outBucketIdx = NVSIndirectDrawParams.InMaterialDescriptors[materialId].instancedBucketIndex;
+                }
+            }
+            if (outBucketIdx >= maxShadowBuckets) {
+                return false;
+            }
+            return true;
+        }
+
+        if (isCustomShadow) {
+            outBucketIdx = 7u;
+        } else if (isDoubleSided && !isSkinned && !isAlphaTest) {
+            outBucketIdx = 6u;
+        } else if (isAlphaTest) {
+            if (isSkinned) {
+                outBucketIdx = 5u;
+            } else if (isInstanced) {
+                outBucketIdx = 4u;
+            } else {
+                outBucketIdx = 3u;
+            }
+        } else {
+            if (isSkinned) {
+                outBucketIdx = 2u;
+            } else if (isInstanced) {
+                outBucketIdx = 1u;
+            } else {
+                outBucketIdx = 0u;
+            }
+        }
+
+        if (outBucketIdx >= maxShadowBuckets) {
+            return false;
+        }
+        return true;
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt mode       = NVSIndirectDrawParams.Config.dispatchMode;
+        UInt tid        = gtid.x;
+        UInt maxBuckets = Max(8u, NVSIndirectDrawParams.Config.maxShadowBuckets);
+
+        // =================================================================
+        //  MODE 0: Reset Bucket Command Counts, Pool Counters & Telemetry
+        // =================================================================
+        if (mode == 0u) {
+            UInt flatIdx = dtid.x;
+            if (flatIdx <= maxBuckets) {
+                NVSIndirectDrawParams.OutBucketCommandCounts[flatIdx].count = 0u;
+            }
+            if (flatIdx < 64u && NVSIndirectDrawParams.Config.maxPerDrawCBVWords >= 64u) {
+                NVSIndirectDrawParams.OutPerDrawCBVWords[flatIdx].word = 0u;
+            }
+            if (flatIdx < 64u && NVSIndirectDrawParams.Config.maxPerBatchInstanceWords >= 64u) {
+                NVSIndirectDrawParams.OutPerBatchInstanceWords[flatIdx].word = 0u;
+            }
+            if (flatIdx == 0u) {
+                NVSIndirectDrawParams.OutAllocationCounters[0u].count = 64u; // Reserve [0..63] (256B) zeroed CBV fallback block at offset 0
+                NVSIndirectDrawParams.OutAllocationCounters[1u].count = 64u; // Reserve [0..63] (256B) zeroed SRV fallback block at offset 0
+
+                NVSIndirectDrawParams.OutTelemetry[0u].activePagesEvaluated             = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].candidateDrawsProcessed          = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].validIndirectCommandsEmitted     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].totalInstancesEmitted            = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].rejectedStaleObjectHandle        = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidMeshDescriptor    = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidMaterialOrVariant = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidPageOrSlice       = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].overflowDroppedCommands          = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].instancedBatchMergedDraws        = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].committablePagesCount            = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].nonCommittablePagesCount         = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount0                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount1                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount2                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount3                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount4                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount5                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount6                     = 0u;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount7                     = 0u;
+
+                NVSIndirectDrawParams.OutPageCommitRecords[0u].physicalPageIndex          = 4294967295u;
+                NVSIndirectDrawParams.OutPageCommitRecords[0u].resultFlags                = 2147483648u;
+                NVSIndirectDrawParams.OutPageCommitRecords[0u].expectedPhysicalGeneration = 0u;
+                NVSIndirectDrawParams.OutPageCommitRecords[0u].expectedVirtualFlatIndex   = 4294967295u;
+            }
+            return;
+        }
+
+        UInt maxActivePages = NVSIndirectDrawParams.Config.maxActivePages;
+        UInt activePages    = (NVSIndirectDrawParams.Config.useGPUActivePageCount != 0u)
+            ? NVSIndirectDrawParams.InProjectionCounter[4u].count
+            : NVSIndirectDrawParams.Config.explicitActivePageCount;
+        if (activePages > maxActivePages) {
+            activePages = maxActivePages;
+        }
+
+        // =================================================================
+        //  MODE 2: Finalize Telemetry & Write GPU Commit Record Sentinel
+        // =================================================================
+        if (mode == 2u) {
+            if (gid.x > 0u) {
+                return;
+            }
+            UInt maxBuckets2   = NVSIndirectDrawParams.Config.maxShadowBuckets;
+            UInt maxCmdPerBkt2 = NVSIndirectDrawParams.Config.maxCommandsPerBucket;
+            for (UInt b = tid; b < maxBuckets2; b = b + 64u) {
+                UInt bCnt = NVSIndirectDrawParams.OutBucketCommandCounts[b].count;
+                if (bCnt > maxCmdPerBkt2) {
+                    NVSIndirectDrawParams.OutBucketCommandCounts[b].count = maxCmdPerBkt2;
+                }
+            }
+            AllMemoryBarrierWithGroupSync();
+            if (tid == 0u) {
+                NVSIndirectDrawParams.OutTelemetry[0u].activePagesEvaluated = activePages;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount0         = NVSIndirectDrawParams.OutBucketCommandCounts[0u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount1         = NVSIndirectDrawParams.OutBucketCommandCounts[1u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount2         = NVSIndirectDrawParams.OutBucketCommandCounts[2u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount3         = NVSIndirectDrawParams.OutBucketCommandCounts[3u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount4         = NVSIndirectDrawParams.OutBucketCommandCounts[4u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount5         = NVSIndirectDrawParams.OutBucketCommandCounts[5u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount6         = NVSIndirectDrawParams.OutBucketCommandCounts[6u].count;
+                NVSIndirectDrawParams.OutTelemetry[0u].bucketCount7         = NVSIndirectDrawParams.OutBucketCommandCounts[7u].count;
+
+                UInt physCap = NVSIndirectDrawParams.Config.physicalPoolCapacity;
+                if (activePages < physCap) {
+                    NVSIndirectDrawParams.OutPageCommitRecords[activePages].physicalPageIndex          = 4294967295u;
+                    NVSIndirectDrawParams.OutPageCommitRecords[activePages].resultFlags                = 2147483648u;
+                    NVSIndirectDrawParams.OutPageCommitRecords[activePages].expectedPhysicalGeneration = activePages;
+                    NVSIndirectDrawParams.OutPageCommitRecords[activePages].expectedVirtualFlatIndex   = 4294967295u;
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1: Per-Page Candidate Resolution, Instanced Batching,
+        //          Reflected CBV/SRV Patching & 96-Byte Command Emission
+        // =================================================================
+        if (mode != 1u) {
+            return;
+        }
+
+        UInt pageOrd = (gid.x + (gid.y * 65535u)) * 64u + tid;
+        if (pageOrd >= activePages) {
+            return;
+        }
+
+        UInt maxWorklist    = NVSIndirectDrawParams.Config.maxWorklistEntries;
+        UInt maxSceneSlots  = NVSIndirectDrawParams.Config.maxSceneSlots;
+        UInt maxMeshDesc    = NVSIndirectDrawParams.Config.maxMeshDescriptors;
+        UInt maxMatDesc     = NVSIndirectDrawParams.Config.maxMaterialDescriptors;
+        UInt maxRenderSlots = NVSIndirectDrawParams.Config.maxRenderDataSlots;
+        UInt maxCmdPerBkt   = NVSIndirectDrawParams.Config.maxCommandsPerBucket;
+        UInt maxCtxCap      = NVSIndirectDrawParams.Config.maxDrawContexts;
+        UInt physCap        = NVSIndirectDrawParams.Config.physicalPoolCapacity;
+        Bool allowInstMerge = (NVSIndirectDrawParams.Config.enableHardwareInstancing != 0u);
+        UInt dgBindCount    = NVSIndirectDrawParams.Config.drawGroupBindingCount;
+        UInt cbvBaseLo      = NVSIndirectDrawParams.Config.cbvPoolBaseLo;
+        UInt cbvBaseHi      = NVSIndirectDrawParams.Config.cbvPoolBaseHi;
+        UInt instBaseLo     = NVSIndirectDrawParams.Config.instancePoolBaseLo;
+        UInt instBaseHi     = NVSIndirectDrawParams.Config.instancePoolBaseHi;
+        UInt boneBaseLo     = NVSIndirectDrawParams.Config.bonePaletteBaseLo;
+        UInt boneBaseHi     = NVSIndirectDrawParams.Config.bonePaletteBaseHi;
+        UInt maxCBVWords    = NVSIndirectDrawParams.Config.maxPerDrawCBVWords;
+        UInt maxInstWords   = NVSIndirectDrawParams.Config.maxPerBatchInstanceWords;
+
+        UInt vFlatIdx    = NVSIndirectDrawParams.InCasterPageRanges[pageOrd].virtualPageFlatIndex;
+        UInt physIdx     = NVSIndirectDrawParams.InCasterPageRanges[pageOrd].physicalPageIndex;
+        UInt firstOffset = NVSIndirectDrawParams.InCasterPageRanges[pageOrd].firstCasterOffset;
+        UInt casterCnt   = NVSIndirectDrawParams.InCasterPageRanges[pageOrd].casterCount;
+        UInt pageFlags   = NVSIndirectDrawParams.InCasterPageRanges[pageOrd].pageFlags;
+        UInt physGen     = NVSIndirectDrawParams.InCasterPageRanges[pageOrd].physicalGeneration;
+
+        Bool pageValid      = ((pageFlags & 1u) != 0u) && (physIdx < physCap) && (physIdx < maxRenderSlots);
+        Bool pageOverflowed = ((pageFlags & 4u) != 0u);
+        Bool pageAllDrawsOk = true;
+        UInt pageDiagFlags  = (casterCnt == 0u) ? 8u : 0u;
+
+        if (pageValid) {
+            UInt rdPhys = NVSIndirectDrawParams.InPageRenderData[physIdx].physicalPageIndex;
+            UInt rdVirt = NVSIndirectDrawParams.InPageRenderData[physIdx].virtualFlatIndex;
+            UInt rdGen  = NVSIndirectDrawParams.InPageRenderData[physIdx].physicalGeneration;
+            UInt rdFlgs = NVSIndirectDrawParams.InPageRenderData[physIdx].renderFlags;
+            if (physGen == 0u) {
+                physGen = rdGen;
+            }
+            if ((rdFlgs & 1u) == 0u || rdPhys != physIdx || rdVirt != vFlatIdx || rdGen != physGen) {
+                pageValid      = false;
+                pageAllDrawsOk = false;
+                UInt prevRejP  = 0u;
+                InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidPageOrSlice, 1u, prevRejP);
+            }
+        } else {
+            pageAllDrawsOk = false;
+            UInt prevRejP  = 0u;
+            InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidPageOrSlice, 1u, prevRejP);
+        }
+
+        if (pageValid && casterCnt > 0u) {
+            if (firstOffset >= maxWorklist || (firstOffset + casterCnt) > maxWorklist) {
+                pageOverflowed = true;
+                pageAllDrawsOk = false;
+            } else {
+                UInt prevCand = 0u;
+                InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].candidateDrawsProcessed, casterCnt, prevCand);
+
+                // Cache page-level matrices & scalars once per page thread
+                Vec4 vp0        = NVSIndirectDrawParams.InPageRenderData[physIdx].worldToPageClipCol0;
+                Vec4 vp1        = NVSIndirectDrawParams.InPageRenderData[physIdx].worldToPageClipCol1;
+                Vec4 vp2        = NVSIndirectDrawParams.InPageRenderData[physIdx].worldToPageClipCol2;
+                Vec4 vp3        = NVSIndirectDrawParams.InPageRenderData[physIdx].worldToPageClipCol3;
+                Vec4 lv0        = NVSIndirectDrawParams.InPageRenderData[physIdx].lightViewCol0;
+                Vec4 lv1        = NVSIndirectDrawParams.InPageRenderData[physIdx].lightViewCol1;
+                Vec4 lv2        = NVSIndirectDrawParams.InPageRenderData[physIdx].lightViewCol2;
+                Vec4 lv3        = NVSIndirectDrawParams.InPageRenderData[physIdx].lightViewCol3;
+                Vec4 pr0        = NVSIndirectDrawParams.InPageRenderData[physIdx].pageProjCol0;
+                Vec4 pr1        = NVSIndirectDrawParams.InPageRenderData[physIdx].pageProjCol1;
+                Vec4 pr2        = NVSIndirectDrawParams.InPageRenderData[physIdx].pageProjCol2;
+                Vec4 pr3        = NVSIndirectDrawParams.InPageRenderData[physIdx].pageProjCol3;
+                UInt pVirtAddr  = NVSIndirectDrawParams.InPageRenderData[physIdx].virtualAddressPacked;
+                UInt pClipLvl   = NVSIndirectDrawParams.InPageRenderData[physIdx].clipmapLevel;
+                Float biasGate  = (NVSIndirectDrawParams.Config.applyShaderBias != 0u) ? 1.0 : 0.0;
+                Float pDepthB   = NVSIndirectDrawParams.InPageRenderData[physIdx].depthBiasNdc * biasGate * NVSIndirectDrawParams.Config.depthBiasScale;
+                Float pNormB    = NVSIndirectDrawParams.InPageRenderData[physIdx].normalBiasWorld * biasGate * NVSIndirectDrawParams.Config.normalBiasScale;
+                Float pRecMinZ  = NVSIndirectDrawParams.InPageRenderData[physIdx].receiverMinZ;
+                Float pRecMaxZ  = NVSIndirectDrawParams.InPageRenderData[physIdx].receiverMaxZ;
+                Float pCastMinZ = NVSIndirectDrawParams.InPageRenderData[physIdx].casterMinZ;
+                Float pCastMaxZ = NVSIndirectDrawParams.InPageRenderData[physIdx].casterMaxZ;
+                Float pMinX     = NVSIndirectDrawParams.InPageRenderData[physIdx].lightMinX;
+                Float pMaxX     = NVSIndirectDrawParams.InPageRenderData[physIdx].lightMaxX;
+                Float pMinY     = NVSIndirectDrawParams.InPageRenderData[physIdx].lightMinY;
+                Float pMaxY     = NVSIndirectDrawParams.InPageRenderData[physIdx].lightMaxY;
+                UInt  pRFlags   = NVSIndirectDrawParams.InPageRenderData[physIdx].renderFlags;
+                if ((pRFlags & 64u) == 0u) {
+                    Float cx = 0.5 * (pMinX + pMaxX);
+                    Float cy = 0.5 * (pMinY + pMaxY);
+                    lv3 = Vec4(-cx, -cy, -pCastMinZ, 1.0);
+                    pr3 = Vec4(
+                        pr3.x + pr0.x * cx,
+                        pr3.y + pr1.y * cy,
+                        pr3.z + pr2.z * pCastMinZ,
+                        1.0);
+                }
+
+                UInt endOffset = firstOffset + casterCnt;
+                for (UInt c = firstOffset; c < endOffset; c = c + 1u) {
+                    UInt slotIdx       = NVSIndirectDrawParams.InCasterWorklist[c].gpuSceneSlotIndex;
+                    UInt expectedGen   = NVSIndirectDrawParams.InCasterWorklist[c].renderObjectHandle;
+                    UInt candPhys      = NVSIndirectDrawParams.InCasterWorklist[c].physicalPageIndex;
+                    UInt candVirt      = NVSIndirectDrawParams.InCasterWorklist[c].virtualPageFlatIndex;
+                    UInt lightAndLevel = NVSIndirectDrawParams.InCasterWorklist[c].lightIdAndClipmapLevel;
+                    UInt candMeshId    = NVSIndirectDrawParams.InCasterWorklist[c].meshId;
+                    UInt candSubmesh   = NVSIndirectDrawParams.InCasterWorklist[c].submeshIndex;
+                    UInt candMatId     = NVSIndirectDrawParams.InCasterWorklist[c].materialId;
+                    UInt candVarFlags  = NVSIndirectDrawParams.InCasterWorklist[c].pipelineVariantFlags;
+                    UInt candLod       = NVSIndirectDrawParams.InCasterWorklist[c].selectedLODIndex & 65535u;
+                    UInt candInstGrp   = NVSIndirectDrawParams.InCasterWorklist[c].instanceGroupId;
+                    UInt candStartIdx  = NVSIndirectDrawParams.InCasterWorklist[c].startIndex;
+                    UInt candIdxCount  = NVSIndirectDrawParams.InCasterWorklist[c].indexCount;
+
+                    if (candPhys != physIdx || candVirt != vFlatIdx) {
+                        pageAllDrawsOk = false;
+                        UInt prevP = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidPageOrSlice, 1u, prevP);
+                        continue;
+                    }
+
+                    if (slotIdx >= maxSceneSlots) {
+                        pageAllDrawsOk = false;
+                        pageDiagFlags  = pageDiagFlags | 16u;
+                        UInt prevS = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedStaleObjectHandle, 1u, prevS);
+                        continue;
+                    }
+
+                    UInt objSlot     = NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].slotIndex;
+                    UInt objGen      = NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].generation;
+                    UInt objFlags    = NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].objectFlags;
+                    UInt renderFlags = NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].renderObjectFlags;
+                    UInt objBatchGrp = NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].batchGroupId;
+
+                    UInt expectedPacked = ((objGen & 65535u) << 16u) | (slotIdx & 65535u);
+                    Bool genMatch = (objGen > 65535u)
+                        ? (expectedGen == objGen)
+                        : ((expectedGen == objGen) || (expectedGen == expectedPacked));
+
+                    if (objSlot != slotIdx || objGen == 0u || !genMatch || (objFlags & 11u) != 11u) {
+                        pageAllDrawsOk = false;
+                        pageDiagFlags  = pageDiagFlags | 16u;
+                        UInt prevS = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedStaleObjectHandle, 1u, prevS);
+                        continue;
+                    }
+
+                    UInt baseMeshFlags = (candMeshId < maxMeshDesc)
+                        ? NVSIndirectDrawParams.InMeshDescriptors[candMeshId].descriptorFlags
+                        : 0u;
+                    Bool isUnbakedStaticMember = (((candVarFlags & 16u) != 0u) || ((objFlags & 4096u) != 0u)) && ((baseMeshFlags & 16u) == 0u);
+                    UInt effSubmesh  = isUnbakedStaticMember ? 0u : candSubmesh;
+                    UInt effStartIdx = isUnbakedStaticMember ? 0u : candStartIdx;
+
+                    UInt meshDescIdx = 0u;
+                    if (!ResolveMeshDescriptor(candMeshId, effSubmesh, candLod, maxMeshDesc, meshDescIdx)) {
+                        pageAllDrawsOk = false;
+                        pageDiagFlags  = pageDiagFlags | 32u;
+                        UInt prevM = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidMeshDescriptor, 1u, prevM);
+                        continue;
+                    }
+
+                    UInt meshDescFlags = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].descriptorFlags;
+
+                    // Receiver-only / geometry-only materials (GPU_MAT_SHADOW_FLAG_NO_SHADOW_PASS = 4096) intentionally
+                    // omit PassType::SHADOW: skip shadow draw emission cleanly without blocking valid page commit.
+                    if (candMatId < maxMatDesc && (NVSIndirectDrawParams.InMaterialDescriptors[candMatId].materialFlags & 4096u) != 0u) {
+                        continue;
+                    }
+
+                    UInt bucketIdx = 0u;
+                    UInt drawFlags = 0u;
+                    if (!ResolveMaterialAndBucket(candVarFlags, objFlags, renderFlags, meshDescFlags, candMatId, maxMatDesc, maxBuckets, bucketIdx, drawFlags)) {
+                        pageAllDrawsOk = false;
+                        pageDiagFlags  = pageDiagFlags | 64u;
+                        UInt prevMat = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidMaterialOrVariant, 1u, prevMat);
+                        continue;
+                    }
+
+                    UInt candMatFlags   = NVSIndirectDrawParams.InMaterialDescriptors[candMatId].materialFlags;
+                    Bool reqSkinBatch   = ((candMatFlags & 1024u) != 0u) || (((drawFlags & 16u) != 0u) && ((candMatFlags & 2048u) != 0u));
+                    Bool canScanPeers   = allowInstMerge && ((drawFlags & 32u) != 0u) && (candInstGrp != 0u);
+                    Bool hasEarlierPeer = false;
+                    UInt laterPeerCount = 0u;
+
+                    UInt peerChunkBase = firstOffset + (((c - firstOffset) >> 8u) << 8u);
+                    UInt peerChunkEnd  = Min(peerChunkBase + 256u, endOffset);
+
+                    if (canScanPeers) {
+                        for (UInt p = peerChunkBase; p < c; p = p + 1u) {
+                            UInt pVarFlags   = NVSIndirectDrawParams.InCasterWorklist[p].pipelineVariantFlags;
+                            UInt pRawSubmesh = NVSIndirectDrawParams.InCasterWorklist[p].submeshIndex;
+                            UInt pEffSubmesh = ((((pVarFlags & 16u) != 0u)) && ((baseMeshFlags & 16u) == 0u)) ? 0u : pRawSubmesh;
+                            if (NVSIndirectDrawParams.InCasterWorklist[p].instanceGroupId == candInstGrp &&
+                                NVSIndirectDrawParams.InCasterWorklist[p].meshId == candMeshId &&
+                                pEffSubmesh == effSubmesh &&
+                                NVSIndirectDrawParams.InCasterWorklist[p].selectedLODIndex == candLod &&
+                                NVSIndirectDrawParams.InCasterWorklist[p].materialId == candMatId &&
+                                pVarFlags == candVarFlags) {
+                                UInt pSlot = NVSIndirectDrawParams.InCasterWorklist[p].gpuSceneSlotIndex;
+                                UInt pGen  = NVSIndirectDrawParams.InCasterWorklist[p].renderObjectHandle;
+                                if (pSlot < maxSceneSlots) {
+                                    UInt pRealGen       = NVSIndirectDrawParams.InGPUSceneObjects[pSlot].generation;
+                                    UInt pPackedGenSlot = ((pRealGen & 65535u) << 16u) | (pSlot & 65535u);
+                                    Bool pGenMatch      = (pRealGen > 65535u)
+                                        ? (pGen == pRealGen)
+                                        : ((pGen == pRealGen) || (pGen == pPackedGenSlot));
+                                    UInt pRenderFlags   = NVSIndirectDrawParams.InGPUSceneObjects[pSlot].renderObjectFlags;
+                                    Bool pSkinOk        = !reqSkinBatch || (((pRenderFlags >> 16u) & 65535u) > 0u);
+                                    if (NVSIndirectDrawParams.InGPUSceneObjects[pSlot].slotIndex == pSlot &&
+                                        pGenMatch && pSkinOk &&
+                                        (NVSIndirectDrawParams.InGPUSceneObjects[pSlot].objectFlags & 11u) == 11u) {
+                                        hasEarlierPeer = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!hasEarlierPeer) {
+                            for (UInt n = c + 1u; n < peerChunkEnd; n = n + 1u) {
+                                UInt nVarFlags   = NVSIndirectDrawParams.InCasterWorklist[n].pipelineVariantFlags;
+                                UInt nRawSubmesh = NVSIndirectDrawParams.InCasterWorklist[n].submeshIndex;
+                                UInt nEffSubmesh = ((((nVarFlags & 16u) != 0u)) && ((baseMeshFlags & 16u) == 0u)) ? 0u : nRawSubmesh;
+                                if (NVSIndirectDrawParams.InCasterWorklist[n].instanceGroupId == candInstGrp &&
+                                    NVSIndirectDrawParams.InCasterWorklist[n].meshId == candMeshId &&
+                                    nEffSubmesh == effSubmesh &&
+                                    NVSIndirectDrawParams.InCasterWorklist[n].selectedLODIndex == candLod &&
+                                    NVSIndirectDrawParams.InCasterWorklist[n].materialId == candMatId &&
+                                    nVarFlags == candVarFlags) {
+                                    UInt nSlot = NVSIndirectDrawParams.InCasterWorklist[n].gpuSceneSlotIndex;
+                                    UInt nGen  = NVSIndirectDrawParams.InCasterWorklist[n].renderObjectHandle;
+                                    if (nSlot < maxSceneSlots) {
+                                        UInt nRealGen       = NVSIndirectDrawParams.InGPUSceneObjects[nSlot].generation;
+                                        UInt nPackedGenSlot = ((nRealGen & 65535u) << 16u) | (nSlot & 65535u);
+                                        Bool nGenMatch      = (nGen == nRealGen) || ((nRealGen <= 65535u) && (nGen == nPackedGenSlot));
+                                        UInt nRenderFlags   = NVSIndirectDrawParams.InGPUSceneObjects[nSlot].renderObjectFlags;
+                                        Bool nSkinOk        = !reqSkinBatch || (((nRenderFlags >> 16u) & 65535u) > 0u);
+                                        if (NVSIndirectDrawParams.InGPUSceneObjects[nSlot].slotIndex == nSlot &&
+                                            nGenMatch && nSkinOk &&
+                                            (NVSIndirectDrawParams.InGPUSceneObjects[nSlot].objectFlags & 11u) == 11u) {
+                                            laterPeerCount = laterPeerCount + 1u;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // For explicit-bucket materials, route singleton page casters to STANDARD/SKINNED when available,
+                    // and multi-peer page batches to INSTANCED/INSTANCED_SKINNED when available.
+                    if ((candMatFlags & 512u) != 0u) {
+                        Bool isSkinDraw = ((drawFlags & 16u) != 0u);
+                        UInt singleBkt  = isSkinDraw
+                            ? NVSIndirectDrawParams.InMaterialDescriptors[candMatId].skinnedBucketIndex
+                            : NVSIndirectDrawParams.InMaterialDescriptors[candMatId].defaultBucketIndex;
+                        UInt instBkt    = isSkinDraw
+                            ? NVSIndirectDrawParams.InMaterialDescriptors[candMatId].customBucketIndex
+                            : NVSIndirectDrawParams.InMaterialDescriptors[candMatId].instancedBucketIndex;
+
+                        if (!canScanPeers || (!hasEarlierPeer && laterPeerCount == 0u)) {
+                            bucketIdx = (singleBkt < maxBuckets) ? singleBkt : instBkt;
+                        } else {
+                            bucketIdx = (instBkt < maxBuckets) ? instBkt : singleBkt;
+                        }
+
+                        if (bucketIdx >= maxBuckets) {
+                            pageAllDrawsOk = false;
+                            pageDiagFlags  = pageDiagFlags | 64u;
+                            UInt prevMat = 0u;
+                            InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].rejectedInvalidMaterialOrVariant, 1u, prevMat);
+                            continue;
+                        }
+                    }
+
+                    // Resolve reflected DrawGroup binding metadata & gate hardware instancing on srvMode == 1 (INSTANCE_POOL)
+                    Bool hasBinding = (bucketIdx < dgBindCount) && ((NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].bindingFlags & 1u) != 0u);
+                    UInt cbvCount   = hasBinding ? Min(NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbvCount, 3u) : 0u;
+                    UInt srvMode    = hasBinding ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].srvMode : 0u;
+                    UInt instStride = hasBinding ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].instanceStrideBytes : 0u;
+                    UInt patchFirst = hasBinding ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].patchFirstIndex : 0u;
+                    UInt patchCnt   = hasBinding ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].patchCount : 0u;
+                    UInt patchEnd   = patchFirst + patchCnt;
+
+                    Bool bucketSupportsInstMerge = ((candMatFlags & 512u) != 0u)
+                        ? (hasBinding && srvMode == 1u)
+                        : (bucketIdx == 1u || bucketIdx == 4u);
+                    Bool isInstBucket = canScanPeers && bucketSupportsInstMerge;
+                    if (isInstBucket && hasEarlierPeer) {
+                        continue;
+                    }
+                    UInt instCount = isInstBucket ? (1u + laterPeerCount) : 1u;
+
+                    UInt cbvBytes0  = (cbvCount > 0u) ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbv0ByteSize : 0u;
+                    UInt cbvBytes1  = (cbvCount > 1u) ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbv1ByteSize : 0u;
+                    UInt cbvBytes2  = (cbvCount > 2u) ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbv2ByteSize : 0u;
+
+                    UInt cbvAlignW0 = (cbvBytes0 > 0u) ? (((cbvBytes0 + 255u) & ~255u) >> 2u) : 0u;
+                    UInt cbvAlignW1 = (cbvBytes1 > 0u) ? (((cbvBytes1 + 255u) & ~255u) >> 2u) : 0u;
+                    UInt cbvAlignW2 = (cbvBytes2 > 0u) ? (((cbvBytes2 + 255u) & ~255u) >> 2u) : 0u;
+                    UInt totalCBVW  = cbvAlignW0 + cbvAlignW1 + cbvAlignW2;
+
+                    UInt cbvAllocBase = 0u;
+                    if (totalCBVW > 0u) {
+                        InterlockedAdd(NVSIndirectDrawParams.OutAllocationCounters[0u].count, totalCBVW, cbvAllocBase);
+                        if ((cbvAllocBase + totalCBVW) > maxCBVWords) {
+                            pageOverflowed = true;
+                            pageAllDrawsOk = false;
+                            pageDiagFlags  = pageDiagFlags | 128u;
+                            UInt prevOvf = 0u;
+                            InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].overflowDroppedCommands, 1u, prevOvf);
+                            continue;
+                        }
+                    }
+
+                    UInt strideWords   = (srvMode == 1u && instStride >= 4u) ? ((instStride + 3u) >> 2u) : 0u;
+                    UInt rawInstWords  = instCount * strideWords;
+                    UInt allocReqWords = (rawInstWords > 0u) ? (rawInstWords + strideWords) : 0u;
+                    UInt instRawBase   = 0u;
+                    UInt instAllocBase = 0u;
+                    if (allocReqWords > 0u) {
+                        InterlockedAdd(NVSIndirectDrawParams.OutAllocationCounters[1u].count, allocReqWords, instRawBase);
+                        if ((instRawBase + allocReqWords) > maxInstWords) {
+                            pageOverflowed = true;
+                            pageAllDrawsOk = false;
+                            pageDiagFlags  = pageDiagFlags | 128u;
+                            UInt prevOvf = 0u;
+                            InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].overflowDroppedCommands, 1u, prevOvf);
+                            continue;
+                        }
+                        UInt strideRem = instRawBase % strideWords;
+                        instAllocBase  = (strideRem == 0u) ? instRawBase : (instRawBase + (strideWords - strideRem));
+                    }
+
+                    // Allocate DrawContext slice & Bucket Command Slot
+                    UInt baseCtxIdx = 0u;
+                    InterlockedAdd(NVSIndirectDrawParams.OutBucketCommandCounts[maxBuckets].count, instCount, baseCtxIdx);
+                    if ((baseCtxIdx + instCount) > maxCtxCap) {
+                        pageOverflowed = true;
+                        pageAllDrawsOk = false;
+                        pageDiagFlags  = pageDiagFlags | 128u;
+                        UInt prevOvf = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].overflowDroppedCommands, 1u, prevOvf);
+                        continue;
+                    }
+
+                    UInt cmdInBucket = 0u;
+                    InterlockedAdd(NVSIndirectDrawParams.OutBucketCommandCounts[bucketIdx].count, 1u, cmdInBucket);
+                    if (cmdInBucket >= maxCmdPerBkt) {
+                        pageOverflowed = true;
+                        pageAllDrawsOk = false;
+                        pageDiagFlags  = pageDiagFlags | 128u;
+                        UInt prevOvf = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].overflowDroppedCommands, 1u, prevOvf);
+                        continue;
+                    }
+
+                    // Initialize CBV slices from reflected template words (preserving all user Add() CBuffer values)
+                    UInt cbvBase0 = cbvAllocBase;
+                    UInt cbvBase1 = cbvAllocBase + cbvAlignW0;
+                    UInt cbvBase2 = cbvBase1     + cbvAlignW1;
+                    UInt cbvWords0 = (cbvBytes0 + 3u) >> 2u;
+                    UInt cbvWords1 = (cbvBytes1 + 3u) >> 2u;
+                    UInt cbvWords2 = (cbvBytes2 + 3u) >> 2u;
+
+                    if (cbvAlignW0 > 0u) {
+                        UInt tpl0 = NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbv0TemplateWordOffset;
+                        for (UInt w = 0u; w < cbvAlignW0; w = w + 1u) {
+                            NVSIndirectDrawParams.OutPerDrawCBVWords[cbvBase0 + w].word = (w < cbvWords0)
+                                ? NVSIndirectDrawParams.InTemplateWords[tpl0 + w].word
+                                : 0u;
+                        }
+                    }
+                    if (cbvAlignW1 > 0u) {
+                        UInt tpl1 = NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbv1TemplateWordOffset;
+                        for (UInt w = 0u; w < cbvAlignW1; w = w + 1u) {
+                            NVSIndirectDrawParams.OutPerDrawCBVWords[cbvBase1 + w].word = (w < cbvWords1)
+                                ? NVSIndirectDrawParams.InTemplateWords[tpl1 + w].word
+                                : 0u;
+                        }
+                    }
+                    if (cbvAlignW2 > 0u) {
+                        UInt tpl2 = NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].cbv2TemplateWordOffset;
+                        for (UInt w = 0u; w < cbvAlignW2; w = w + 1u) {
+                            NVSIndirectDrawParams.OutPerDrawCBVWords[cbvBase2 + w].word = (w < cbvWords2)
+                                ? NVSIndirectDrawParams.InTemplateWords[tpl2 + w].word
+                                : 0u;
+                        }
+                    }
+
+                    // Patch Engine Get() CBV fields on GPU
+                    Bool isPretransformed = ((drawFlags & 256u) != 0u);
+                    if (totalCBVW > 0u && patchCnt > 0u) {
+                        Vec4 w0 = isPretransformed ? Vec4(1.0, 0.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol0;
+                        Vec4 w1 = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol1;
+                        Vec4 w2 = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol2;
+                        Vec4 w3 = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol3;
+                        UInt boneOff0 = ((objFlags & 1024u) != 0u) ? objBatchGrp : 0u;
+                        UInt boneCnt0 = (renderFlags >> 16u) & 65535u;
+                        UInt skinRev0 = (boneCnt0 > 0u) ? 1u : 0u;
+
+                        for (UInt pIdx = patchFirst; pIdx < patchEnd; pIdx = pIdx + 1u) {
+                            UInt tSlot = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].targetSlot;
+                            if (tSlot >= 3u) {
+                                continue;
+                            }
+                            UInt slotBase = (tSlot == 0u) ? cbvBase0 : ((tSlot == 1u) ? cbvBase1 : cbvBase2);
+                            UInt slotMaxW = (tSlot == 0u) ? cbvWords0 : ((tSlot == 1u) ? cbvWords1 : cbvWords2);
+                            UInt semId    = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].semanticId;
+                            UInt relWord  = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].byteOffset >> 2u;
+                            UInt reqWords = (NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].byteSize + 3u) >> 2u;
+                            if (relWord >= slotMaxW || reqWords == 0u) {
+                                continue;
+                            }
+
+                            if (semId == 1u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, w0, w1, w2, w3);
+                            } else if (semId == 2u) {
+                                Vec4 iw0 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 iw1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 iw2 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 iw3 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                InvertMat4Cols(w0, w1, w2, w3, iw0, iw1, iw2, iw3);
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, iw0, iw1, iw2, iw3);
+                            } else if (semId == 3u) {
+                                Vec4 nm0 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 nm1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 nm2 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                ComputeNormalMatrixCols(w0, w1, w2, nm0, nm1, nm2);
+                                WriteCBVVec4(slotBase, relWord + 0u, slotMaxW, reqWords, nm0);
+                                if (reqWords > 4u) { WriteCBVVec4(slotBase, relWord + 4u, slotMaxW, reqWords - 4u, nm1); }
+                                if (reqWords > 8u) { WriteCBVVec4(slotBase, relWord + 8u, slotMaxW, reqWords - 8u, nm2); }
+                            } else if (semId == 4u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, lv0, lv1, lv2, lv3);
+                            } else if (semId == 5u) {
+                                Vec4 ilv0 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ilv1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 ilv2 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ilv3 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                InvertMat4Cols(lv0, lv1, lv2, lv3, ilv0, ilv1, ilv2, ilv3);
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, ilv0, ilv1, ilv2, ilv3);
+                            } else if (semId == 6u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, pr0, pr1, pr2, pr3);
+                            } else if (semId == 7u) {
+                                Vec4 ipr0 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ipr1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 ipr2 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ipr3 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                InvertMat4Cols(pr0, pr1, pr2, pr3, ipr0, ipr1, ipr2, ipr3);
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, ipr0, ipr1, ipr2, ipr3);
+                            } else if (semId == 8u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, vp0, vp1, vp2, vp3);
+                            } else if (semId == 9u) {
+                                Vec4 ivp0 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ivp1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 ivp2 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ivp3 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                InvertMat4Cols(vp0, vp1, vp2, vp3, ivp0, ivp1, ivp2, ivp3);
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, ivp0, ivp1, ivp2, ivp3);
+                            } else if (semId == 10u) {
+                                Vec4 mvp0 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 mvp1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 mvp2 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 mvp3 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                MulMat4Cols(vp0, vp1, vp2, vp3, w0, w1, w2, w3, mvp0, mvp1, mvp2, mvp3);
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, mvp0, mvp1, mvp2, mvp3);
+                            } else if (semId == 11u) {
+                                Vec4 ilv0 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ilv1 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                Vec4 ilv2 = Vec4(0.0, 0.0, 0.0, 0.0); Vec4 ilv3 = Vec4(0.0, 0.0, 0.0, 0.0);
+                                InvertMat4Cols(lv0, lv1, lv2, lv3, ilv0, ilv1, ilv2, ilv3);
+                                WriteCBVVec4(slotBase, relWord, slotMaxW, Min(reqWords, 3u), Vec4(ilv3.xyz, 0.0));
+                            } else if (semId == 12u) {
+                                Vec3 camDir = Vec3(lv0.z, lv1.z, lv2.z);
+                                WriteCBVVec4(slotBase, relWord, slotMaxW, Min(reqWords, 3u), Vec4(camDir, 0.0));
+                            } else if (semId == 13u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(pCastMinZ);
+                            } else if (semId == 14u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(pCastMaxZ);
+                            } else if (semId == 15u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = boneOff0;
+                            } else if (semId == 16u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = boneCnt0;
+                            } else if (semId == 17u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = skinRev0;
+                            } else if (semId == 18u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = physIdx;
+                            } else if (semId == 19u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = pVirtAddr;
+                            } else if (semId == 20u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = pClipLvl;
+                            } else if (semId == 21u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(pDepthB);
+                            } else if (semId == 22u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(pNormB);
+                            } else if (semId == 23u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(pRecMinZ);
+                            } else if (semId == 24u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(pRecMaxZ);
+                            } else if (semId == 25u) {
+                                Float fovApprox = (abs(pr1.y) > 0.0001) ? (2.0 * atan(1.0 / abs(pr1.y))) : 1.5707963;
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(fovApprox);
+                            } else if (semId == 26u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(1.0);
+                            }
+                        }
+                    }
+
+                    // Initialize Instance 0 in OutPerBatchInstanceWords if srvMode == 1
+                    UInt instTplBase = hasBinding ? NVSIndirectDrawParams.InDrawGroupBindings[bucketIdx].instanceTemplateWordOffset : 0u;
+                    if (rawInstWords > 0u) {
+                        for (UInt w = 0u; w < strideWords; w = w + 1u) {
+                            NVSIndirectDrawParams.OutPerBatchInstanceWords[instAllocBase + w].word =
+                                NVSIndirectDrawParams.InTemplateWords[instTplBase + w].word;
+                        }
+                        PatchInstanceElementFields(instAllocBase, strideWords, patchFirst, patchEnd, 0u, slotIdx, isPretransformed);
+                    }
+
+                    Float matAlphaCutoff = NVSIndirectDrawParams.InMaterialDescriptors[candMatId].alphaCutoff;
+                    Float matDeformAmp   = NVSIndirectDrawParams.InMaterialDescriptors[candMatId].deformAmplitude;
+                    Float matDeformFreq  = NVSIndirectDrawParams.InMaterialDescriptors[candMatId].deformFrequency;
+                    Float matUvScaleX    = NVSIndirectDrawParams.InMaterialDescriptors[candMatId].uvScaleX;
+
+                    UInt boneSlot0 = objBatchGrp;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].gpuSceneSlotIndex        = slotIdx;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].expectedObjectGeneration = objGen;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].physicalPageIndex        = physIdx;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].renderDataIndex          = physIdx;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].virtualPageFlatIndex     = vFlatIdx;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].lightIdAndClipmapLevel   = lightAndLevel;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].meshDescriptorIndex      = meshDescIdx;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].materialId               = candMatId;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].bucketIndex              = bucketIdx;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].drawFlags                = drawFlags;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].bonePayloadIndex         = boneSlot0;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].instanceOrdinalAndCount  = (instCount & 65535u) << 16u;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].alphaCutoff              = matAlphaCutoff;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].deformAmplitude          = matDeformAmp;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].deformFrequency          = matDeformFreq;
+                    NVSIndirectDrawParams.OutShadowDrawContexts[baseCtxIdx].uvScaleX                 = matUvScaleX;
+
+                    if (instCount > 1u) {
+                        UInt instOrd = 1u;
+                        for (UInt n = c + 1u; n < peerChunkEnd; n = n + 1u) {
+                            if (instOrd >= instCount) {
+                                break;
+                            }
+                            UInt nVarFlags   = NVSIndirectDrawParams.InCasterWorklist[n].pipelineVariantFlags;
+                            UInt nRawSubmesh = NVSIndirectDrawParams.InCasterWorklist[n].submeshIndex;
+                            UInt nEffSubmesh = ((((nVarFlags & 16u) != 0u)) && ((baseMeshFlags & 16u) == 0u)) ? 0u : nRawSubmesh;
+                            if (NVSIndirectDrawParams.InCasterWorklist[n].instanceGroupId == candInstGrp &&
+                                NVSIndirectDrawParams.InCasterWorklist[n].meshId == candMeshId &&
+                                nEffSubmesh == effSubmesh &&
+                                NVSIndirectDrawParams.InCasterWorklist[n].selectedLODIndex == candLod &&
+                                NVSIndirectDrawParams.InCasterWorklist[n].materialId == candMatId &&
+                                nVarFlags == candVarFlags) {
+                                UInt nSlot = NVSIndirectDrawParams.InCasterWorklist[n].gpuSceneSlotIndex;
+                                UInt nGen  = NVSIndirectDrawParams.InCasterWorklist[n].renderObjectHandle;
+                                if (nSlot < maxSceneSlots) {
+                                    UInt nRealGen       = NVSIndirectDrawParams.InGPUSceneObjects[nSlot].generation;
+                                    UInt nPackedGenSlot = ((nRealGen & 65535u) << 16u) | (nSlot & 65535u);
+                                    Bool nGenMatch      = (nGen == nRealGen) || ((nRealGen <= 65535u) && (nGen == nPackedGenSlot));
+                                    UInt nBatchGrp      = NVSIndirectDrawParams.InGPUSceneObjects[nSlot].batchGroupId;
+                                    UInt nRenderFlags   = NVSIndirectDrawParams.InGPUSceneObjects[nSlot].renderObjectFlags;
+                                    Bool nSkinOk        = !reqSkinBatch || (((nRenderFlags >> 16u) & 65535u) > 0u);
+                                    if (NVSIndirectDrawParams.InGPUSceneObjects[nSlot].slotIndex == nSlot &&
+                                        nGenMatch && nSkinOk &&
+                                        (NVSIndirectDrawParams.InGPUSceneObjects[nSlot].objectFlags & 11u) == 11u) {
+                                        UInt ctxIdxN   = baseCtxIdx + instOrd;
+                                        UInt boneSlotN = nBatchGrp;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].gpuSceneSlotIndex        = nSlot;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].expectedObjectGeneration = nRealGen;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].physicalPageIndex        = physIdx;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].renderDataIndex          = physIdx;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].virtualPageFlatIndex     = vFlatIdx;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].lightIdAndClipmapLevel   = lightAndLevel;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].meshDescriptorIndex      = meshDescIdx;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].materialId               = candMatId;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].bucketIndex              = bucketIdx;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].drawFlags                = drawFlags;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].bonePayloadIndex         = boneSlotN;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].instanceOrdinalAndCount  = (instOrd & 65535u) | ((instCount & 65535u) << 16u);
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].alphaCutoff              = matAlphaCutoff;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].deformAmplitude          = matDeformAmp;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].deformFrequency          = matDeformFreq;
+                                        NVSIndirectDrawParams.OutShadowDrawContexts[ctxIdxN].uvScaleX                 = matUvScaleX;
+
+                                        if (rawInstWords > 0u) {
+                                            UInt elemWordBase = instAllocBase + instOrd * strideWords;
+                                            for (UInt w = 0u; w < strideWords; w = w + 1u) {
+                                                NVSIndirectDrawParams.OutPerBatchInstanceWords[elemWordBase + w].word =
+                                                    NVSIndirectDrawParams.InTemplateWords[instTplBase + w].word;
+                                            }
+                                            PatchInstanceElementFields(elemWordBase, strideWords, patchFirst, patchEnd, instOrd, nSlot, isPretransformed);
+                                        }
+
+                                        instOrd = instOrd + 1u;
+                                    }
+                                }
+                            }
+                        }
+
+                        UInt prevMerged = 0u;
+                        InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].instancedBatchMergedDraws, instCount - 1u, prevMerged);
+                    }
+
+                    // Compute 64-bit Root CBV 0..2 and Root SRV 0 GPU Virtual Addresses
+                    UInt cbv0Lo = cbvBaseLo; UInt cbv0Hi = cbvBaseHi;
+                    UInt cbv1Lo = cbvBaseLo; UInt cbv1Hi = cbvBaseHi;
+                    UInt cbv2Lo = cbvBaseLo; UInt cbv2Hi = cbvBaseHi;
+                    UInt srv0Lo = instBaseLo; UInt srv0Hi = instBaseHi;
+
+                    if (cbvAlignW0 > 0u) { AddGpuAddressWords(cbvBaseLo, cbvBaseHi, cbvBase0, cbv0Lo, cbv0Hi); }
+                    if (cbvAlignW1 > 0u) { AddGpuAddressWords(cbvBaseLo, cbvBaseHi, cbvBase1, cbv1Lo, cbv1Hi); }
+                    if (cbvAlignW2 > 0u) { AddGpuAddressWords(cbvBaseLo, cbvBaseHi, cbvBase2, cbv2Lo, cbv2Hi); }
+
+                    if (srvMode == 1u && rawInstWords > 0u) {
+                        AddGpuAddressWords(instBaseLo, instBaseHi, instAllocBase, srv0Lo, srv0Hi);
+                    } else if (srvMode == 2u) {
+                        UInt boneOffSlice = ((objFlags & 1024u) != 0u) ? objBatchGrp : 0u;
+                        AddGpuAddressMatrices64B(boneBaseLo, boneBaseHi, boneOffSlice, srv0Lo, srv0Hi);
+                    }
+
+                    // Emit 96-Byte NVSIndirectDrawCommand into Bucket Slice
+                    UInt globalCmdIdx  = (bucketIdx * maxCmdPerBkt) + cmdInBucket;
+                    UInt descSubAndLod = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].submeshAndLodPacked;
+                    UInt reqSubAndLod  = (effSubmesh & 65535u) | ((candLod & 65535u) << 16u);
+
+                    UInt finalIdxCount = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].indexCount;
+                    UInt finalStartIdx = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].startIndex;
+                    Int  finalBaseVtx  = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].baseVertex;
+
+                    UInt idxByteStride = (NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibFormat == 1u ||
+                                          NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibFormat == 57u) ? 2u : 4u;
+                    UInt maxIbIndices  = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibSizeInBytes / idxByteStride;
+
+                    if (descSubAndLod != reqSubAndLod && candLod == 0u && candIdxCount > 0u && (effStartIdx + candIdxCount) <= maxIbIndices) {
+                        finalIdxCount = candIdxCount;
+                        finalStartIdx = effStartIdx;
+                    }
+
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].vbAddressLo           = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].vbAddressLo;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].vbAddressHi           = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].vbAddressHi;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].vbSizeInBytes         = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].vbSizeInBytes;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].vbStrideInBytes       = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].vbStrideInBytes;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].ibAddressLo           = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibAddressLo;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].ibAddressHi           = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibAddressHi;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].ibSizeInBytes         = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibSizeInBytes;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].ibFormat              = NVSIndirectDrawParams.InMeshDescriptors[meshDescIdx].ibFormat;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].cbv0AddressLo         = cbv0Lo;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].cbv0AddressHi         = cbv0Hi;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].cbv1AddressLo         = cbv1Lo;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].cbv1AddressHi         = cbv1Hi;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].cbv2AddressLo         = cbv2Lo;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].cbv2AddressHi         = cbv2Hi;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].srv0AddressLo         = srv0Lo;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].srv0AddressHi         = srv0Hi;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].indexCountPerInstance = finalIdxCount;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].instanceCount         = instCount;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].startIndexLocation    = finalStartIdx;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].baseVertexLocation    = finalBaseVtx;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].startInstanceLocation = 0u;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].drawContextIndex      = baseCtxIdx;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].meshDescriptorIndex   = meshDescIdx;
+                    NVSIndirectDrawParams.OutIndirectDrawCommands[globalCmdIdx].commandFlags          = drawFlags;
+
+                    UInt prevCmd = 0u;
+                    InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].validIndirectCommandsEmitted, 1u, prevCmd);
+                    UInt prevInst = 0u;
+                    InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].totalInstancesEmitted, instCount, prevInst);
+                }
+            }
+        }
+
+        UInt resFlags = (pageValid && pageAllDrawsOk) ? 1u : 6u;
+        if (pageOverflowed) {
+            resFlags = (resFlags & ~1u) | 2u;
+        }
+        resFlags = resFlags | pageDiagFlags;
+
+        if (pageOrd < physCap) {
+            NVSIndirectDrawParams.OutPageCommitRecords[pageOrd].physicalPageIndex          = physIdx;
+            NVSIndirectDrawParams.OutPageCommitRecords[pageOrd].resultFlags                = resFlags;
+            NVSIndirectDrawParams.OutPageCommitRecords[pageOrd].expectedPhysicalGeneration = physGen;
+            NVSIndirectDrawParams.OutPageCommitRecords[pageOrd].expectedVirtualFlatIndex   = vFlatIdx;
+        }
+
+        if ((resFlags & 1u) != 0u && (resFlags & 6u) == 0u) {
+            UInt prevOk = 0u;
+            InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].committablePagesCount, 1u, prevOk);
+        } else {
+            UInt prevBad = 0u;
+            InterlockedAdd(NVSIndirectDrawParams.OutTelemetry[0u].nonCommittablePagesCount, 1u, prevBad);
+        }
+    }
+}

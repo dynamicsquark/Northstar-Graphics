@@ -1,0 +1,65 @@
+// =====================================================================
+//  StandardLitShadowPS.nsl
+//  Northstar StandardLit — Alpha-Tested NVS Shadow Caster Pixel Shader
+//
+//  Paired with StandardLitShadowVS / StandardLitShadowInstancedVS /
+//  StandardLitShadowSkinnedVS / StandardLitNVGShadowVS when alpha
+//  cutout shadow casting is enabled on a StandardLit material.
+// =====================================================================
+
+STAGE PIXEL
+
+INPUT_LAYOUT
+{
+    Get(CLIP_POSITION)
+    Get(UV0)
+}
+
+OUTPUT_LAYOUT
+{
+}
+
+PROPERTY Material
+{
+    Buffer MaterialParams
+    {
+        Add(baseColor)       : Vec4  = 1.0 1.0 1.0 1.0
+        Add(alphaCutoff)     : Float = 0.5
+        Add(uvTiling)        : Vec2  = 1.0 1.0
+        Add(uvOffset)        : Vec2  = 0.0 0.0
+        Add(useBaseColorMap) : Bool  = true
+    }
+
+    Texture2D Textures
+    {
+        Add(BaseColorMap)
+    }
+
+    SamplerState Samplers
+    {
+        Add(LinearWrapSampler)
+    }
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+
+        Float alpha = Material.MaterialParams.baseColor.w;
+        if (Material.MaterialParams.useBaseColorMap)
+        {
+            Vec2 uv = input.UV0 * Material.MaterialParams.uvTiling + Material.MaterialParams.uvOffset;
+            Vec4 texSample = Material.Textures.BaseColorMap.Sample(Material.Samplers.LinearWrapSampler, uv);
+            alpha = alpha * texSample.w;
+        }
+
+        if (Material.MaterialParams.alphaCutoff > 0.0)
+        {
+            Clip(alpha - Material.MaterialParams.alphaCutoff);
+        }
+
+        return o;
+    }
+}

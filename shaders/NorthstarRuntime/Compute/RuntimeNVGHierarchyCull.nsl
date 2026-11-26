@@ -1,0 +1,1000 @@
+// =====================================================================
+//  RuntimeNVGHierarchyCull.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — GPU BVH Traversal, Cluster Culling,
+//  Perspective & Orthographic Screen-Space LOD Cut, Crack-Free Residency
+//  Fallback, GPU Page Faulting & Two-Phase HZB Occlusion Culling
+//
+//  Dispatch Modes:
+//    Mode 0 (TRAVERSE_BVH_STEP):
+//      Reads InNodeQueue[0 .. srcCount-1], frustum-culls & LOD-range-culls
+//      hierarchy nodes, enqueues child nodes into OutNodeQueue or leaf
+//      clusters into OutCandidateClusters.
+//    Mode 1 (EVALUATE_CLUSTERS_PHASE1):
+//      Evaluates OutCandidateClusters: exact perspective/ortho screen-space
+//      DAG LOD cut, crack-free InGroupActiveMask residency fallback + GPU
+//      page fault request emission, cluster frustum cull, conservative
+//      backface normal-cone cull, small-cluster cull, Phase-1 prev-HZB cull
+//      (saving occluded clusters to OutOccludedClusters), and writes
+//      surviving clusters to OutVisibleClusters.
+//    Mode 2 (EVALUATE_CLUSTERS_PHASE2):
+//      Re-tests OutOccludedClusters against fresh current-frame HZB with
+//      currViewProj; disoccluded survivors are emitted with
+//      NVG_VIS_FLAG_DISOCCLUDED into OutVisibleClusters.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGHierarchyCullParams {
+    Buffer Config {
+        Add(dispatchMode)            : UInt  = 0
+        Add(srcCounterIndex)         : UInt  = 0
+        Add(dstNodeCounterIndex)     : UInt  = 1
+        Add(maxNodeQueueCapacity)    : UInt  = 131072
+        Add(maxCandidateCapacity)    : UInt  = 262144
+        Add(maxVisibleCapacity)      : UInt  = 262144
+        Add(maxOccludedClusterCap)   : UInt  = 262144
+        Add(bvhNodeCount)            : UInt  = 0
+        Add(clusterMetaCount)        : UInt  = 0
+        Add(clusterGroupCount)       : UInt  = 0
+        Add(virtualPageCount)        : UInt  = 0
+        Add(materialTableCount)      : UInt  = 0
+        Add(maxScreenErrorPixels)    : Float = 1.0
+        Add(lodProjScale)            : Float = 540.0
+        Add(cameraNearPlane)         : Float = 0.1
+        Add(isOrthographic)          : UInt  = 0
+        Add(enableConeCulling)       : UInt  = 1
+        Add(enableSmallClusterCull)  : UInt  = 1
+        Add(smallClusterPixelThresh) : Float = 0.75
+        Add(enableHZBOcclusion)      : UInt  = 1
+        Add(enableTwoPhase)          : UInt  = 1
+        Add(hasPrevHZB)              : UInt  = 0
+        Add(isReversedZ)             : UInt  = 0
+        Add(viewportWidth)           : Float = 1280.0
+        Add(viewportHeight)          : Float = 720.0
+        Add(hzbWidth)                : UInt  = 1
+        Add(hzbHeight)               : UInt  = 1
+        Add(hzbMipCount)             : UInt  = 1
+        Add(lodCameraPos)            : Vec3
+        Add(phase2ResetMode)         : UInt  = 0
+        Add(cameraForward)           : Vec3
+        Add(reserved0)               : UInt  = 0
+        Add(frustumPlane0)           : Vec4
+        Add(frustumPlane1)           : Vec4
+        Add(frustumPlane2)           : Vec4
+        Add(frustumPlane3)           : Vec4
+        Add(frustumPlane4)           : Vec4
+        Add(frustumPlane5)           : Vec4
+        Add(prevViewProj)            : Mat4
+        Add(currViewProj)            : Mat4
+    }
+    Texture2D InTextures {
+        Add(HZBTexture)
+    }
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : Int
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldMatrix)         : Mat4
+    }
+    StructuredBuffer InMaterialTable {
+        Add(materialId)               : UInt
+        Add(nvgFlags)                 : UInt
+        Add(opaqueBucketIndex)        : UInt
+        Add(depthBucketIndex)         : UInt
+        Add(transparentBucketIndex)   : UInt
+        Add(shadowBucketIndex)        : UInt
+        Add(opaqueInstBucketIndex)    : UInt
+        Add(shadowInstBucketIndex)    : UInt
+        Add(maxWorldDisplacement)     : Float
+        Add(lodErrorScale)            : Float
+        Add(shadowLodErrorScale)      : Float
+        Add(compatStatus)             : UInt
+        Add(depthInstBucketIndex)     : UInt
+        Add(transInstBucketIndex)     : UInt
+        Add(skinnedOpaqueBucketIndex) : UInt
+        Add(skinnedShadowBucketIndex) : UInt
+    }
+    StructuredBuffer InBVHNodes {
+        Add(boundsMin)          : Vec3
+        Add(childStart)         : UInt
+        Add(boundsMax)          : Vec3
+        Add(childCountAndFlags) : UInt
+        Add(lodSphere)          : Vec4
+        Add(maxParentError)     : Float
+        Add(minSelfError)       : Float
+        Add(meshId)             : UInt
+        Add(reserved)           : UInt
+    }
+    StructuredBuffer InClusterMeta {
+        Add(meshId)                   : UInt
+        Add(clusterLocalIndex)        : UInt
+        Add(virtualPageId)            : UInt
+        Add(clusterWordOffsetInPage)  : UInt
+        Add(countsAndLod)             : UInt
+        Add(selfGroupIndex)           : UInt
+        Add(parentGroupIndex)         : UInt
+        Add(refinedByChildGroupStart) : UInt
+        Add(aabbMin)                  : Vec3
+        Add(selfGroupError)           : Float
+        Add(aabbMax)                  : Vec3
+        Add(parentGroupError)         : Float
+        Add(selfGroupSphere)          : Vec4
+        Add(parentGroupSphere)        : Vec4
+        Add(normalConeAxisAndSin)     : Vec4
+        Add(thinFeatureMetric)        : Float
+        Add(maxEdgeLength)            : Float
+        Add(refinedByChildGroupCount) : UInt
+        Add(clusterFlags)             : UInt
+    }
+    StructuredBuffer InClusterGroups {
+        Add(meshId)             : UInt
+        Add(lodLevel)           : UInt
+        Add(clusterStart)       : UInt
+        Add(clusterCount)       : UInt
+        Add(parentGroupIndex)   : UInt
+        Add(childGroupStart)    : UInt
+        Add(childGroupCount)    : UInt
+        Add(firstVirtualPageId) : UInt
+        Add(groupSphere)        : Vec4
+    }
+    StructuredBuffer InVirtualPageTable {
+        Add(stateAndFlags)     : UInt
+        Add(physicalPageIndex) : UInt
+        Add(pageGeneration)    : UInt
+        Add(meshIdAndLod)      : UInt
+    }
+    StructuredBuffer InGroupActiveMask {
+        Add(active) : UInt
+    }
+    StructuredBuffer InNodeQueue {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutNodeQueue {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutCandidateClusters {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutOccludedClusters {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutVisibleClusters {
+        Add(objectSlotIndex)   : UInt
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(virtualPageId)     : UInt
+        Add(lodAndFlags)       : UInt
+        Add(geometricError)    : Float
+        Add(materialId)        : UInt
+        Add(bonePaletteOffset) : UInt
+        Add(boneCount)         : UInt
+        Add(drawBucketIndex)   : UInt
+        Add(viewDepthKey)      : Float
+    }
+    RWStructuredBuffer OutQueueCounters {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutBucketCounts {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutPageRequests {
+        Add(priority) : UInt
+    }
+    RWStructuredBuffer OutTelemetry {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+    void TransformLocalAABBToWorld(Mat4 worldMat, Vec3 lMin, Vec3 lMax, Float pad, out Vec3 wMin, out Vec3 wMax) {
+        Vec3 lCenter = (lMin + lMax) * 0.5;
+        Vec3 lExt    = (lMax - lMin) * 0.5;
+
+        Vec3 col0 = Mul(worldMat, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3 col1 = Mul(worldMat, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3 col2 = Mul(worldMat, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+
+        Vec3 wCenter = Mul(worldMat, Vec4(lCenter, 1.0)).xyz;
+        Vec3 wExt = Abs(col0) * lExt.x + Abs(col1) * lExt.y + Abs(col2) * lExt.z + Vec3(pad, pad, pad);
+        wMin = wCenter - wExt;
+        wMax = wCenter + wExt;
+    }
+
+    Float GetWorldMaxAxisScale(Mat4 worldMat) {
+        Vec3 col0  = Mul(worldMat, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3 col1  = Mul(worldMat, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3 col2  = Mul(worldMat, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        Float s0Sq = Dot(col0, col0);
+        Float s1Sq = Dot(col1, col1);
+        Float s2Sq = Dot(col2, col2);
+        Float maxSq = Max(Max(s0Sq, s1Sq), s2Sq);
+        Float offDiag = Abs(Dot(col0, col1)) + Abs(Dot(col0, col2)) + Abs(Dot(col1, col2));
+        if (offDiag > (0.0001 * maxSq)) {
+            // Frobenius norm upper bound >= sigma_max(M) for arbitrarily sheared 3x3 linear transforms
+            return Sqrt(Max(s0Sq + s1Sq + s2Sq, 1.0e-10));
+        }
+        return Sqrt(Max(maxSq, 1.0e-10));
+    }
+
+    Float ComputeWorldMatrixDet3x3(Mat4 worldMat) {
+        Vec3 col0 = Mul(worldMat, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3 col1 = Mul(worldMat, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3 col2 = Mul(worldMat, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        return Dot(col0, Cross(col1, col2));
+    }
+
+    Bool TestWorldAABBFrustum(Vec3 bMin, Vec3 bMax) {
+        Vec4 planes[6];
+        planes[0] = NVGHierarchyCullParams.Config.frustumPlane0;
+        planes[1] = NVGHierarchyCullParams.Config.frustumPlane1;
+        planes[2] = NVGHierarchyCullParams.Config.frustumPlane2;
+        planes[3] = NVGHierarchyCullParams.Config.frustumPlane3;
+        planes[4] = NVGHierarchyCullParams.Config.frustumPlane4;
+        planes[5] = NVGHierarchyCullParams.Config.frustumPlane5;
+
+        for (UInt i = 0u; i < 6u; i = i + 1u) {
+            Vec3 n = planes[i].xyz;
+            Vec3 pVertex = Vec3(
+                (n.x >= 0.0) ? bMax.x : bMin.x,
+                (n.y >= 0.0) ? bMax.y : bMin.y,
+                (n.z >= 0.0) ? bMax.z : bMin.z);
+            if (Dot(n, pVertex) + planes[i].w < 0.0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    Float ComputeProjectedErrorPixels(Vec4 localSphere, Float localError, Mat4 worldMat, Float maxScale) {
+        if (localError <= 0.0) {
+            return 0.0;
+        }
+        if (localError >= 1.0e20) {
+            return 1.0e20;
+        }
+        Float worldError = localError * maxScale;
+        if (NVGHierarchyCullParams.Config.isOrthographic != 0u) {
+            return worldError * NVGHierarchyCullParams.Config.lodProjScale;
+        }
+        Vec3  wCenter = Mul(worldMat, Vec4(localSphere.xyz, 1.0)).xyz;
+        Float wRadius = localSphere.w * maxScale;
+        Float dist    = Length(wCenter - NVGHierarchyCullParams.Config.lodCameraPos) - wRadius;
+        Float safeD   = Max(dist, Max(NVGHierarchyCullParams.Config.cameraNearPlane, 0.001));
+        return (worldError * NVGHierarchyCullParams.Config.lodProjScale) / safeD;
+    }
+
+    Bool TestWorldAABBOccludedByHZB(Vec3 bMin, Vec3 bMax, Mat4 vpMatrix) {
+        Float minX = 1.0;
+        Float minY = 1.0;
+        Float maxX = 0.0;
+        Float maxY = 0.0;
+        UInt isRevZ = NVGHierarchyCullParams.Config.isReversedZ;
+        Float closestZ = (isRevZ != 0u) ? 0.0 : 1.0;
+
+        for (UInt ci = 0u; ci < 8u; ci = ci + 1u) {
+            Vec3 corner = Vec3(
+                ((ci & 1u) != 0u) ? bMax.x : bMin.x,
+                ((ci & 2u) != 0u) ? bMax.y : bMin.y,
+                ((ci & 4u) != 0u) ? bMax.z : bMin.z);
+            Vec4 clip = Mul(vpMatrix, Vec4(corner, 1.0));
+            if (clip.w <= 0.0001) {
+                return false;
+            }
+            Float invW = 1.0 / clip.w;
+            Float uvX  = (clip.x * invW) * 0.5 + 0.5;
+            Float uvY  = 0.5 - (clip.y * invW) * 0.5;
+            Float ndcZ = clip.z * invW;
+
+            minX = Min(minX, uvX);
+            minY = Min(minY, uvY);
+            maxX = Max(maxX, uvX);
+            maxY = Max(maxY, uvY);
+            if (isRevZ != 0u) {
+                closestZ = Max(closestZ, ndcZ);
+            } else {
+                closestZ = Min(closestZ, ndcZ);
+            }
+        }
+
+        minX = Clamp(minX, 0.0, 1.0);
+        minY = Clamp(minY, 0.0, 1.0);
+        maxX = Clamp(maxX, 0.0, 1.0);
+        maxY = Clamp(maxY, 0.0, 1.0);
+        if (maxX <= minX || maxY <= minY) {
+            return false;
+        }
+
+        Int baseW = Int(Max(NVGHierarchyCullParams.Config.hzbWidth, 1u));
+        Int baseH = Int(Max(NVGHierarchyCullParams.Config.hzbHeight, 1u));
+        Int ix0   = Clamp(Int(Floor(minX * Float(baseW))), 0, baseW - 1);
+        Int iy0   = Clamp(Int(Floor(minY * Float(baseH))), 0, baseH - 1);
+        Int ix1   = Clamp(Int(Floor(maxX * Float(baseW))), 0, baseW - 1);
+        Int iy1   = Clamp(Int(Floor(maxY * Float(baseH))), 0, baseH - 1);
+
+        Float spanPx = Float(Max(ix1 - ix0, iy1 - iy0));
+        Float mipF   = (spanPx > 1.0) ? Ceil(Log2(spanPx)) : 0.0;
+        UInt  maxMip = (NVGHierarchyCullParams.Config.hzbMipCount > 0u) ? (NVGHierarchyCullParams.Config.hzbMipCount - 1u) : 0u;
+        UInt  mip    = Min(UInt(Max(mipF, 0.0)), maxMip);
+
+        for (UInt step = 0u; step < 16u; step = step + 1u) {
+            if (mip >= maxMip) {
+                break;
+            }
+            Int tx0 = ix0 >> Int(mip);
+            Int tx1 = ix1 >> Int(mip);
+            Int ty0 = iy0 >> Int(mip);
+            Int ty1 = iy1 >> Int(mip);
+            if ((tx1 - tx0) <= 1 && (ty1 - ty0) <= 1) {
+                break;
+            }
+            mip = mip + 1u;
+        }
+
+        Int mipMaxX = Int(Max(NVGHierarchyCullParams.Config.hzbWidth >> mip, 1u)) - 1;
+        Int mipMaxY = Int(Max(NVGHierarchyCullParams.Config.hzbHeight >> mip, 1u)) - 1;
+        Int x0 = Clamp(ix0 >> Int(mip), 0, mipMaxX);
+        Int y0 = Clamp(iy0 >> Int(mip), 0, mipMaxY);
+        Int x1 = Clamp(ix1 >> Int(mip), 0, mipMaxX);
+        Int y1 = Clamp(iy1 >> Int(mip), 0, mipMaxY);
+
+        if (isRevZ != 0u) {
+            Float farOccZ = 1.0;
+            for (Int sy = y0; sy <= y1; sy = sy + 1) {
+                for (Int sx = x0; sx <= x1; sx = sx + 1) {
+                    Float d = NVGHierarchyCullParams.InTextures.HZBTexture.Load(Int3(sx, sy, Int(mip))).x;
+                    farOccZ = Min(farOccZ, d);
+                }
+            }
+            return (closestZ + 0.00001) < farOccZ;
+        } else {
+            Float farOccZ = 0.0;
+            for (Int sy = y0; sy <= y1; sy = sy + 1) {
+                for (Int sx = x0; sx <= x1; sx = sx + 1) {
+                    Float d = NVGHierarchyCullParams.InTextures.HZBTexture.Load(Int3(sx, sy, Int(mip))).x;
+                    farOccZ = Max(farOccZ, d);
+                }
+            }
+            return (closestZ - 0.00001) > farOccZ;
+        }
+    }
+
+    Bool TestSmallClusterCulled(Vec3 bMin, Vec3 bMax, Mat4 vpMatrix) {
+        Float thresh = NVGHierarchyCullParams.Config.smallClusterPixelThresh;
+        if (NVGHierarchyCullParams.Config.enableSmallClusterCull == 0u || thresh <= 0.0) {
+            return false;
+        }
+        Float vpW  = NVGHierarchyCullParams.Config.viewportWidth;
+        Float vpH  = NVGHierarchyCullParams.Config.viewportHeight;
+        Float minX = 1.0e9;
+        Float minY = 1.0e9;
+        Float maxX = -1.0e9;
+        Float maxY = -1.0e9;
+        for (UInt ci = 0u; ci < 8u; ci = ci + 1u) {
+            Vec3 corner = Vec3(
+                ((ci & 1u) != 0u) ? bMax.x : bMin.x,
+                ((ci & 2u) != 0u) ? bMax.y : bMin.y,
+                ((ci & 4u) != 0u) ? bMax.z : bMin.z);
+            Vec4 clip = Mul(vpMatrix, Vec4(corner, 1.0));
+            if (clip.w <= 0.0001) {
+                return false;
+            }
+            Float invW = 1.0 / clip.w;
+            Float px = ((clip.x * invW) * 0.5 + 0.5) * vpW;
+            Float py = (0.5 - (clip.y * invW) * 0.5) * vpH;
+            minX = Min(minX, px);
+            minY = Min(minY, py);
+            maxX = Max(maxX, px);
+            maxY = Max(maxY, py);
+        }
+        if (maxX <= 0.0 || minX >= vpW || maxY <= 0.0 || minY >= vpH) {
+            return true;
+        }
+        // Exact hardware rasterizer sample-center test: a projected AABB [min, max] misses ALL pixel centers
+        // (k + 0.5) iff [min - 0.5, max - 0.5] contains zero integers k. Preserves 100% continuous surfaces
+        // with zero sub-pixel pinholes at extreme distances while culling genuinely between-sample micro-clusters!
+        Bool missesSampleCenters =
+            (Ceil(minX - 0.501) > Floor(maxX - 0.499)) ||
+            (Ceil(minY - 0.501) > Floor(maxY - 0.499));
+        if (missesSampleCenters) {
+            return true;
+        }
+        if (thresh > 1.001) {
+            return (Max(maxX - minX, maxY - minY) < (thresh - 1.0));
+        }
+        return false;
+    }
+
+    void EmitVisibleCluster(
+        UInt  objSlot,
+        UInt  clusterId,
+        UInt  bucketIdx,
+        UInt  visFlags,
+        UInt  lodLevel,
+        UInt  virtualPageId,
+        UInt  physPageIdx,
+        UInt  clusterWordOff,
+        Float projError,
+        UInt  matId,
+        UInt  objFlags,
+        UInt  batchGrp,
+        Float viewDepthKey)
+    {
+        UInt prev = 0u;
+        UInt dst  = 0u;
+        InterlockedAdd(NVGHierarchyCullParams.OutQueueCounters[3u].count, 1u, dst);
+        if (dst >= NVGHierarchyCullParams.Config.maxVisibleCapacity) {
+            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[15u].word, 1u, prev); // overflowDroppedClusters
+            return;
+        }
+
+        UInt boneOff = 0u;
+        UInt boneCnt = 0u;
+        if ((objFlags & 1024u) != 0u) {
+            boneOff = batchGrp;
+            boneCnt = (NVGHierarchyCullParams.InGPUSceneObjects[objSlot].renderObjectFlags >> 16u) & 65535u;
+        }
+
+        NVGHierarchyCullParams.OutVisibleClusters[dst].objectSlotIndex   = objSlot;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].clusterId         = clusterId;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].physicalPageIndex = physPageIdx;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].clusterWordOffset = clusterWordOff;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].virtualPageId     = virtualPageId;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].lodAndFlags       = (lodLevel & 255u) | ((visFlags & 255u) << 8u);
+        NVGHierarchyCullParams.OutVisibleClusters[dst].geometricError    = projError;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].materialId        = matId;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].bonePaletteOffset = boneOff;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].boneCount         = boneCnt;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].drawBucketIndex   = bucketIdx;
+        NVGHierarchyCullParams.OutVisibleClusters[dst].viewDepthKey      = viewDepthKey;
+
+        InterlockedAdd(NVGHierarchyCullParams.OutBucketCounts[bucketIdx].count, 1u, prev);
+
+        if ((visFlags & 8u) != 0u) {
+            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[9u].word, 1u, prev); // visibleTransparentClusters
+        } else {
+            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[8u].word, 1u, prev); // visibleOpaqueClusters
+        }
+        if ((visFlags & 2u) != 0u) {
+            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[10u].word, 1u, prev); // disocclusionRecovered
+        }
+        UInt histBin = Min(lodLevel, 7u);
+        InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[20u + histBin].word, 1u, prev);
+        InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[36u].word, lodLevel, prev); // cameraLODSum
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt tid        = dtid.x;
+        UInt mode       = NVGHierarchyCullParams.Config.dispatchMode;
+        UInt invalidIdx = ~0u;
+        UInt prev       = 0u;
+
+        // =================================================================
+        //  MODE 0: Coarse-to-Fine BVH Traversal Step (Grid-Stride Unlimited)
+        // =================================================================
+        if (mode == 0u) {
+            UInt srcCounter = NVGHierarchyCullParams.Config.srcCounterIndex;
+            UInt srcCount   = Min(NVGHierarchyCullParams.OutQueueCounters[srcCounter].count,
+                                  NVGHierarchyCullParams.Config.maxNodeQueueCapacity);
+            for (UInt itemIdx = dtid.x; itemIdx < srcCount; itemIdx = itemIdx + 4194240u) {
+                UInt objSlot   = NVGHierarchyCullParams.InNodeQueue[itemIdx].objectSlotIndex;
+                UInt nodeId    = NVGHierarchyCullParams.InNodeQueue[itemIdx].nodeOrClusterId;
+                UInt bucketIdx = NVGHierarchyCullParams.InNodeQueue[itemIdx].drawBucketHint;
+                UInt auxFlags  = NVGHierarchyCullParams.InNodeQueue[itemIdx].auxData;
+
+                if (nodeId >= NVGHierarchyCullParams.Config.bvhNodeCount) {
+                    continue;
+                }
+
+                Mat4 worldMat = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].worldMatrix;
+                UInt objFlags = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].objectFlags;
+                UInt matId    = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialId;
+
+                Float disp = 0.0;
+                Float matLodScale = 1.0;
+                UInt  matFlags = 0u;
+                if (matId < NVGHierarchyCullParams.Config.materialTableCount) {
+                    disp        = Max(NVGHierarchyCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                    matLodScale = Max(NVGHierarchyCullParams.InMaterialTable[matId].lodErrorScale, 0.001);
+                    matFlags    = NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags;
+                }
+
+                Vec3 nMin = NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMin;
+                Vec3 nMax = NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMax;
+
+                // Frustum cull BVH node AABB (GPU_SCENE_OBJ_FRUSTUM_CULL = 1 << 5 = 32)
+                if ((objFlags & 32u) != 0u) {
+                    Vec3 wMin = Vec3(0.0, 0.0, 0.0);
+                    Vec3 wMax = Vec3(0.0, 0.0, 0.0);
+                    TransformLocalAABBToWorld(worldMat, nMin, nMax, disp, wMin, wMax);
+                    if (!TestWorldAABBFrustum(wMin, wMax)) {
+                        continue;
+                    }
+                }
+
+                // Conservative LOD early-out: if EVERY cluster in subtree has parentGroupError <= threshold,
+                // no cluster in this subtree can possibly pass the parent cut (unless lockToLOD0 is set).
+                Bool  lockLod0 = ((matFlags & 64u) != 0u);
+                Float maxScale = GetWorldMaxAxisScale(worldMat);
+                Float thresh   = Max(NVGHierarchyCullParams.Config.maxScreenErrorPixels * matLodScale, 0.001);
+                if (!lockLod0) {
+                    Float maxParentProj = ComputeProjectedErrorPixels(
+                        NVGHierarchyCullParams.InBVHNodes[nodeId].lodSphere,
+                        NVGHierarchyCullParams.InBVHNodes[nodeId].maxParentError,
+                        worldMat, maxScale);
+                    if (maxParentProj <= thresh) {
+                        continue;
+                    }
+                }
+
+                UInt childStart = NVGHierarchyCullParams.InBVHNodes[nodeId].childStart;
+                UInt cPacked    = NVGHierarchyCullParams.InBVHNodes[nodeId].childCountAndFlags;
+                UInt childCount = cPacked & 65535u;
+                Bool isLeaf     = ((cPacked & 65536u) != 0u);
+
+                if (isLeaf) {
+                    UInt clampedLeafCnt = Min(childCount, 16u);
+                    UInt passMask       = 0u;
+                    UInt passCnt        = 0u;
+                    for (UInt c = 0u; c < clampedLeafCnt; c = c + 1u) {
+                        UInt cid = childStart + c;
+                        if (cid >= NVGHierarchyCullParams.Config.clusterMetaCount) {
+                            continue;
+                        }
+                        if (!lockLod0) {
+                            Float pProj = ComputeProjectedErrorPixels(
+                                NVGHierarchyCullParams.InClusterMeta[cid].parentGroupSphere,
+                                NVGHierarchyCullParams.InClusterMeta[cid].parentGroupError,
+                                worldMat, maxScale);
+                            if (pProj <= thresh) {
+                                continue;
+                            }
+                        }
+                        UInt selfGrp = NVGHierarchyCullParams.InClusterMeta[cid].selfGroupIndex;
+                        Bool grpAct  = (selfGrp < NVGHierarchyCullParams.Config.clusterGroupCount) &&
+                                       (NVGHierarchyCullParams.InGroupActiveMask[selfGrp].active != 0u);
+                        if (grpAct) {
+                            UInt chGrpCnt = NVGHierarchyCullParams.InClusterMeta[cid].refinedByChildGroupCount;
+                            if (chGrpCnt > 0u) {
+                                UInt  cLod = (NVGHierarchyCullParams.InClusterMeta[cid].countsAndLod >> 16u) & 255u;
+                                Float sProj = ComputeProjectedErrorPixels(
+                                    NVGHierarchyCullParams.InClusterMeta[cid].selfGroupSphere,
+                                    NVGHierarchyCullParams.InClusterMeta[cid].selfGroupError,
+                                    worldMat, maxScale);
+                                Bool wantsRef = lockLod0 ? (cLod > 0u) : (sProj > thresh);
+                                if (wantsRef) {
+                                    UInt chGrpId = NVGHierarchyCullParams.InClusterMeta[cid].refinedByChildGroupStart;
+                                    Bool chAct   = (chGrpId < NVGHierarchyCullParams.Config.clusterGroupCount);
+                                    UInt clChCnt = Min(chGrpCnt, 16u);
+                                    for (UInt cg = 0u; cg < clChCnt; cg = cg + 1u) {
+                                        UInt curCg = chGrpId + cg;
+                                        if (curCg >= NVGHierarchyCullParams.Config.clusterGroupCount ||
+                                            NVGHierarchyCullParams.InGroupActiveMask[curCg].active == 0u) {
+                                            chAct = false;
+                                            break;
+                                        }
+                                    }
+                                    if (chAct) {
+                                        // Finer child group(s) are already active in the cut -> skip ancestor before queueing!
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else {
+                            // Non-resident cluster: skip if already resident-flagged or outside camera frustum
+                            UInt sVP = NVGHierarchyCullParams.InClusterMeta[cid].virtualPageId;
+                            if (sVP >= NVGHierarchyCullParams.Config.virtualPageCount ||
+                                (NVGHierarchyCullParams.InVirtualPageTable[sVP].stateAndFlags & 1u) != 0u) {
+                                continue;
+                            }
+                            if ((objFlags & 32u) != 0u) {
+                                Vec3 cMin = Vec3(0.0, 0.0, 0.0);
+                                Vec3 cMax = Vec3(0.0, 0.0, 0.0);
+                                TransformLocalAABBToWorld(
+                                    worldMat,
+                                    NVGHierarchyCullParams.InClusterMeta[cid].aabbMin,
+                                    NVGHierarchyCullParams.InClusterMeta[cid].aabbMax,
+                                    disp, cMin, cMax);
+                                if (!TestWorldAABBFrustum(cMin, cMax)) {
+                                    continue;
+                                }
+                            }
+                        }
+                        passMask = passMask | (1u << c);
+                        passCnt  = passCnt + 1u;
+                    }
+
+                    if (passCnt > 0u) {
+                        UInt baseDst = 0u;
+                        InterlockedAdd(NVGHierarchyCullParams.OutQueueCounters[2u].count, passCnt, baseDst);
+                        UInt maxCand = NVGHierarchyCullParams.Config.maxCandidateCapacity;
+                        if (baseDst + passCnt > maxCand) {
+                            UInt dropped = (baseDst >= maxCand) ? passCnt : ((baseDst + passCnt) - maxCand);
+                            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[15u].word, dropped, prev);
+                        }
+                        UInt localOut = 0u;
+                        for (UInt c = 0u; c < clampedLeafCnt; c = c + 1u) {
+                            if ((passMask & (1u << c)) != 0u) {
+                                UInt wIdx = baseDst + localOut;
+                                localOut  = localOut + 1u;
+                                if (wIdx < maxCand) {
+                                    NVGHierarchyCullParams.OutCandidateClusters[wIdx].objectSlotIndex = objSlot;
+                                    NVGHierarchyCullParams.OutCandidateClusters[wIdx].nodeOrClusterId = childStart + c;
+                                    NVGHierarchyCullParams.OutCandidateClusters[wIdx].drawBucketHint  = bucketIdx;
+                                    NVGHierarchyCullParams.OutCandidateClusters[wIdx].auxData         = auxFlags;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    UInt clampedChildCnt = Min(childCount, 16u);
+                    UInt childMask       = 0u;
+                    UInt childPassCnt    = 0u;
+                    for (UInt c = 0u; c < clampedChildCnt; c = c + 1u) {
+                        UInt childNodeId = childStart + c;
+                        if (childNodeId >= NVGHierarchyCullParams.Config.bvhNodeCount) {
+                            continue;
+                        }
+                        if ((objFlags & 32u) != 0u) {
+                            Vec3 cwMin = Vec3(0.0, 0.0, 0.0);
+                            Vec3 cwMax = Vec3(0.0, 0.0, 0.0);
+                            TransformLocalAABBToWorld(
+                                worldMat,
+                                NVGHierarchyCullParams.InBVHNodes[childNodeId].boundsMin,
+                                NVGHierarchyCullParams.InBVHNodes[childNodeId].boundsMax,
+                                disp, cwMin, cwMax);
+                            if (!TestWorldAABBFrustum(cwMin, cwMax)) {
+                                continue;
+                            }
+                        }
+                        if (!lockLod0) {
+                            Float chProj = ComputeProjectedErrorPixels(
+                                NVGHierarchyCullParams.InBVHNodes[childNodeId].lodSphere,
+                                NVGHierarchyCullParams.InBVHNodes[childNodeId].maxParentError,
+                                worldMat, maxScale);
+                            if (chProj <= thresh) {
+                                continue;
+                            }
+                        }
+                        childMask    = childMask | (1u << c);
+                        childPassCnt = childPassCnt + 1u;
+                    }
+
+                    if (childPassCnt > 0u) {
+                        UInt dstCounter = NVGHierarchyCullParams.Config.dstNodeCounterIndex;
+                        UInt baseDst    = 0u;
+                        InterlockedAdd(NVGHierarchyCullParams.OutQueueCounters[dstCounter].count, childPassCnt, baseDst);
+                        UInt maxNodes = NVGHierarchyCullParams.Config.maxNodeQueueCapacity;
+                        if (baseDst + childPassCnt > maxNodes) {
+                            UInt dropped = (baseDst >= maxNodes) ? childPassCnt : ((baseDst + childPassCnt) - maxNodes);
+                            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[15u].word, dropped, prev);
+                        }
+                        UInt localOut = 0u;
+                        for (UInt c = 0u; c < clampedChildCnt; c = c + 1u) {
+                            if ((childMask & (1u << c)) != 0u) {
+                                UInt wIdx = baseDst + localOut;
+                                localOut  = localOut + 1u;
+                                if (wIdx < maxNodes) {
+                                    NVGHierarchyCullParams.OutNodeQueue[wIdx].objectSlotIndex = objSlot;
+                                    NVGHierarchyCullParams.OutNodeQueue[wIdx].nodeOrClusterId = childStart + c;
+                                    NVGHierarchyCullParams.OutNodeQueue[wIdx].drawBucketHint  = bucketIdx;
+                                    NVGHierarchyCullParams.OutNodeQueue[wIdx].auxData         = auxFlags;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1 (Phase 1) & MODE 2 (Phase 2 Disocclusion Recovery):
+        //  Cluster LOD Cut, Residency Fallback, Faulting & Culling (Grid-Stride Unlimited)
+        // =================================================================
+        Bool isPhase2 = (mode == 2u);
+        UInt candCount = isPhase2
+            ? Min(NVGHierarchyCullParams.OutQueueCounters[4u].count, NVGHierarchyCullParams.Config.maxOccludedClusterCap)
+            : Min(NVGHierarchyCullParams.OutQueueCounters[2u].count, NVGHierarchyCullParams.Config.maxCandidateCapacity);
+        for (UInt curTid = dtid.x; curTid < candCount; curTid = curTid + 4194240u) {
+            UInt objSlot   = isPhase2
+                ? NVGHierarchyCullParams.OutOccludedClusters[curTid].objectSlotIndex
+                : NVGHierarchyCullParams.OutCandidateClusters[curTid].objectSlotIndex;
+            UInt clusterId = isPhase2
+                ? NVGHierarchyCullParams.OutOccludedClusters[curTid].nodeOrClusterId
+                : NVGHierarchyCullParams.OutCandidateClusters[curTid].nodeOrClusterId;
+            UInt bucketIdx = isPhase2
+                ? NVGHierarchyCullParams.OutOccludedClusters[curTid].drawBucketHint
+                : NVGHierarchyCullParams.OutCandidateClusters[curTid].drawBucketHint;
+            UInt auxFlags  = isPhase2
+                ? NVGHierarchyCullParams.OutOccludedClusters[curTid].auxData
+                : NVGHierarchyCullParams.OutCandidateClusters[curTid].auxData;
+
+            if (clusterId >= NVGHierarchyCullParams.Config.clusterMetaCount) {
+                continue;
+            }
+
+            Mat4 worldMat = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].worldMatrix;
+            UInt objFlags = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].objectFlags;
+            UInt batchGrp = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].batchGroupId;
+            UInt matId    = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialId;
+
+            Float disp        = 0.0;
+            Float matLodScale = 1.0;
+            UInt  matFlags    = 0u;
+            if (matId < NVGHierarchyCullParams.Config.materialTableCount) {
+                disp        = Max(NVGHierarchyCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                matLodScale = Max(NVGHierarchyCullParams.InMaterialTable[matId].lodErrorScale, 0.001);
+                matFlags    = NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags;
+            }
+
+            UInt selfGroup   = NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupIndex;
+            UInt countsLod   = NVGHierarchyCullParams.InClusterMeta[clusterId].countsAndLod;
+            UInt lodLevel    = (countsLod >> 16u) & 255u;
+            UInt selfVP      = NVGHierarchyCullParams.InClusterMeta[clusterId].virtualPageId;
+            UInt wordOff     = NVGHierarchyCullParams.InClusterMeta[clusterId].clusterWordOffsetInPage;
+            UInt childGrpId  = NVGHierarchyCullParams.InClusterMeta[clusterId].refinedByChildGroupStart;
+            UInt childGrpCnt = NVGHierarchyCullParams.InClusterMeta[clusterId].refinedByChildGroupCount;
+
+            // 1. Watertight Residency Check: own group active-chain MUST be 1 to emit geometry.
+            //    Symmetric priority formula [262144 .. 802815] guarantees missing faults and resident keepPrio
+            //    produce bit-identical priorities for the same DAG cut error (zero 4-frame ping-pong thrashing!).
+            Float maxScale   = GetWorldMaxAxisScale(worldMat);
+            Float threshold  = Max(NVGHierarchyCullParams.Config.maxScreenErrorPixels * matLodScale, 0.001);
+            Float parentProj = ComputeProjectedErrorPixels(
+                NVGHierarchyCullParams.InClusterMeta[clusterId].parentGroupSphere,
+                NVGHierarchyCullParams.InClusterMeta[clusterId].parentGroupError,
+                worldMat, maxScale);
+            Bool lockLod0     = ((matFlags & 64u) != 0u);
+            Bool parentPasses = lockLod0 ? true : (parentProj > threshold);
+
+            if (selfGroup >= NVGHierarchyCullParams.Config.clusterGroupCount ||
+                NVGHierarchyCullParams.InGroupActiveMask[selfGroup].active == 0u)
+            {
+                if (!isPhase2 && parentPasses && selfVP < NVGHierarchyCullParams.Config.virtualPageCount)
+                {
+                    UInt vpFlags = NVGHierarchyCullParams.InVirtualPageTable[selfVP].stateAndFlags;
+                    if ((vpFlags & 1u) == 0u)
+                    {
+                        Bool inView = true;
+                        if ((objFlags & 32u) != 0u)
+                        {
+                            Vec3 cMin = Vec3(0.0, 0.0, 0.0);
+                            Vec3 cMax = Vec3(0.0, 0.0, 0.0);
+                            TransformLocalAABBToWorld(
+                                worldMat,
+                                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMin,
+                                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMax,
+                                disp, cMin, cMax);
+                            inView = TestWorldAABBFrustum(cMin, cMax);
+                        }
+                        if (inView)
+                        {
+                            UInt prio = 262144u + Min(UInt(Min(parentProj, 8000.0) * 64.0), 524287u) + (Min(lodLevel, 31u) * 512u);
+                            if (NVGHierarchyCullParams.OutPageRequests[selfVP].priority < prio)
+                            {
+                                InterlockedMax(NVGHierarchyCullParams.OutPageRequests[selfVP].priority, prio, prev);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (!isPhase2) {
+                InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[3u].word, 1u, prev); // clustersTested
+            }
+
+            // 2. Exact Screen-Space DAG LOD Cut + Crack-Free Ancestor Fallback & Page Faulting
+            if (!parentPasses) {
+                continue;
+            }
+
+            Float selfProj = ComputeProjectedErrorPixels(
+                NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupSphere,
+                NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupError,
+                worldMat, maxScale);
+
+            Bool wantsRefine = (childGrpCnt > 0u) && (lockLod0 ? (lodLevel > 0u) : (selfProj > threshold));
+            UInt visFlags    = auxFlags;
+
+            if (wantsRefine) {
+                Bool childChainActive = (childGrpCnt > 0u) && (childGrpId < NVGHierarchyCullParams.Config.clusterGroupCount);
+                UInt clampedChildGrps = Min(childGrpCnt, 16u);
+                for (UInt cg = 0u; cg < clampedChildGrps; cg = cg + 1u) {
+                    UInt curCg = childGrpId + cg;
+                    if (curCg >= NVGHierarchyCullParams.Config.clusterGroupCount ||
+                        NVGHierarchyCullParams.InGroupActiveMask[curCg].active == 0u) {
+                        childChainActive = false;
+                        break;
+                    }
+                }
+                if (childChainActive) {
+                    // Finer child group(s) are resident & active -> skip this coarser ancestor cleanly
+                    continue;
+                }
+                // Finer child page(s) are NOT resident yet -> emit deduplicated GPU page faults and draw as crack-free fallback!
+                UInt childLod = (lodLevel > 0u) ? (lodLevel - 1u) : 0u;
+                UInt prio = 262144u + Min(UInt(Min(selfProj, 8000.0) * 64.0), 524287u) + (Min(childLod, 31u) * 512u);
+                for (UInt cg = 0u; cg < clampedChildGrps; cg = cg + 1u) {
+                    UInt curCg = childGrpId + cg;
+                    if (curCg < NVGHierarchyCullParams.Config.clusterGroupCount) {
+                        UInt reqVP      = NVGHierarchyCullParams.InClusterGroups[curCg].firstVirtualPageId;
+                        UInt cgLodMeta  = NVGHierarchyCullParams.InClusterGroups[curCg].lodLevel;
+                        UInt reqPageCnt = Min(Max((cgLodMeta >> 16u) & 65535u, 1u), 64u);
+                        for (UInt rp = 0u; rp < reqPageCnt; rp = rp + 1u) {
+                            UInt targetVP = reqVP + rp;
+                            if (reqVP != invalidIdx && targetVP < NVGHierarchyCullParams.Config.virtualPageCount) {
+                                UInt vpFl = NVGHierarchyCullParams.InVirtualPageTable[targetVP].stateAndFlags;
+                                if ((vpFl & 1u) == 0u) {
+                                    if (NVGHierarchyCullParams.OutPageRequests[targetVP].priority < prio) {
+                                        InterlockedMax(NVGHierarchyCullParams.OutPageRequests[targetVP].priority, prio, prev);
+                                    }
+                                    InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[12u].word, 1u, prev); // pageFaults
+                                }
+                            }
+                        }
+                    }
+                }
+                visFlags = visFlags | 1u; // NVG_VIS_FLAG_RESIDENCY_FALLBACK
+                InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[11u].word, 1u, prev); // fallbackClusters
+            }
+
+            // Resolve physical page slot
+            if (selfVP >= NVGHierarchyCullParams.Config.virtualPageCount) {
+                continue;
+            }
+            UInt physPageIdx = NVGHierarchyCullParams.InVirtualPageTable[selfVP].physicalPageIndex;
+            if (physPageIdx == invalidIdx) {
+                continue;
+            }
+
+            // 3. Transform Cluster AABB to World Space
+            Vec3 wMin = Vec3(0.0, 0.0, 0.0);
+            Vec3 wMax = Vec3(0.0, 0.0, 0.0);
+            TransformLocalAABBToWorld(
+                worldMat,
+                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMin,
+                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMax,
+                disp, wMin, wMax);
+
+            // 4. Cluster Frustum Cull (GPU_SCENE_OBJ_FRUSTUM_CULL = 1 << 5 = 32)
+            if (!isPhase2 && (objFlags & 32u) != 0u) {
+                if (!TestWorldAABBFrustum(wMin, wMax)) {
+                    InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[4u].word, 1u, prev); // clustersFrustumCulled
+                    continue;
+                }
+            }
+
+            // 5. Conservative Backface Normal Cone Culling (perspective, opaque/non-two-sided, zero displacement)
+            Bool isTwoSided = ((matFlags & 16u) != 0u);
+            Bool isFrontCull = ((matFlags & 1024u) != 0u);
+            Vec4 cone = NVGHierarchyCullParams.InClusterMeta[clusterId].normalConeAxisAndSin;
+            if (!isPhase2 &&
+                NVGHierarchyCullParams.Config.enableConeCulling != 0u &&
+                NVGHierarchyCullParams.Config.isOrthographic == 0u &&
+                !isTwoSided &&
+                disp <= 0.00001 &&
+                cone.w >= 0.0 && cone.w < 0.995)
+            {
+                Vec3 wCenter = (wMin + wMax) * 0.5;
+                Float wRad   = Length((wMax - wMin) * 0.5);
+                Vec3 toCam   = NVGHierarchyCullParams.Config.lodCameraPos - wCenter;
+                Float dist   = Length(toCam);
+                if (dist > wRad + 0.001) {
+                    Vec3 viewDir = toCam / dist;
+                    Vec3 c0 = Mul(worldMat, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+                    Vec3 c1 = Mul(worldMat, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+                    Vec3 c2 = Mul(worldMat, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+                    Vec3 r0 = Cross(c1, c2);
+                    Vec3 r1 = Cross(c2, c0);
+                    Vec3 r2 = Cross(c0, c1);
+                    Float det = Dot(c0, r0);
+                    Float absDet = Abs(det);
+                    Vec3 wAxis = r0 * cone.x + r1 * cone.y + r2 * cone.z;
+                    Float axLen = Length(wAxis);
+                    if (axLen > 0.00001 && absDet > 0.00000001) {
+                        wAxis = wAxis / axLen;
+                        if (isFrontCull) {
+                            wAxis = -wAxis;
+                        }
+                        Float maxC = Max(Length(c0), Max(Length(c1), Length(c2)));
+                        Float maxR = Max(Length(r0), Max(Length(r1), Length(r2)));
+                        Float aniso = Max((maxC * maxR) / absDet, 1.0);
+                        Float sinCone = cone.w;
+                        if (aniso > 1.001) {
+                            Float cosCone  = Sqrt(Max(1.0 - sinCone * sinCone, 0.0));
+                            Float scaledS  = aniso * sinCone;
+                            sinCone        = scaledS / Sqrt(Max(cosCone * cosCone + scaledS * scaledS, 0.00000001));
+                        }
+                        if (sinCone < 0.995 && Dot(viewDir, wAxis) < -(sinCone + (wRad / dist) + 0.001)) {
+                            InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[5u].word, 1u, prev); // clustersConeCulled
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // 6. Small-Cluster Sample-Center Culling
+            if (!isPhase2 && TestSmallClusterCulled(wMin, wMax, NVGHierarchyCullParams.Config.currViewProj)) {
+                InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[7u].word, 1u, prev); // clustersSmallCulled
+                continue;
+            }
+
+            // 7. HZB Occlusion Culling (Phase 1 vs prev-HZB, Phase 2 vs current-HZB)
+            Bool isTrans = ((visFlags & 8u) != 0u);
+            if (NVGHierarchyCullParams.Config.enableHZBOcclusion != 0u && !isTrans) {
+                if (!isPhase2) {
+                    if (NVGHierarchyCullParams.Config.hasPrevHZB != 0u) {
+                        if (TestWorldAABBOccludedByHZB(wMin, wMax, NVGHierarchyCullParams.Config.prevViewProj)) {
+                            if (NVGHierarchyCullParams.Config.enableTwoPhase != 0u) {
+                                UInt occDst = 0u;
+                                InterlockedAdd(NVGHierarchyCullParams.OutQueueCounters[4u].count, 1u, occDst);
+                                if (occDst < NVGHierarchyCullParams.Config.maxOccludedClusterCap) {
+                                    InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[6u].word, 1u, prev); // clustersHZBCulled
+                                    NVGHierarchyCullParams.OutOccludedClusters[occDst].objectSlotIndex = objSlot;
+                                    NVGHierarchyCullParams.OutOccludedClusters[occDst].nodeOrClusterId = clusterId;
+                                    NVGHierarchyCullParams.OutOccludedClusters[occDst].drawBucketHint  = bucketIdx;
+                                    NVGHierarchyCullParams.OutOccludedClusters[occDst].auxData         = auxFlags;
+                                    continue;
+                                }
+                                // Queue full: conservatively fall through and emit in Phase 1 (zero disocclusion holes!)
+                            } else {
+                                InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[6u].word, 1u, prev); // clustersHZBCulled
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    // Phase 2: Re-test previously occluded cluster against current-frame HZB
+                    if (TestWorldAABBOccludedByHZB(wMin, wMax, NVGHierarchyCullParams.Config.currViewProj)) {
+                        continue;
+                    }
+                    visFlags = visFlags | 2u; // NVG_VIS_FLAG_DISOCCLUDED
+                }
+            }
+
+            // 8. Touch resident virtual page with symmetric projected importance AFTER all culling tests pass
+            UInt keepPrio = 262144u + Min(UInt(Min(parentProj, 8000.0) * 64.0), 524287u) + (Min(lodLevel, 31u) * 512u);
+            if (NVGHierarchyCullParams.OutPageRequests[selfVP].priority < keepPrio) {
+                InterlockedMax(NVGHierarchyCullParams.OutPageRequests[selfVP].priority, keepPrio, prev);
+            }
+
+            // 9. Compute View-Space Depth Key (used for back-to-front transparent cluster sorting)
+            Vec3  wCenter = (wMin + wMax) * 0.5;
+            Float viewDepth = Dot(wCenter - NVGHierarchyCullParams.Config.lodCameraPos,
+                                  NVGHierarchyCullParams.Config.cameraForward);
+
+            EmitVisibleCluster(
+                objSlot, clusterId, bucketIdx, visFlags, lodLevel,
+                selfVP, physPageIdx, wordOff, selfProj, matId, objFlags, batchGrp, viewDepth);
+        }
+    }
+}

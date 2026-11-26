@@ -1,0 +1,1202 @@
+// =====================================================================
+//  ShadowPageLookup.nsl — Northstar NSL Standard Library: Virtual Shadow Page Lookup
+//
+//  Provides engine-owned Northstar Virtual Shadows (NVS) metadata bindings
+//  and 1:1 virtual-to-physical page address translation across:
+//    - 4-level toroidal orthographic Directional Light clipmaps (RES_512..RES_16384)
+//    - Perspective Spot Light virtual mip-hierarchy shadow cones (up to 8 mips)
+//    - 6-face omnidirectional Point Light virtual cubemap mip hierarchies (up to 8 mips/face)
+//    - 2-level demand-driven sparse virtual page directory (60,000+ shadow views)
+//    - Dynamic texel-relative shadow bias ([0.0, 1.0] local texel units)
+//
+//  Lookup Status Codes (matches Northstar::NVSShadowSampleStatus 1:1):
+//    0u : VALID_SHADOW_DATA   — Resident valid physical page (state == 3)
+//    1u : MISSING             — Virtual page unmapped or evicted (state == 0 or 5)
+//    2u : NOT_RENDERED        — Allocated or cleared, awaiting caster render (state == 1 or 2)
+//    3u : INVALIDATED         — Explicitly invalidated page (state == 4)
+//    4u : GENERATION_MISMATCH — Bidirectional owner / address / generation mismatch
+//    5u : AWAITING_UPDATE     — Sampling snapshot not yet committed
+//    6u : OUT_OF_RANGE        — Receiver outside shadow frustum / cone / clipmap coverage
+//    7u : INVALID_LIGHT       — Invalid shadow view range or shadow disabled
+// =====================================================================
+
+PROPERTY NVSShadowMetadata
+{
+    Buffer Params
+    {
+        Get(NVS_PAGES_PER_AXIS)
+        Get(NVS_PHYSICAL_POOL_CAPACITY)
+        Get(NVS_PAGE_TEXEL_SIZE)
+        Get(NVS_VIEW_TABLE_COUNT)
+        Get(NVS_TOTAL_VIRTUAL_PAGES)
+        Get(NVS_DEPTH_MODE)
+        Get(NVS_SAMPLING_AVAILABLE)
+        Get(NVS_SNAPSHOT_FRAME_INDEX)
+        Get(NVS_SPARSE_ROOT_CAPACITY)
+        Get(NVS_SPARSE_DIR_STRIDE)
+        Get(NVS_SPARSE_DIR_CAPACITY)
+        Get(NVS_SCREEN_PIXEL_WORLD_SCALE)
+        Get(CAMERA_POSITION)
+    }
+
+    StructuredBuffer SparsePageHierarchy
+    {
+        Get(NVS_SPARSE_NODE_VALUE)
+    }
+
+    StructuredBuffer VirtualPageTable
+    {
+        Get(NVS_VPAGE_STATE_AND_FLAGS)
+        Get(NVS_VPAGE_PHYSICAL_INDEX)
+        Get(NVS_VPAGE_VIRTUAL_ADDRESS)
+        Get(NVS_VPAGE_LAST_TOUCHED_FRAME)
+    }
+
+    StructuredBuffer PhysicalPageTable
+    {
+        Get(NVS_PPAGE_STATE_AND_FLAGS)
+        Get(NVS_PPAGE_OWNER_FLAT_INDEX)
+        Get(NVS_PPAGE_OWNER_ADDRESS)
+        Get(NVS_PPAGE_GENERATION)
+        Get(NVS_PPAGE_LAST_USED_FRAME)
+        Get(NVS_PPAGE_ALLOCATED_FRAME)
+        Get(NVS_PPAGE_MIN_EVICTABLE_FRAME)
+        Get(NVS_PPAGE_META_AUX)
+    }
+
+    StructuredBuffer LightViewTable
+    {
+        Get(NVS_VIEW_LIGHT_ID)
+        Get(NVS_VIEW_SUB_INDEX)
+        Get(NVS_VIEW_PAGES_PER_AXIS)
+        Get(NVS_VIEW_FLAGS)
+        Get(NVS_VIEW_SNAPPED_ORIGIN_X)
+        Get(NVS_VIEW_SNAPPED_ORIGIN_Y)
+        Get(NVS_VIEW_WORLD_EXTENT)
+        Get(NVS_VIEW_PAGE_WORLD_SIZE)
+        Get(NVS_VIEW_TEXEL_WORLD_SIZE)
+        Get(NVS_VIEW_RECEIVER_MIN_Z)
+        Get(NVS_VIEW_RECEIVER_MAX_Z)
+        Get(NVS_VIEW_CASTER_MIN_Z)
+        Get(NVS_VIEW_CASTER_MAX_Z)
+        Get(NVS_VIEW_DEPTH_BIAS_NDC)
+        Get(NVS_VIEW_NORMAL_BIAS_WORLD)
+        Get(NVS_VIEW_REF_LIGHT_Z)
+        Get(NVS_VIEW_RIGHT_AND_CENTER_X)
+        Get(NVS_VIEW_UP_AND_CENTER_Y)
+        Get(NVS_VIEW_DIR_AND_EXTRUSION)
+        Get(NVS_VIEW_TRANSITION_AND_PARAMS)
+        Get(NVS_VIEW_WORLD_TO_LIGHT)
+        Get(NVS_VIEW_LIGHT_TO_WORLD)
+    }
+}
+
+LIBRARY
+{
+    struct NVSLookupResult
+    {
+        UInt  status;
+        UInt  selectedViewIndex;
+        UInt  virtualFlatIndex;
+        UInt  physicalPageIndex;
+        UInt  virtualPageX;
+        UInt  virtualPageY;
+        UInt  desiredMipLevel;
+        UInt  resolvedMipLevel;
+        UInt  usedCoarseFallback;
+        Int   worldPageX;
+        Int   worldPageY;
+        Vec2  rawSliceUV;
+        Vec2  borderSafeSliceUV;
+        Float receiverNdcDepth;
+        Float receiverCompareDepth;
+        Float clipmapTransition;
+        Float mipTransition;
+        Float receiverLightZ;
+    };
+
+    NVSLookupResult NVSMakeEmptyLookupResult(UInt initialStatus)
+    {
+        NVSLookupResult r;
+        r.status               = initialStatus;
+        r.selectedViewIndex    = ~0u;
+        r.virtualFlatIndex     = ~0u;
+        r.physicalPageIndex    = ~0u;
+        r.virtualPageX         = 0u;
+        r.virtualPageY         = 0u;
+        r.desiredMipLevel      = 0u;
+        r.resolvedMipLevel     = 0u;
+        r.usedCoarseFallback   = 0u;
+        r.worldPageX           = 0;
+        r.worldPageY           = 0;
+        r.rawSliceUV           = Vec2(0.5, 0.5);
+        r.borderSafeSliceUV    = Vec2(0.5, 0.5);
+        r.receiverNdcDepth     = 0.0;
+        r.receiverCompareDepth = 0.0;
+        r.clipmapTransition    = 0.0;
+        r.mipTransition        = 0.0;
+        r.receiverLightZ       = 0.0;
+        return r;
+    }
+
+    Bool NVSSamplingIsAvailable()
+    {
+        return NVSShadowMetadata.Params.NVS_SAMPLING_AVAILABLE != 0u;
+    }
+
+    UInt NVSSamplingSnapshotFrame()
+    {
+        return NVSShadowMetadata.Params.NVS_SNAPSHOT_FRAME_INDEX;
+    }
+
+    UInt NVSSamplingDepthMode()
+    {
+        return NVSShadowMetadata.Params.NVS_DEPTH_MODE;
+    }
+
+    Bool NVSIsLookupValid(NVSLookupResult r)
+    {
+        return r.status == 0u;
+    }
+
+    Bool NVSIsLookupOutOfRange(NVSLookupResult r)
+    {
+        return r.status == 6u;
+    }
+
+    UInt NVSExtractViewMipCount(UInt viewFlags)
+    {
+        UInt m1  = (viewFlags >> 12u) & 0xFu;
+        UInt cnt = m1 + 1u;
+        return (cnt <= 8u) ? cnt : 8u;
+    }
+
+    UInt NVSExtractViewMinMip(UInt viewFlags)
+    {
+        return ((viewFlags & 8388608u) != 0u) ? ((viewFlags >> 16u) & 0x7u) : 0u;
+    }
+
+    Float NVSExtractViewLodBias(UInt viewFlags)
+    {
+        return ((viewFlags & 8388608u) != 0u) ? ((Float((viewFlags >> 19u) & 0xFu) * 0.5) - 1.5) : 0.0;
+    }
+
+    UInt NVSExtractViewCubeFaceIndex(UInt viewFlags)
+    {
+        return (viewFlags >> 9u) & 0x7u;
+    }
+
+    UInt NVSPositiveMod(Int value, UInt modulus)
+    {
+        UInt result = 0u;
+        if (modulus > 1u)
+        {
+            if ((modulus & (modulus - 1u)) == 0u)
+            {
+                result = UInt(value) & (modulus - 1u);
+            }
+            else
+            {
+                UInt absVal = (value < 0) ? UInt(-1 - value) : UInt(value);
+                UInt rem    = absVal % modulus;
+                result      = (value < 0) ? (modulus - 1u - rem) : rem;
+            }
+        }
+        return result;
+    }
+
+    UInt NVSWorldPageToToroidalPage(Int worldPageCoord, UInt pagesPerAxis)
+    {
+        UInt result = 0u;
+        if (pagesPerAxis > 1u)
+        {
+            Int halfPages = Int(pagesPerAxis / 2u);
+            result = NVSPositiveMod(worldPageCoord + halfPages, pagesPerAxis);
+        }
+        return result;
+    }
+
+    Int NVSFloorDivPow2(Int value, UInt shift)
+    {
+        Int res = value;
+        if (shift > 0u)
+        {
+            if (value >= 0)
+            {
+                res = Int(UInt(value) >> shift);
+            }
+            else
+            {
+                res = -Int((UInt(-1 - value) >> shift) + 1u);
+            }
+        }
+        return res;
+    }
+
+    Int NVSOrthoSnapOriginAtMip(Int originMip0, UInt mip)
+    {
+        Int roundBias = (mip > 0u) ? Int(1u << (mip - 1u)) : 0;
+        return NVSFloorDivPow2(originMip0 + roundBias, mip);
+    }
+
+    UInt NVSPackVirtualPageAddress(UInt lightId, UInt clipmapLevel, UInt vx, UInt vy, UInt generation)
+    {
+        UInt safeGen = (generation == 0u) ? 0u : (((generation - 1u) % 255u) + 1u);
+        return (vx & 0xFFu) |
+               ((vy & 0xFFu) << 8u) |
+               ((clipmapLevel & 0x3u) << 16u) |
+               ((lightId & 0x3Fu) << 18u) |
+               ((safeGen & 0xFFu) << 24u);
+    }
+
+    UInt NVSPackSparsePageCoord(UInt vx, UInt vy, UInt mipLevel, UInt generation)
+    {
+        UInt safeGen = (generation == 0u) ? 1u : (((generation - 1u) % 4095u) + 1u);
+        return (vx & 0xFFu) |
+               ((vy & 0xFFu) << 8u) |
+               ((mipLevel & 0xFu) << 16u) |
+               (safeGen << 20u);
+    }
+
+    UInt NVSComputeVirtualPageFlatIndex(UInt lightId, UInt clipmapLevel, UInt vx, UInt vy, UInt pagesPerAxis)
+    {
+        UInt pagesPerLevel = pagesPerAxis * pagesPerAxis;
+        UInt globalLevel   = (lightId * 4u) + clipmapLevel;
+        return (globalLevel * pagesPerLevel) + (vy * pagesPerAxis) + vx;
+    }
+
+    Bool NVSComputeSparseDirectoryOffset(
+        UInt     mipLevel,
+        UInt     vx,
+        UInt     vy,
+        out UInt outDirTileOffset,
+        out UInt outLocalBlockIdx)
+    {
+        outDirTileOffset = ~0u;
+        outLocalBlockIdx = 0u;
+        Bool ok = false;
+        if (mipLevel < 8u)
+        {
+            UInt maxPages = 128u >> mipLevel;
+            if (vx < maxPages && vy < maxPages)
+            {
+                ok = true;
+                if (mipLevel <= 4u)
+                {
+                    UInt tileX        = vx >> 3u;
+                    UInt tileY        = vy >> 3u;
+                    UInt localX       = vx & 7u;
+                    UInt localY       = vy & 7u;
+                    UInt tilesPerAxis = 16u >> mipLevel;
+                    UInt baseOffset   = 0u;
+                    if (mipLevel == 1u)      { baseOffset = 256u; }
+                    else if (mipLevel == 2u) { baseOffset = 320u; }
+                    else if (mipLevel == 3u) { baseOffset = 336u; }
+                    else if (mipLevel == 4u) { baseOffset = 340u; }
+                    outDirTileOffset = baseOffset + (tileY * tilesPerAxis) + tileX;
+                    outLocalBlockIdx = (localY << 3u) | localX;
+                }
+                else
+                {
+                    outDirTileOffset = 341u;
+                    if (mipLevel == 5u)
+                    {
+                        outLocalBlockIdx = (vy << 2u) + vx;
+                    }
+                    else if (mipLevel == 6u)
+                    {
+                        outLocalBlockIdx = 16u + (vy << 1u) + vx;
+                    }
+                    else
+                    {
+                        outLocalBlockIdx = 20u;
+                    }
+                }
+            }
+        }
+        return ok;
+    }
+
+    // Resolves (viewIndex, mipLevel, vx, vy) -> leaf index in VirtualPageTable via 2-level sparse page directory.
+    // Returns ~0u when unmapped, ~1u when out of bounds.
+    UInt NVSLookupSparseVirtualFlatIndex(
+        UInt viewIndex,
+        UInt viewLightId,
+        UInt viewSubIdx,
+        UInt mipLevel,
+        UInt vx,
+        UInt vy,
+        UInt viewPagesPerAxis)
+    {
+        UInt flatIdx   = ~0u;
+        UInt rootCap   = NVSShadowMetadata.Params.NVS_SPARSE_ROOT_CAPACITY;
+        UInt dirStride = NVSShadowMetadata.Params.NVS_SPARSE_DIR_STRIDE;
+        UInt dirCap    = NVSShadowMetadata.Params.NVS_SPARSE_DIR_CAPACITY;
+        Vec4 scaleCfg  = NVSShadowMetadata.Params.NVS_SCREEN_PIXEL_WORLD_SCALE;
+
+        if (scaleCfg.w > 0.5 && rootCap > 0u && dirStride >= 342u)
+        {
+            UInt spElemCount  = 0u;
+            UInt spElemStride = 0u;
+            GetDimensions(NVSShadowMetadata.SparsePageHierarchy, spElemCount, spElemStride);
+            if (viewIndex < rootCap && viewIndex < spElemCount)
+            {
+                UInt dirSlot = NVSShadowMetadata.SparsePageHierarchy[viewIndex].NVS_SPARSE_NODE_VALUE;
+                if (dirSlot < dirCap && dirSlot < (~1u))
+                {
+                    UInt tileOff  = 0u;
+                    UInt localIdx = 0u;
+                    if (!NVSComputeSparseDirectoryOffset(mipLevel, vx, vy, tileOff, localIdx))
+                    {
+                        flatIdx = ~1u;
+                    }
+                    else
+                    {
+                        UInt dirLinear = rootCap + (dirSlot * dirStride) + tileOff;
+                        if (dirLinear < spElemCount)
+                        {
+                            UInt blockSlot = NVSShadowMetadata.SparsePageHierarchy[dirLinear].NVS_SPARSE_NODE_VALUE;
+                            if (blockSlot < (~1u))
+                            {
+                                flatIdx = (blockSlot << 6u) + localIdx;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            UInt cfgPagesAxis   = NVSShadowMetadata.Params.NVS_PAGES_PER_AXIS;
+            UInt tablePagesAxis = (cfgPagesAxis > viewPagesPerAxis) ? cfgPagesAxis : viewPagesPerAxis;
+            flatIdx = NVSComputeVirtualPageFlatIndex(viewLightId, viewSubIdx, vx, vy, tablePagesAxis);
+        }
+        return flatIdx;
+    }
+
+    Float NVSEstimateScreenPixelWorldFootprint(Vec3 worldPos)
+    {
+        Vec4  scaleCfg = NVSShadowMetadata.Params.NVS_SCREEN_PIXEL_WORLD_SCALE;
+        Vec3  camRel   = worldPos - NVSShadowMetadata.Params.CAMERA_POSITION;
+        Float camDist  = Sqrt(Max(Dot(camRel, camRel), 0.00000001));
+        return (scaleCfg.x * camDist) + scaleCfg.y;
+    }
+
+    UInt NVSComputePerspectiveDesiredMipTier(
+        Vec3      worldPos,
+        Float     receiverLightZ,
+        Float     baseMip0TexelTanSize,
+        UInt      mipCount,
+        UInt      minMip,
+        Float     totalLodBias,
+        out Float outMipTransition)
+    {
+        outMipTransition = 0.0;
+        UInt maxMipIdx   = (mipCount > 0u) ? (mipCount - 1u) : 0u;
+        UInt safeMinMip  = Min(minMip, maxMipIdx);
+        UInt mip0        = safeMinMip;
+        if (mipCount > 1u && baseMip0TexelTanSize > 0.00000001 && receiverLightZ > 0.00001)
+        {
+            Float screenWorld = NVSEstimateScreenPixelWorldFootprint(worldPos);
+            if (screenWorld > 0.0)
+            {
+                Vec4  scaleCfg       = NVSShadowMetadata.Params.NVS_SCREEN_PIXEL_WORLD_SCALE;
+                Float mip0TexelWorld = receiverLightZ * baseMip0TexelTanSize;
+                Float ratio          = screenWorld / Max(mip0TexelWorld, 0.0000001);
+                Float rawLod         = Log2(Max(ratio, 0.0625)) + scaleCfg.z + totalLodBias;
+                Float clampedLod     = Clamp(rawLod, Float(safeMinMip), Float(maxMipIdx));
+                mip0                 = Min(Max(UInt(Floor(clampedLod)), safeMinMip), maxMipIdx);
+                if (mip0 < maxMipIdx)
+                {
+                    outMipTransition = SmoothStep(0.75, 1.0, clampedLod - Floor(clampedLod));
+                }
+            }
+        }
+        return mip0;
+    }
+
+    UInt NVSComputePerspectiveDesiredMip(
+        Vec3      worldPos,
+        Float     receiverLightZ,
+        Float     baseMip0TexelTanSize,
+        UInt      mipCount,
+        Float     extraLodBias,
+        out Float outMipTransition)
+    {
+        return NVSComputePerspectiveDesiredMipTier(
+            worldPos,
+            receiverLightZ,
+            baseMip0TexelTanSize,
+            mipCount,
+            0u,
+            extraLodBias,
+            outMipTransition);
+    }
+
+    UInt NVSComputeOrthographicMaxActiveMip(UInt mipCount)
+    {
+        return (mipCount > 3u) ? (mipCount - 3u) : 0u;
+    }
+
+    UInt NVSComputeOrthographicDesiredMipTier(
+        Vec3      worldPos,
+        Float     baseMip0TexelWorldSize,
+        UInt      mipCount,
+        UInt      minMip,
+        Float     totalLodBias,
+        out Float outMipTransition)
+    {
+        outMipTransition  = 0.0;
+        UInt maxActiveMip = NVSComputeOrthographicMaxActiveMip(mipCount);
+        UInt safeMinMip   = Min(minMip, maxActiveMip);
+        UInt mip0         = safeMinMip;
+        if (maxActiveMip > safeMinMip && baseMip0TexelWorldSize > 0.00000001)
+        {
+            Float screenWorld = NVSEstimateScreenPixelWorldFootprint(worldPos);
+            if (screenWorld > 0.0)
+            {
+                Vec4  scaleCfg   = NVSShadowMetadata.Params.NVS_SCREEN_PIXEL_WORLD_SCALE;
+                Float ratio      = screenWorld / Max(baseMip0TexelWorldSize, 0.0000001);
+                Float rawLod     = Log2(Max(ratio, 0.0625)) + scaleCfg.z + totalLodBias;
+                Float clampedLod = Clamp(rawLod, Float(safeMinMip), Float(maxActiveMip));
+                mip0             = Min(Max(UInt(Floor(clampedLod)), safeMinMip), maxActiveMip);
+                if (mip0 < maxActiveMip)
+                {
+                    outMipTransition = SmoothStep(0.75, 1.0, clampedLod - Floor(clampedLod));
+                }
+            }
+        }
+        return mip0;
+    }
+
+    UInt NVSComputeOrthographicDesiredMip(
+        Vec3      worldPos,
+        Float     baseMip0TexelWorldSize,
+        UInt      mipCount,
+        Float     extraLodBias,
+        out Float outMipTransition)
+    {
+        return NVSComputeOrthographicDesiredMipTier(
+            worldPos,
+            baseMip0TexelWorldSize,
+            mipCount,
+            0u,
+            extraLodBias,
+            outMipTransition);
+    }
+
+    NVSLookupResult NVSEvaluateViewAtSpecificMip(
+        UInt  viewIndex,
+        UInt  evalMip,
+        UInt  desiredMip,
+        Float mipTrans,
+        Vec3  worldPos,
+        Vec3  safeNormal,
+        Vec2  texelPageOffsetXY,
+        UInt  totalVPages,
+        UInt  physPoolCap)
+    {
+        NVSLookupResult res    = NVSMakeEmptyLookupResult(6u);
+        res.selectedViewIndex  = viewIndex;
+        res.desiredMipLevel    = desiredMip;
+        res.resolvedMipLevel   = evalMip;
+        res.usedCoarseFallback = (evalMip > desiredMip) ? 1u : 0u;
+        res.mipTransition      = mipTrans;
+
+        UInt  viewFlags     = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_FLAGS;
+        UInt  basePagesAxis = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_PAGES_PER_AXIS;
+        Float worldExtent   = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_WORLD_EXTENT;
+        Float casterMinZ    = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MIN_Z;
+        Float casterMaxZ    = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MAX_Z;
+        Float viewDepthBias = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DEPTH_BIAS_NDC;
+        Float viewNormBias  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_NORMAL_BIAS_WORLD;
+
+        Vec4 rightAndCenterX = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_RIGHT_AND_CENTER_X;
+        Vec4 upAndCenterY    = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_UP_AND_CENTER_Y;
+        Vec4 dirAndExtrusion = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DIR_AND_EXTRUSION;
+        Vec4 transAndParams  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TRANSITION_AND_PARAMS;
+
+        Vec3 R = rightAndCenterX.xyz;
+        Vec3 U = upAndCenterY.xyz;
+        Vec3 D = dirAndExtrusion.xyz;
+
+        Bool isPerspective   = (viewFlags & 4u) != 0u;
+        Bool isSpotCone      = (viewFlags & 8u) != 0u;
+        Bool isReversedZ     = (viewFlags & 2u) != 0u;
+        Bool isRadialSel     = (viewFlags & 16u) != 0u;
+        Bool rasterAppliedDB = (viewFlags & 64u) != 0u;
+        Bool rasterAppliedNB = (viewFlags & 128u) != 0u;
+        Bool isTexelRelBias  = (viewFlags & 256u) != 0u;
+
+        UInt  mipPagesAxis = Max(basePagesAxis >> evalMip, 1u);
+        Float mipScale     = Float(1u << evalMip);
+        Float mipPageSize  = worldExtent / Float(mipPagesAxis);
+
+        Float lx          = 0.0;
+        Float ly          = 0.0;
+        Float lz          = 0.0;
+        Float projCoordX  = 0.0;
+        Float projCoordY  = 0.0;
+        Float radialRatio = 0.0;
+        Vec3  lightRayDir = D;
+        Bool  inFrustum   = true;
+
+        if (isPerspective)
+        {
+            Mat4  lightToWorld = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_LIGHT_TO_WORLD;
+            Vec3  lightPos     = Mul(lightToWorld, Vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            Vec3  rawRel       = worldPos - lightPos;
+            Float rawLz        = Dot(rawRel, D);
+
+            if (rawLz < casterMinZ || rawLz > casterMaxZ || rawLz <= 0.00001)
+            {
+                inFrustum = false;
+            }
+            else
+            {
+                Float rawDistSq     = Max(Dot(rawRel, rawRel), 0.0000000001);
+                Vec3  rawRayDir     = rawRel * Rsqrt(rawDistSq);
+                Float effNormOffset = rasterAppliedNB ? 0.0 : viewNormBias;
+                if (isTexelRelBias)
+                {
+                    // 100% receiver-side perspective normal bias with built-in physical texel-footprint
+                    // baseline floor (keeps 0.0 user sliders acne-free with sub-millimeter contact at 16K)
+                    // plus user artist offset scaled by incidence slope sin(theta) = sqrt(1 - (N.L)^2).
+                    Float baseTexelTan  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TEXEL_WORLD_SIZE;
+                    Float normMipScale  = (evalMip > desiredMip) ? Min(mipScale, Float(1u << desiredMip) * 4.0) : mipScale;
+                    Float localTexelW   = (normMipScale * baseTexelTan) * rawLz;
+                    Float nLenSqPre     = Dot(safeNormal, safeNormal);
+                    Float rawCosSlope   = (nLenSqPre > 0.5) ? Clamp(Abs(Dot(safeNormal, rawRayDir)), 0.0, 1.0) : 1.0;
+                    Float rawSinSlope   = Sqrt(Max(1.0 - (rawCosSlope * rawCosSlope), 0.0));
+                    Float baseNormFloor = (0.55 * localTexelW) * (0.30 + (1.20 * rawSinSlope));
+                    Float slopeScale    = 0.35 + (1.65 * rawSinSlope);
+                    effNormOffset       = baseNormFloor + ((normMipScale * viewNormBias) * rawLz * slopeScale);
+                }
+                Vec3  biasedPos = worldPos + (safeNormal * effNormOffset);
+                Vec3  rel       = biasedPos - lightPos;
+                Float distSq    = Max(Dot(rel, rel), 0.0000000001);
+                Float invDist   = Rsqrt(distSq);
+                lightRayDir     = rel * invDist;
+                lx = Dot(rel, R);
+                ly = Dot(rel, U);
+                lz = Dot(rel, D);
+
+                if (lz < casterMinZ || lz > casterMaxZ || lz <= 0.00001)
+                {
+                    inFrustum = false;
+                }
+                else if (isSpotCone && ((lz * invDist) < transAndParams.x))
+                {
+                    inFrustum = false;
+                }
+                else
+                {
+                    projCoordX = lx / lz;
+                    projCoordY = ly / lz;
+                }
+            }
+        }
+        else
+        {
+            if (isRadialSel)
+            {
+                Mat4 lightToWorld = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_LIGHT_TO_WORLD;
+                Vec4 camRad       = Mul(lightToWorld, Vec4(0.0, 0.0, 0.0, 1.0));
+                if (camRad.w > 0.0001)
+                {
+                    Vec3  camRel  = worldPos - camRad.xyz;
+                    Float camDist = Sqrt(Dot(camRel, camRel));
+                    if (camDist > camRad.w)
+                    {
+                        inFrustum = false;
+                    }
+                    else
+                    {
+                        radialRatio = camDist / camRad.w;
+                    }
+                }
+            }
+            if (inFrustum)
+            {
+                Float effNormOffset = rasterAppliedNB ? 0.0 : viewNormBias;
+                if (isTexelRelBias)
+                {
+                    // 100% receiver-side orthographic normal bias matching perspective shadow math:
+                    // built-in physical texel-footprint floor guarantees acne-free 0.0 user bias
+                    // with watertight shadow rasterization and sin(theta) slope scaling.
+                    Float baseTexelW    = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TEXEL_WORLD_SIZE;
+                    Float normMipScale  = (evalMip > desiredMip) ? Min(mipScale, Float(1u << desiredMip) * 4.0) : mipScale;
+                    Float localTexelW   = normMipScale * baseTexelW;
+                    Float nLenSqPre     = Dot(safeNormal, safeNormal);
+                    Float rawCosSlope   = (nLenSqPre > 0.5) ? Clamp(Abs(Dot(safeNormal, D)), 0.0, 1.0) : 1.0;
+                    Float rawSinSlope   = Sqrt(Max(1.0 - (rawCosSlope * rawCosSlope), 0.0));
+                    Float baseNormFloor = (0.55 * localTexelW) * (0.30 + (1.20 * rawSinSlope));
+                    Float slopeScale    = 0.35 + (1.65 * rawSinSlope);
+                    effNormOffset       = baseNormFloor + ((normMipScale * viewNormBias) * slopeScale);
+                }
+                Vec3  biasedPos     = worldPos + (safeNormal * effNormOffset);
+                Mat4  worldToLight  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_WORLD_TO_LIGHT;
+                Vec3  lightSpace    = Mul(worldToLight, Vec4(biasedPos, 1.0)).xyz;
+                lx = lightSpace.x;
+                ly = lightSpace.y;
+                lz = lightSpace.z;
+                if (lz < casterMinZ || lz > casterMaxZ)
+                {
+                    inFrustum = false;
+                }
+                else
+                {
+                    projCoordX = lx;
+                    projCoordY = ly;
+                }
+            }
+        }
+
+        if (!inFrustum)
+        {
+            res.status = 6u;
+        }
+        else
+        {
+            res.receiverLightZ = lz;
+
+            UInt  texelCount      = Max(NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE, 1u);
+            Float invTexelCount   = 1.0 / Float(texelCount);
+            Float centerShift     = (mipPagesAxis == 1u) ? 0.5 : 0.0;
+            Float orthoCenterOffX = (!isPerspective && mipPagesAxis == 1u) ? rightAndCenterX.w : 0.0;
+            Float orthoCenterOffY = (!isPerspective && mipPagesAxis == 1u) ? upAndCenterY.w : 0.0;
+            Float exactPageX      = ((projCoordX - orthoCenterOffX) / mipPageSize) + centerShift + (texelPageOffsetXY.x * invTexelCount);
+            Float exactPageY      = ((projCoordY - orthoCenterOffY) / mipPageSize) + centerShift - (texelPageOffsetXY.y * invTexelCount);
+            Float flX             = Floor(exactPageX);
+            Float flY             = Floor(exactPageY);
+            Int   wPageX          = Int(flX);
+            Int   wPageY          = Int(flY);
+
+            Int snappedOriginX = (isPerspective || mipPagesAxis == 1u)
+                ? 0
+                : NVSOrthoSnapOriginAtMip(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SNAPPED_ORIGIN_X, evalMip);
+            Int snappedOriginY = (isPerspective || mipPagesAxis == 1u)
+                ? 0
+                : NVSOrthoSnapOriginAtMip(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SNAPPED_ORIGIN_Y, evalMip);
+            Int halfPages      = Int(mipPagesAxis / 2u);
+            Int minPageX       = snappedOriginX - halfPages;
+            Int minPageY       = snappedOriginY - halfPages;
+            Int relX           = wPageX - minPageX;
+            Int relY           = wPageY - minPageY;
+            Int lim            = Int(mipPagesAxis);
+
+            if (relX < 0 || relX >= lim || relY < 0 || relY >= lim)
+            {
+                res.status = 6u;
+            }
+            else
+            {
+                UInt viewLightId = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_LIGHT_ID;
+                UInt viewSubIdx  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_SUB_INDEX;
+                UInt vx          = (mipPagesAxis == 1u) ? 0u : NVSWorldPageToToroidalPage(wPageX, mipPagesAxis);
+                UInt vy          = (mipPagesAxis == 1u) ? 0u : NVSWorldPageToToroidalPage(wPageY, mipPagesAxis);
+
+                res.virtualPageX = vx;
+                res.virtualPageY = vy;
+                res.worldPageX   = wPageX;
+                res.worldPageY   = wPageY;
+
+                Float fracX = exactPageX - flX;
+                Float fracY = exactPageY - flY;
+                Float rawU  = fracX;
+                Float rawV  = 1.0 - fracY;
+                Float minUV = 0.5 * invTexelCount;
+                Float maxUV = 1.0 - minUV;
+                res.rawSliceUV        = Vec2(rawU, rawV);
+                res.borderSafeSliceUV = Vec2(Clamp(rawU, minUV, maxUV), Clamp(rawV, minUV, maxUV));
+
+                Float dz   = casterMaxZ - casterMinZ;
+                Float ndcZ = 0.0;
+                if (isPerspective)
+                {
+                    Float pz = isReversedZ ? (-casterMinZ / dz) : (casterMaxZ / dz);
+                    Float qz = isReversedZ ? ((casterMinZ * casterMaxZ) / dz) : (-(casterMinZ * casterMaxZ) / dz);
+                    ndcZ = pz + (qz / lz);
+                }
+                else
+                {
+                    ndcZ = isReversedZ ? ((casterMaxZ - lz) / dz) : ((lz - casterMinZ) / dz);
+                }
+
+                Float nLenSq      = Dot(safeNormal, safeNormal);
+                Float slopeFactor = 1.0;
+                if (nLenSq > 0.5)
+                {
+                    Float cosSlope = Clamp(Abs(Dot(safeNormal, lightRayDir)), 0.0, 1.0);
+                    Float sinSlope = Sqrt(Max(1.0 - (cosSlope * cosSlope), 0.0));
+                    slopeFactor    = 1.0 + Clamp(sinSlope / Max(cosSlope, 0.15), 0.0, 6.0);
+                }
+
+                Float absViewDepthBias = Abs(viewDepthBias);
+                Float effDepthBiasNdc  = 0.0;
+                if (isTexelRelBias)
+                {
+                    Float baseTexelUnit = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TEXEL_WORLD_SIZE;
+                    Float depthMipScale = (evalMip > desiredMip) ? Min(mipScale, Float(1u << desiredMip) * 8.0) : mipScale;
+                    if (isPerspective)
+                    {
+                        Float baseFloorCoeff = 0.25 * baseTexelUnit * ((casterMinZ * casterMaxZ) / Max(dz, 0.000001));
+                        Float totalCoeff     = baseFloorCoeff + absViewDepthBias;
+                        Float fullBias       = (depthMipScale * totalCoeff * slopeFactor) / Max(lz, casterMinZ);
+                        Float rastBias       = rasterAppliedDB ? ((depthMipScale * absViewDepthBias) / Max(casterMaxZ, casterMinZ)) : 0.0;
+                        effDepthBiasNdc      = Max(fullBias - rastBias, 0.000002);
+                    }
+                    else
+                    {
+                        Float baseFloorNdc    = (0.25 * baseTexelUnit) / Max(dz, 0.000001);
+                        Float totalNdc        = baseFloorNdc + absViewDepthBias;
+                        Float scaledDepthBias = depthMipScale * totalNdc;
+                        Float rawOrthoBias    = rasterAppliedDB
+                            ? (Max(slopeFactor - 1.0, 0.0) * scaledDepthBias + (depthMipScale * baseFloorNdc))
+                            : (slopeFactor * scaledDepthBias);
+                        effDepthBiasNdc       = Max(rawOrthoBias, 0.000002);
+                    }
+                }
+                else if (absViewDepthBias > 0.0)
+                {
+                    effDepthBiasNdc = rasterAppliedDB ? 0.0 : absViewDepthBias;
+                }
+
+                Float biasedNdc = isReversedZ ? (ndcZ + effDepthBiasNdc) : (ndcZ - effDepthBiasNdc);
+                res.receiverNdcDepth     = Clamp(ndcZ, 0.0, 1.0);
+                res.receiverCompareDepth = Clamp(biasedNdc, 0.0, 1.0);
+
+                if (!isPerspective && worldExtent > 0.00001)
+                {
+                    Float halfExt = 0.5 * worldExtent;
+                    Float dxNorm  = Abs(lx - rightAndCenterX.w) / halfExt;
+                    Float dyNorm  = Abs(ly - upAndCenterY.w) / halfExt;
+                    Float maxNorm = Max(dxNorm, dyNorm);
+                    if (isRadialSel)
+                    {
+                        maxNorm = Max(maxNorm, radialRatio);
+                    }
+                    Float startR = Clamp(transAndParams.x, 0.5, 0.99);
+                    if (maxNorm > startR)
+                    {
+                        Float t = Clamp((maxNorm - startR) / Max(1.0 - startR, 0.0001), 0.0, 1.0);
+                        res.clipmapTransition = t * t * (3.0 - 2.0 * t);
+                    }
+                }
+
+                UInt vFlat = NVSLookupSparseVirtualFlatIndex(viewIndex, viewLightId, viewSubIdx, evalMip, vx, vy, basePagesAxis);
+                if (vFlat == (~0u))
+                {
+                    res.status = 1u;
+                }
+                else if (vFlat >= totalVPages)
+                {
+                    res.status = 6u;
+                }
+                else
+                {
+                    res.virtualFlatIndex = vFlat;
+                    UInt vStateAndFlags = NVSShadowMetadata.VirtualPageTable[vFlat].NVS_VPAGE_STATE_AND_FLAGS;
+                    UInt vState         = vStateAndFlags & 0xFu;
+                    if (vState == 1u || vState == 2u)
+                    {
+                        res.status = 2u;
+                    }
+                    else if (vState == 4u)
+                    {
+                        res.status = 3u;
+                    }
+                    else if (vState != 3u)
+                    {
+                        res.status = 1u;
+                    }
+                    else
+                    {
+                        UInt physIdx = NVSShadowMetadata.VirtualPageTable[vFlat].NVS_VPAGE_PHYSICAL_INDEX;
+                        if (physIdx >= physPoolCap)
+                        {
+                            res.status = 4u;
+                        }
+                        else
+                        {
+                            UInt packedAddr     = NVSShadowMetadata.VirtualPageTable[vFlat].NVS_VPAGE_VIRTUAL_ADDRESS;
+                            UInt pStateAndFlags = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_STATE_AND_FLAGS;
+                            UInt pState         = pStateAndFlags & 0xFu;
+                            UInt pOwnerFlat     = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_OWNER_FLAT_INDEX;
+                            UInt pOwnerAddr     = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_OWNER_ADDRESS;
+                            UInt pGen           = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_GENERATION;
+                            UInt pOwnerView     = NVSShadowMetadata.PhysicalPageTable[physIdx].NVS_PPAGE_META_AUX;
+
+                            Bool isExtAddr = ((vStateAndFlags & 512u) != 0u) || ((pStateAndFlags & 128u) != 0u);
+                            Bool addrMatch = false;
+                            if (isExtAddr)
+                            {
+                                UInt uVx  = packedAddr & 0xFFu;
+                                UInt uVy  = (packedAddr >> 8u) & 0xFFu;
+                                UInt uMip = (packedAddr >> 16u) & 0xFu;
+                                UInt uGen = (packedAddr >> 20u) & 0xFFFu;
+                                addrMatch = (uGen != 0u) && (pOwnerView == viewIndex) && (uMip == evalMip) && (uVx == vx) && (uVy == vy);
+                            }
+                            else
+                            {
+                                UInt uVx      = packedAddr & 0xFFu;
+                                UInt uVy      = (packedAddr >> 8u) & 0xFFu;
+                                UInt uSubIdx  = (packedAddr >> 16u) & 0x3u;
+                                UInt uLightId = (packedAddr >> 18u) & 0x3Fu;
+                                UInt uGen     = (packedAddr >> 24u) & 0xFFu;
+                                addrMatch     = (uGen != 0u) && (uLightId == viewLightId) && (uSubIdx == viewSubIdx) && (uVx == vx) && (uVy == vy);
+                            }
+
+                            if (!addrMatch || pState != 3u || pGen == 0u || pOwnerFlat != vFlat || pOwnerAddr != packedAddr)
+                            {
+                                res.status = 4u;
+                            }
+                            else
+                            {
+                                res.physicalPageIndex = physIdx;
+                                res.status            = 0u;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return res;
+    }
+
+    NVSLookupResult NVSResolveViewPageLookupMipEx(
+        UInt  viewIndex,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Vec2  texelPageOffsetXY,
+        Float extraLodBias,
+        UInt  explicitMipOverride,
+        Bool  allowCoarseFallback)
+    {
+        NVSLookupResult res = NVSMakeEmptyLookupResult(7u);
+
+        if (NVSShadowMetadata.Params.NVS_SAMPLING_AVAILABLE == 0u)
+        {
+            res.status = 5u;
+        }
+        else
+        {
+            UInt viewBufCount  = 0u;
+            UInt viewBufStride = 0u;
+            GetDimensions(NVSShadowMetadata.LightViewTable, viewBufCount, viewBufStride);
+
+            UInt vPageBufCount  = 0u;
+            UInt vPageBufStride = 0u;
+            GetDimensions(NVSShadowMetadata.VirtualPageTable, vPageBufCount, vPageBufStride);
+
+            UInt pPageBufCount  = 0u;
+            UInt pPageBufStride = 0u;
+            GetDimensions(NVSShadowMetadata.PhysicalPageTable, pPageBufCount, pPageBufStride);
+
+            UInt viewTableLimit = Min(NVSShadowMetadata.Params.NVS_VIEW_TABLE_COUNT, viewBufCount);
+            UInt totalVPages    = Min(NVSShadowMetadata.Params.NVS_TOTAL_VIRTUAL_PAGES, vPageBufCount);
+            UInt physPoolCap    = Min(NVSShadowMetadata.Params.NVS_PHYSICAL_POOL_CAPACITY, pPageBufCount);
+
+            if (viewIndex < viewTableLimit && totalVPages > 0u && physPoolCap > 0u)
+            {
+                UInt  viewFlags     = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_FLAGS;
+                UInt  pagesPerAxis  = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_PAGES_PER_AXIS;
+                Float pageWorldSize = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_PAGE_WORLD_SIZE;
+                Float casterMinZ    = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MIN_Z;
+                Float casterMaxZ    = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MAX_Z;
+
+                if ((viewFlags & 1u) != 0u &&
+                    pagesPerAxis > 0u &&
+                    pageWorldSize > 0.000001 &&
+                    (casterMaxZ - casterMinZ) > 0.000001)
+                {
+                    Float normalLenSq = Dot(worldNormal, worldNormal);
+                    Vec3  safeNormal  = Vec3(0.0, 0.0, 0.0);
+                    if (normalLenSq > 0.000001)
+                    {
+                        safeNormal = worldNormal * Rsqrt(normalLenSq);
+                    }
+
+                    Bool  isPerspective = (viewFlags & 4u) != 0u;
+                    UInt  mipCount      = NVSExtractViewMipCount(viewFlags);
+                    UInt  viewMinMip    = NVSExtractViewMinMip(viewFlags);
+                    Float viewLodBias   = NVSExtractViewLodBias(viewFlags);
+                    UInt  desiredMip    = 0u;
+                    Float mipTrans      = 0.0;
+
+                    if (mipCount > 1u)
+                    {
+                        if (explicitMipOverride < mipCount)
+                        {
+                            desiredMip = explicitMipOverride;
+                        }
+                        else if (isPerspective)
+                        {
+                            Mat4  lightToWorld = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_LIGHT_TO_WORLD;
+                            Vec3  lightPos     = Mul(lightToWorld, Vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                            Vec3  D            = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_DIR_AND_EXTRUSION.xyz;
+                            Float rawLz        = Dot(worldPos - lightPos, D);
+                            Float baseTexTan   = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TEXEL_WORLD_SIZE;
+                            desiredMip = NVSComputePerspectiveDesiredMipTier(
+                                worldPos,
+                                rawLz,
+                                baseTexTan,
+                                mipCount,
+                                viewMinMip,
+                                viewLodBias + extraLodBias,
+                                mipTrans);
+                        }
+                        else
+                        {
+                            Float baseTexWorld = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TEXEL_WORLD_SIZE;
+                            desiredMip = NVSComputeOrthographicDesiredMipTier(
+                                worldPos,
+                                baseTexWorld,
+                                mipCount,
+                                viewMinMip,
+                                viewLodBias + extraLodBias,
+                                mipTrans);
+                        }
+                    }
+
+                    UInt maxActiveOrtho = NVSComputeOrthographicMaxActiveMip(mipCount);
+                    UInt maxMipEnd      = desiredMip + 1u;
+                    Bool tryOrthoRoot   = false;
+                    if (allowCoarseFallback && mipCount > 1u)
+                    {
+                        if (isPerspective)
+                        {
+                            maxMipEnd = mipCount;
+                        }
+                        else
+                        {
+                            maxMipEnd    = (desiredMip <= maxActiveOrtho) ? (maxActiveOrtho + 1u) : (desiredMip + 1u);
+                            tryOrthoRoot = ((mipCount - 1u) >= maxMipEnd);
+                        }
+                    }
+
+                    UInt dynMipEnd = maxMipEnd + (NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE >> 24u);
+                    for (UInt curMip = desiredMip; curMip < dynMipEnd; curMip++)
+                    {
+                        Float curTrans = (curMip == desiredMip) ? mipTrans : 0.0;
+                        NVSLookupResult cand = NVSEvaluateViewAtSpecificMip(
+                            viewIndex,
+                            curMip,
+                            desiredMip,
+                            curTrans,
+                            worldPos,
+                            safeNormal,
+                            texelPageOffsetXY,
+                            totalVPages,
+                            physPoolCap);
+                        if (curMip == desiredMip)
+                        {
+                            res = cand;
+                            if (cand.status == 0u || cand.status == 6u || cand.status == 7u)
+                            {
+                                break;
+                            }
+                        }
+                        else if (cand.status == 0u)
+                        {
+                            res = cand;
+                            break;
+                        }
+                    }
+
+                    if (tryOrthoRoot && res.status != 0u && res.status != 6u && res.status != 7u)
+                    {
+                        NVSLookupResult rootCand = NVSEvaluateViewAtSpecificMip(
+                            viewIndex,
+                            mipCount - 1u,
+                            desiredMip,
+                            0.0,
+                            worldPos,
+                            safeNormal,
+                            texelPageOffsetXY,
+                            totalVPages,
+                            physPoolCap);
+                        if (rootCand.status == 0u)
+                        {
+                            res = rootCand;
+                        }
+                    }
+                }
+            }
+        }
+
+        return res;
+    }
+
+    NVSLookupResult NVSResolveViewPageLookupOffset(
+        UInt viewIndex,
+        Vec3 worldPos,
+        Vec3 worldNormal,
+        Vec2 texelPageOffsetXY)
+    {
+        return NVSResolveViewPageLookupMipEx(
+            viewIndex,
+            worldPos,
+            worldNormal,
+            texelPageOffsetXY,
+            0.0,
+            ~0u,
+            true);
+    }
+
+    NVSLookupResult NVSResolveViewPageLookup(
+        UInt viewIndex,
+        Vec3 worldPos,
+        Vec3 worldNormal)
+    {
+        return NVSResolveViewPageLookupOffset(viewIndex, worldPos, worldNormal, Vec2(0.0, 0.0));
+    }
+
+    UInt NVSSelectPointCubeFaceView(UInt shadowViewBase, Vec3 worldPos)
+    {
+        UInt  bestFace     = shadowViewBase;
+        Float bestLz       = -1.0e30;
+        UInt  dynFaceCount = 6u + (NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE >> 24u);
+        for (UInt f = 0u; f < dynFaceCount; f++)
+        {
+            UInt fIdx   = shadowViewBase + f;
+            UInt fFlags = NVSShadowMetadata.LightViewTable[fIdx].NVS_VIEW_FLAGS;
+            if ((fFlags & 1u) != 0u)
+            {
+                Mat4  fLightToWorld = NVSShadowMetadata.LightViewTable[fIdx].NVS_VIEW_LIGHT_TO_WORLD;
+                Vec3  fLightPos     = Mul(fLightToWorld, Vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                Vec3  fDir          = NVSShadowMetadata.LightViewTable[fIdx].NVS_VIEW_DIR_AND_EXTRUSION.xyz;
+                Float fLz           = Dot(worldPos - fLightPos, fDir);
+                if (fLz > bestLz)
+                {
+                    bestLz   = fLz;
+                    bestFace = fIdx;
+                }
+            }
+        }
+        return bestFace;
+    }
+
+    NVSLookupResult NVSResolveShadowLookupOffset(
+        UInt shadowViewBase,
+        UInt shadowViewCount,
+        Vec3 worldPos,
+        Vec3 worldNormal,
+        Vec2 texelPageOffsetXY)
+    {
+        NVSLookupResult finalRes = NVSMakeEmptyLookupResult(7u);
+
+        if (NVSShadowMetadata.Params.NVS_SAMPLING_AVAILABLE == 0u)
+        {
+            finalRes.status = 5u;
+        }
+        else
+        {
+            UInt viewBufCount  = 0u;
+            UInt viewBufStride = 0u;
+            GetDimensions(NVSShadowMetadata.LightViewTable, viewBufCount, viewBufStride);
+            UInt viewTableLimit = Min(NVSShadowMetadata.Params.NVS_VIEW_TABLE_COUNT, viewBufCount);
+
+            if (shadowViewCount > 0u &&
+                shadowViewBase < viewTableLimit &&
+                (shadowViewBase + shadowViewCount) <= viewTableLimit)
+            {
+                UInt firstFlags    = NVSShadowMetadata.LightViewTable[shadowViewBase].NVS_VIEW_FLAGS;
+                Bool isPerspective = (firstFlags & 4u) != 0u;
+                UInt startView     = shadowViewBase;
+                UInt endView       = shadowViewBase + shadowViewCount;
+
+                // Point Light 6-face omnidirectional cube face selection (+X, -X, +Y, -Y, +Z, -Z)
+                if (isPerspective && shadowViewCount == 6u)
+                {
+                    UInt domView = NVSSelectPointCubeFaceView(shadowViewBase, worldPos);
+                    finalRes = NVSResolveViewPageLookupOffset(
+                        domView,
+                        worldPos,
+                        worldNormal,
+                        texelPageOffsetXY);
+                    if (finalRes.status == 6u)
+                    {
+                        UInt dynSix = 6u + (NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE >> 24u);
+                        for (UInt fOff = 0u; fOff < dynSix; fOff++)
+                        {
+                            UInt altView = shadowViewBase + fOff;
+                            if (altView != domView && altView < endView)
+                            {
+                                NVSLookupResult altCand = NVSResolveViewPageLookupOffset(
+                                    altView,
+                                    worldPos,
+                                    worldNormal,
+                                    texelPageOffsetXY);
+                                if (altCand.status != 6u && altCand.status != 7u)
+                                {
+                                    finalRes = altCand;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Spot Light (1 view) or Directional clipmaps (0 -> 3)
+                    Bool hasCandidate = false;
+                    Bool waitingSharp = false;
+                    UInt dynEndV      = endView + (NVSShadowMetadata.Params.NVS_PAGE_TEXEL_SIZE >> 24u);
+                    for (UInt v = startView; v < dynEndV; v++)
+                    {
+                        NVSLookupResult cand = NVSResolveViewPageLookupOffset(
+                            v,
+                            worldPos,
+                            worldNormal,
+                            texelPageOffsetXY);
+                        if (cand.status != 6u && cand.status != 7u)
+                        {
+                            UInt cFlags     = NVSShadowMetadata.LightViewTable[v].NVS_VIEW_FLAGS;
+                            UInt cMaxAct    = NVSComputeOrthographicMaxActiveMip(NVSExtractViewMipCount(cFlags));
+                            Bool isRootOnly = (!isPerspective) && (cand.status == 0u) && (cand.resolvedMipLevel > cMaxAct);
+                            if (!waitingSharp)
+                            {
+                                finalRes = cand;
+                                if (isRootOnly && (v + 1u) < endView)
+                                {
+                                    waitingSharp = true;
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+                            else if (cand.status == 0u && !isRootOnly)
+                            {
+                                finalRes = cand;
+                                break;
+                            }
+                        }
+                        else if (!hasCandidate && !waitingSharp)
+                        {
+                            finalRes     = cand;
+                            hasCandidate = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return finalRes;
+    }
+
+    NVSLookupResult NVSResolveShadowLookup(
+        UInt shadowViewBase,
+        UInt shadowViewCount,
+        Vec3 worldPos,
+        Vec3 worldNormal)
+    {
+        return NVSResolveShadowLookupOffset(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal,
+            Vec2(0.0, 0.0));
+    }
+}

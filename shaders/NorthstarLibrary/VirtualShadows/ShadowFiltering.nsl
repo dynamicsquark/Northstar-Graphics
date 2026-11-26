@@ -1,0 +1,1222 @@
+// =====================================================================
+//  ShadowFiltering.nsl — Northstar NSL Standard Library: Virtual Shadow Filtering
+//
+//  User-callable optional filtering, clipmap & virtual-mip transition blending,
+//  Spot/Point virtual LOD helpers, seamless 3D cube cross-face PCF, soft-shadow
+//  blocker search (PCSS), and residency/slice diagnostic helpers built on top
+//  of ShadowSampling.nsl.
+//
+//  Visual Ownership Contract:
+//    None of these functions are injected automatically by the engine.
+//    Developers choose whether to call hard comparison, PCF, Poisson disk,
+//    PCSS, virtual mip-LOD helpers, raw depth sampling, or custom filtering.
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualShadows/ShadowSampling.nsl")
+}
+
+LIBRARY
+{
+    // Low-discrepancy screen-space Interleaved Gradient Noise (zero periodic Sin/Frac striping)
+    Float NVSInterleavedGradientNoise(Vec2 screenPosXY)
+    {
+        return Frac(52.9829189 * Frac(Dot(screenPosXY, Vec2(0.06711056, 0.00583715))));
+    }
+
+    // Golden-angle Vogel spiral disk sample in unit circle for low-discrepancy soft shadow kernels
+    Vec2 NVSVogelDiskSample(UInt sampleIndex, UInt sampleCount, Float rotationRadians)
+    {
+        Float goldenAngle = 2.39996323;
+        Float r           = Sqrt((Float(sampleIndex) + 0.5) / Float(Max(sampleCount, 1u)));
+        Float theta       = (Float(sampleIndex) * goldenAngle) + rotationRadians;
+        return Vec2(Cos(theta) * r, Sin(theta) * r);
+    }
+
+    Float NVSSampleViewPCF2x2(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Float           invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        if (centerLookup.status == 6u)
+        {
+            result = 1.0;
+        }
+        else if (centerLookup.status != 5u && centerLookup.status != 7u)
+        {
+            Vec2  rpdbGrad = NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal);
+            UInt  tapCount = 4u + UInt(NVSLoopDynamicZero());
+            Float sumVis   = 0.0;
+            Float validCnt = 0.0;
+
+            for (UInt tIdx = 0u; tIdx < tapCount; tIdx++)
+            {
+                UInt dx     = tIdx & 1u;
+                UInt dy     = tIdx >> 1u;
+                Vec2 offset = Vec2(Float(dx) - 0.5, Float(dy) - 0.5);
+                NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                    viewIndex,
+                    centerLookup,
+                    worldNormal,
+                    offset,
+                    rpdbGrad);
+                if (tap.valid)
+                {
+                    sumVis   = sumVis + tap.visibility;
+                    validCnt = validCnt + 1.0;
+                }
+            }
+
+            if (validCnt > 0.0)
+            {
+                result = sumVis / validCnt;
+            }
+        }
+        return result;
+    }
+
+    Float NVSSampleViewPCF3x3(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Float           radiusTexels,
+        Float           invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        if (centerLookup.status == 6u)
+        {
+            result = 1.0;
+        }
+        else if (centerLookup.status != 5u && centerLookup.status != 7u)
+        {
+            Vec2 rpdbGrad = NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal);
+            if (radiusTexels <= 0.0001)
+            {
+                NVSShadowTapSample tap0 = NVSSampleCompareTapAtTexelOffsetGrad(
+                    viewIndex,
+                    centerLookup,
+                    worldNormal,
+                    Vec2(0.0, 0.0),
+                    rpdbGrad);
+                if (tap0.valid)
+                {
+                    result = tap0.visibility;
+                }
+            }
+            else
+            {
+                UInt  tapCount = 9u + UInt(NVSLoopDynamicZero());
+                Float r        = Max(radiusTexels, 0.0001);
+                Float sumVis   = 0.0;
+                Float validCnt = 0.0;
+
+                for (UInt tIdx = 0u; tIdx < tapCount; tIdx++)
+                {
+                    Int   dx     = Int(tIdx % 3u) - 1;
+                    Int   dy     = Int(tIdx / 3u) - 1;
+                    Float wx     = (dx == 0) ? 2.0 : 1.0;
+                    Float wy     = (dy == 0) ? 2.0 : 1.0;
+                    Float wTap   = wx * wy;
+                    Vec2  offset = Vec2(Float(dx) * r, Float(dy) * r);
+                    NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                        viewIndex,
+                        centerLookup,
+                        worldNormal,
+                        offset,
+                        rpdbGrad);
+                    if (tap.valid)
+                    {
+                        sumVis   = sumVis + (wTap * tap.visibility);
+                        validCnt = validCnt + wTap;
+                    }
+                }
+
+                if (validCnt > 0.0)
+                {
+                    result = sumVis / validCnt;
+                }
+            }
+        }
+        return result;
+    }
+
+    Float NVSSampleViewPCF5x5(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Float           radiusTexels,
+        Float           invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        if (centerLookup.status == 6u)
+        {
+            result = 1.0;
+        }
+        else if (centerLookup.status != 5u && centerLookup.status != 7u)
+        {
+            Vec2 rpdbGrad = NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal);
+            if (radiusTexels <= 0.0001)
+            {
+                NVSShadowTapSample tap0 = NVSSampleCompareTapAtTexelOffsetGrad(
+                    viewIndex,
+                    centerLookup,
+                    worldNormal,
+                    Vec2(0.0, 0.0),
+                    rpdbGrad);
+                if (tap0.valid)
+                {
+                    result = tap0.visibility;
+                }
+            }
+            else
+            {
+                UInt  tapCount   = 25u + UInt(NVSLoopDynamicZero());
+                Float r          = Max(radiusTexels, 0.0001);
+                Float stepTexels = 0.5 * r;
+                Float sumVis     = 0.0;
+                Float validCnt   = 0.0;
+
+                for (UInt tIdx = 0u; tIdx < tapCount; tIdx++)
+                {
+                    Int   dx     = Int(tIdx % 5u) - 2;
+                    Int   dy     = Int(tIdx / 5u) - 2;
+                    Float adx    = Abs(Float(dx));
+                    Float ady    = Abs(Float(dy));
+                    Float wx     = (adx < 0.5) ? 6.0 : ((adx < 1.5) ? 4.0 : 1.0);
+                    Float wy     = (ady < 0.5) ? 6.0 : ((ady < 1.5) ? 4.0 : 1.0);
+                    Float wTap   = wx * wy;
+                    Vec2  offset = Vec2(Float(dx) * stepTexels, Float(dy) * stepTexels);
+                    NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                        viewIndex,
+                        centerLookup,
+                        worldNormal,
+                        offset,
+                        rpdbGrad);
+                    if (tap.valid)
+                    {
+                        sumVis   = sumVis + (wTap * tap.visibility);
+                        validCnt = validCnt + wTap;
+                    }
+                }
+
+                if (validCnt > 0.0)
+                {
+                    result = sumVis / validCnt;
+                }
+            }
+        }
+        return result;
+    }
+
+    Vec2 NVSPoissonDisk8Sample(UInt index)
+    {
+        Vec2 sampleOffset = Vec2(-0.4419, -0.4419);
+        if (index == 0u)      { sampleOffset = Vec2(-0.7071,  0.7071); }
+        else if (index == 1u) { sampleOffset = Vec2(-0.0001, -0.8750); }
+        else if (index == 2u) { sampleOffset = Vec2( 0.5303,  0.5303); }
+        else if (index == 3u) { sampleOffset = Vec2(-0.6250, -0.0001); }
+        else if (index == 4u) { sampleOffset = Vec2( 0.3536, -0.3536); }
+        else if (index == 5u) { sampleOffset = Vec2(-0.2652,  0.2652); }
+        else if (index == 6u) { sampleOffset = Vec2( 0.8750,  0.0001); }
+        return sampleOffset;
+    }
+
+    Float NVSSampleViewPoisson8Grad(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldNormal,
+        Float           radiusTexels,
+        Float           rotationRadians,
+        Vec2            rpdbGrad,
+        Float           invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        if (centerLookup.status == 6u)
+        {
+            result = 1.0;
+        }
+        else if (centerLookup.status != 5u && centerLookup.status != 7u)
+        {
+            if (radiusTexels <= 0.0001)
+            {
+                NVSShadowTapSample tap0 = NVSSampleCompareTapAtTexelOffsetGrad(
+                    viewIndex,
+                    centerLookup,
+                    worldNormal,
+                    Vec2(0.0, 0.0),
+                    rpdbGrad);
+                if (tap0.valid)
+                {
+                    result = tap0.visibility;
+                }
+            }
+            else
+            {
+                UInt  tapLimit = 8u + UInt(NVSLoopDynamicZero());
+                Float r        = Max(radiusTexels, 0.0001);
+                Float s        = Sin(rotationRadians);
+                Float c        = Cos(rotationRadians);
+                Float sumVis   = 0.0;
+                Float validCnt = 0.0;
+
+                for (UInt k = 0u; k < tapLimit; k++)
+                {
+                    Vec2 p   = NVSPoissonDisk8Sample(k);
+                    Vec2 rot = Vec2(p.x * c - p.y * s, p.x * s + p.y * c) * r;
+                    NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                        viewIndex,
+                        centerLookup,
+                        worldNormal,
+                        rot,
+                        rpdbGrad);
+                    if (tap.valid)
+                    {
+                        sumVis   = sumVis + tap.visibility;
+                        validCnt = validCnt + 1.0;
+                    }
+                }
+
+                if (validCnt > 0.0)
+                {
+                    result = sumVis / validCnt;
+                }
+            }
+        }
+        return result;
+    }
+
+    Float NVSSampleViewPoisson8(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Float           radiusTexels,
+        Float           rotationRadians,
+        Float           invalidPageFallbackVisibility)
+    {
+        Vec2 rpdbGrad = NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal);
+        return NVSSampleViewPoisson8Grad(
+            viewIndex,
+            centerLookup,
+            worldNormal,
+            radiusTexels,
+            rotationRadians,
+            rpdbGrad,
+            invalidPageFallbackVisibility);
+    }
+
+    Float NVSSampleViewPCSSSoft(
+        UInt            viewIndex,
+        NVSLookupResult centerLookup,
+        Vec3            worldPos,
+        Vec3            worldNormal,
+        Float           lightSourceRadiusTexels,
+        Float           rotationRadians,
+        Float           invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        if (centerLookup.status == 6u)
+        {
+            result = 1.0;
+        }
+        else if (centerLookup.status != 5u && centerLookup.status != 7u)
+        {
+            Vec2  rpdbGrad       = NVSComputeReceiverPlaneDepthGradientPerTexel(viewIndex, centerLookup, worldNormal);
+            UInt  viewFlags      = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_FLAGS;
+            Bool  isReversedZ    = (viewFlags & 2u) != 0u;
+            Bool  isPerspective  = (viewFlags & 4u) != 0u;
+            Float cMinZ          = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MIN_Z;
+            Float cMaxZ          = NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_CASTER_MAX_Z;
+            Float zSpan          = Max(cMaxZ - cMinZ, 0.0001);
+            Float mipScale       = Float(1u << centerLookup.resolvedMipLevel);
+            Float baseTexelAttr  = Max(NVSShadowMetadata.LightViewTable[viewIndex].NVS_VIEW_TEXEL_WORLD_SIZE, 0.000001);
+            Float softnessParam  = Max(lightSourceRadiusTexels, 0.25);
+
+            // Resolution-independent physical penumbra parameters (identical world softness across RES_512..RES_16384)
+            Float recZ            = Max(centerLookup.receiverLightZ, cMinZ);
+            Float localTexelWorld = isPerspective
+                ? Max((baseTexelAttr * mipScale) * recZ, 0.0001)
+                : Max(baseTexelAttr * mipScale, 0.0001);
+            Float lightRadWorld   = Clamp(softnessParam * 0.06, 0.01, 2.0);
+            Float tanLightAngle   = Clamp(softnessParam * 0.006, 0.001, 0.08);
+            Float searchWorld     = isPerspective
+                ? (lightRadWorld * Max((recZ - cMinZ) / recZ, 0.25))
+                : (tanLightAngle * 2.5);
+            Float searchRad       = Clamp(searchWorld / localTexelWorld, 1.5, 10.0);
+
+            UInt  blockerTapCount = 16u + UInt(NVSLoopDynamicZero());
+            Float blockerMargin   = 0.5 * (Abs(rpdbGrad.x) + Abs(rpdbGrad.y));
+            Float blockerSum      = 0.0;
+            Float blockerCnt      = 0.0;
+            Float validTaps       = 0.0;
+
+            for (UInt k = 0u; k < blockerTapCount; k++)
+            {
+                // Always include exact center tap (0,0) as tap 0 so thin wires/pins directly over
+                // the receiver pixel are guaranteed to be detected regardless of searchRad!
+                Float tapScale = (k == 0u) ? 0.0 : searchRad;
+                Vec2  offset   = NVSVogelDiskSample(k, 16u, rotationRadians) * tapScale;
+                NVSShadowTapSample tap = NVSSampleRawTapAtTexelOffsetGrad(
+                    viewIndex,
+                    centerLookup,
+                    worldNormal,
+                    offset,
+                    rpdbGrad);
+                if (tap.valid)
+                {
+                    validTaps = validTaps + 1.0;
+                    Bool isBlocker = isReversedZ
+                        ? (tap.rawDepth > (tap.compareDepth + blockerMargin))
+                        : (tap.rawDepth < (tap.compareDepth - blockerMargin));
+                    if (isBlocker)
+                    {
+                        Float blkMetric = 0.0;
+                        if (isPerspective)
+                        {
+                            Float denom = isReversedZ
+                                ? Max(cMinZ + (tap.rawDepth * zSpan), 0.0001)
+                                : Max(cMaxZ - (tap.rawDepth * zSpan), 0.0001);
+                            blkMetric = (cMinZ * cMaxZ) / denom;
+                        }
+                        else
+                        {
+                            blkMetric = isReversedZ
+                                ? (cMaxZ - (tap.rawDepth * zSpan))
+                                : (cMinZ + (tap.rawDepth * zSpan));
+                        }
+                        blockerSum = blockerSum + blkMetric;
+                        blockerCnt = blockerCnt + 1.0;
+                    }
+                }
+            }
+
+            if (validTaps > 0.0)
+            {
+                if (blockerCnt == 0.0)
+                {
+                    result = 1.0;
+                }
+                else
+                {
+                    Float avgBlocker    = blockerSum / blockerCnt;
+                    Float penumbraWorld = 0.0;
+                    if (isPerspective)
+                    {
+                        Float penumbraRatio = Max(recZ - avgBlocker, 0.0) / Max(avgBlocker, 0.01);
+                        penumbraWorld       = lightRadWorld * penumbraRatio;
+                    }
+                    else
+                    {
+                        Float blockerDistWorld = Max(centerLookup.receiverLightZ - avgBlocker, 0.0);
+                        penumbraWorld          = blockerDistWorld * tanLightAngle;
+                    }
+                    Float filterRadius = Clamp(penumbraWorld / localTexelWorld, 0.5, 10.0);
+
+                    UInt  pcfTapCount = 16u + UInt(NVSLoopDynamicZero());
+                    Float pcfSum      = 0.0;
+                    Float pcfWeight   = 0.0;
+                    Float pcfRot      = rotationRadians + 1.04719755;
+
+                    for (UInt pIdx = 0u; pIdx < pcfTapCount; pIdx++)
+                    {
+                        Vec2 offset = NVSVogelDiskSample(pIdx, 16u, pcfRot) * filterRadius;
+                        NVSShadowTapSample pTap = NVSSampleCompareTapAtTexelOffsetGrad(
+                            viewIndex,
+                            centerLookup,
+                            worldNormal,
+                            offset,
+                            rpdbGrad);
+                        if (pTap.valid)
+                        {
+                            pcfSum    = pcfSum + pTap.visibility;
+                            pcfWeight = pcfWeight + 1.0;
+                        }
+                    }
+
+                    NVSShadowTapSample centerTap = NVSSampleCompareTapAtTexelOffsetGrad(
+                        viewIndex,
+                        centerLookup,
+                        worldNormal,
+                        Vec2(0.0, 0.0),
+                        rpdbGrad);
+                    if (centerTap.valid)
+                    {
+                        pcfSum    = pcfSum + (2.0 * centerTap.visibility);
+                        pcfWeight = pcfWeight + 2.0;
+                    }
+
+                    if (pcfWeight > 0.0)
+                    {
+                        result = pcfSum / pcfWeight;
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    struct NVSResolvedLightShadowViews
+    {
+        UInt            baseStatus;
+        UInt            activeView;
+        NVSLookupResult activeLookup;
+        Bool            doTransition;
+        Float           transitionFactor;
+        UInt            nextView;
+        NVSLookupResult nextLookup;
+    };
+
+    NVSResolvedLightShadowViews NVSResolveLightShadowViewsMipEx(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float extraLodBias)
+    {
+        NVSResolvedLightShadowViews outViews;
+        outViews.baseStatus       = 7u;
+        outViews.activeView       = ~0u;
+        outViews.activeLookup     = NVSMakeEmptyLookupResult(7u);
+        outViews.doTransition     = false;
+        outViews.transitionFactor = 0.0;
+        outViews.nextView         = ~0u;
+        outViews.nextLookup       = NVSMakeEmptyLookupResult(7u);
+
+        if (NVSShadowMetadata.Params.NVS_SAMPLING_AVAILABLE == 0u)
+        {
+            outViews.baseStatus = 5u;
+        }
+        else
+        {
+            UInt viewBufCount  = 0u;
+            UInt viewBufStride = 0u;
+            GetDimensions(NVSShadowMetadata.LightViewTable, viewBufCount, viewBufStride);
+            UInt viewTableLimit = Min(NVSShadowMetadata.Params.NVS_VIEW_TABLE_COUNT, viewBufCount);
+
+            if (shadowViewCount > 0u &&
+                shadowViewBase < viewTableLimit &&
+                (shadowViewBase + shadowViewCount) <= viewTableLimit)
+            {
+                UInt firstFlags    = NVSShadowMetadata.LightViewTable[shadowViewBase].NVS_VIEW_FLAGS;
+                Bool isPerspective = (firstFlags & 4u) != 0u;
+
+                UInt startView = shadowViewBase;
+                UInt endView   = shadowViewBase + shadowViewCount;
+
+                if (isPerspective && shadowViewCount == 6u)
+                {
+                    UInt domFace = NVSSelectPointCubeFaceView(shadowViewBase, worldPos);
+                    startView    = domFace;
+                    endView      = domFace + 1u;
+                }
+
+                Bool hasFirstCandidate = false;
+                Bool foundCovering     = false;
+                Bool needCoarseSearch  = false;
+                Bool needTransition    = false;
+                Bool inPerspTransition = false;
+                UInt curView           = startView;
+                UInt mipOverride       = ~0u;
+                Bool allowFallback     = true;
+                UInt iterLimit         = ((endView - startView) + 1u) + UInt(NVSLoopDynamicZero());
+
+                for (UInt step = 0u; step < iterLimit; step++)
+                {
+                    if (curView >= endView)
+                    {
+                        break;
+                    }
+
+                    NVSLookupResult cand = NVSResolveViewPageLookupMipEx(
+                        curView,
+                        worldPos,
+                        worldNormal,
+                        Vec2(0.0, 0.0),
+                        extraLodBias,
+                        mipOverride,
+                        allowFallback);
+
+                    if (inPerspTransition)
+                    {
+                        if (cand.status == 0u)
+                        {
+                            outViews.doTransition     = true;
+                            outViews.transitionFactor = outViews.activeLookup.mipTransition;
+                            outViews.nextView         = curView;
+                            outViews.nextLookup       = cand;
+                        }
+                        break;
+                    }
+
+                    if (!hasFirstCandidate)
+                    {
+                        outViews.baseStatus   = cand.status;
+                        outViews.activeView   = cand.selectedViewIndex;
+                        outViews.activeLookup = cand;
+                        hasFirstCandidate     = true;
+                    }
+
+                    if (!foundCovering)
+                    {
+                        if (cand.status != 6u && cand.status != 7u)
+                        {
+                            foundCovering             = true;
+                            outViews.baseStatus       = cand.status;
+                            outViews.activeView       = curView;
+                            outViews.activeLookup     = cand;
+                            outViews.transitionFactor = cand.clipmapTransition;
+
+                            UInt vFlags         = NVSShadowMetadata.LightViewTable[curView].NVS_VIEW_FLAGS;
+                            UInt mipCount       = NVSExtractViewMipCount(vFlags);
+                            UInt maxActiveOrtho = NVSComputeOrthographicMaxActiveMip(mipCount);
+                            Bool isRootOnly     = (!isPerspective) && (cand.status == 0u) && (cand.resolvedMipLevel > maxActiveOrtho);
+
+                            if (isPerspective)
+                            {
+                                if (cand.status == 0u &&
+                                    cand.usedCoarseFallback == 0u &&
+                                    cand.mipTransition > 0.001 &&
+                                    (cand.resolvedMipLevel + 1u) < mipCount)
+                                {
+                                    inPerspTransition = true;
+                                    mipOverride       = cand.resolvedMipLevel + 1u;
+                                    allowFallback     = false;
+                                }
+                                else
+                                {
+                                    break;
+                                }
+                            }
+                            else if ((cand.status != 0u || isRootOnly) && (curView + 1u) < endView)
+                            {
+                                needCoarseSearch = true;
+                                curView          = curView + 1u;
+                            }
+                            else if (cand.status == 0u && cand.clipmapTransition > 0.001 && (curView + 1u) < endView)
+                            {
+                                needTransition = true;
+                                curView        = curView + 1u;
+                            }
+                            else if (cand.status == 0u &&
+                                     cand.usedCoarseFallback == 0u &&
+                                     cand.mipTransition > 0.001 &&
+                                     (cand.resolvedMipLevel + 1u) <= maxActiveOrtho)
+                            {
+                                inPerspTransition = true;
+                                mipOverride       = cand.resolvedMipLevel + 1u;
+                                allowFallback     = false;
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            curView = curView + 1u;
+                        }
+                    }
+                    else if (needCoarseSearch)
+                    {
+                        if (cand.status == 0u)
+                        {
+                            UInt cFlags2   = NVSShadowMetadata.LightViewTable[curView].NVS_VIEW_FLAGS;
+                            UInt cMaxAct2  = NVSComputeOrthographicMaxActiveMip(NVSExtractViewMipCount(cFlags2));
+                            Bool cRootOnly = (!isPerspective) && (cand.resolvedMipLevel > cMaxAct2);
+                            if (outViews.activeLookup.status != 0u)
+                            {
+                                outViews.activeView   = curView;
+                                outViews.activeLookup = cand;
+                                if (!cRootOnly)
+                                {
+                                    break;
+                                }
+                            }
+                            else if (!cRootOnly)
+                            {
+                                outViews.activeView   = curView;
+                                outViews.activeLookup = cand;
+                                break;
+                            }
+                        }
+                        curView = curView + 1u;
+                    }
+                    else if (needTransition)
+                    {
+                        if (cand.status == 0u)
+                        {
+                            outViews.doTransition = true;
+                            outViews.nextView     = curView;
+                            outViews.nextLookup   = cand;
+                        }
+                        break;
+                    }
+                }
+
+                // Point Light 6-face 45-degree boundary seam recovery:
+                // If normal bias pushed the receiver slightly outside the dominant cube face (status == 6u),
+                // resolve the neighbor cube face containing the biased point (zero hot-path cost on interior pixels).
+                if (isPerspective && shadowViewCount == 6u && !foundCovering)
+                {
+                    UInt domFace = startView;
+                    UInt dynSix  = 6u + UInt(NVSLoopDynamicZero());
+                    for (UInt fOff = 0u; fOff < dynSix; fOff++)
+                    {
+                        UInt altFace = shadowViewBase + fOff;
+                        if (altFace != domFace && altFace < (shadowViewBase + 6u))
+                        {
+                            NVSLookupResult altCand = NVSResolveViewPageLookupMipEx(
+                                altFace,
+                                worldPos,
+                                worldNormal,
+                                Vec2(0.0, 0.0),
+                                extraLodBias,
+                                ~0u,
+                                true);
+                            if (altCand.status != 6u && altCand.status != 7u)
+                            {
+                                outViews.baseStatus       = altCand.status;
+                                outViews.activeView       = altFace;
+                                outViews.activeLookup     = altCand;
+                                outViews.transitionFactor = altCand.mipTransition;
+                                UInt altFlags             = NVSShadowMetadata.LightViewTable[altFace].NVS_VIEW_FLAGS;
+                                UInt altMipCount          = NVSExtractViewMipCount(altFlags);
+                                if (altCand.status == 0u &&
+                                    altCand.usedCoarseFallback == 0u &&
+                                    altCand.mipTransition > 0.001 &&
+                                    (altCand.resolvedMipLevel + 1u) < altMipCount)
+                                {
+                                    NVSLookupResult nextCand = NVSResolveViewPageLookupMipEx(
+                                        altFace,
+                                        worldPos,
+                                        worldNormal,
+                                        Vec2(0.0, 0.0),
+                                        extraLodBias,
+                                        altCand.resolvedMipLevel + 1u,
+                                        false);
+                                    if (nextCand.status == 0u)
+                                    {
+                                        outViews.doTransition     = true;
+                                        outViews.transitionFactor = altCand.mipTransition;
+                                        outViews.nextView         = altFace;
+                                        outViews.nextLookup       = nextCand;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return outViews;
+    }
+
+    NVSResolvedLightShadowViews NVSResolveLightShadowViews(
+        UInt shadowViewBase,
+        UInt shadowViewCount,
+        Vec3 worldPos,
+        Vec3 worldNormal)
+    {
+        return NVSResolveLightShadowViewsMipEx(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal,
+            0.0);
+    }
+
+    // Optional explicit Spot Light virtual mip-hierarchy lookup helper
+    NVSLookupResult NVSResolveSpotShadowMipLookup(
+        UInt  spotViewIndex,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float extraLodBias)
+    {
+        return NVSResolveViewPageLookupMipEx(
+            spotViewIndex,
+            worldPos,
+            worldNormal,
+            Vec2(0.0, 0.0),
+            extraLodBias,
+            ~0u,
+            true);
+    }
+
+    // Optional explicit Point Light 6-face virtual cubemap mip-hierarchy lookup helper
+    NVSLookupResult NVSResolvePointShadowMipLookup(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float extraLodBias)
+    {
+        NVSLookupResult outLk = NVSMakeEmptyLookupResult(7u);
+        if (NVSShadowMetadata.Params.NVS_SAMPLING_AVAILABLE == 0u)
+        {
+            outLk.status = 5u;
+        }
+        else
+        {
+            UInt viewBufCount  = 0u;
+            UInt viewBufStride = 0u;
+            GetDimensions(NVSShadowMetadata.LightViewTable, viewBufCount, viewBufStride);
+            UInt viewTableLimit = Min(NVSShadowMetadata.Params.NVS_VIEW_TABLE_COUNT, viewBufCount);
+            if (shadowViewCount >= 6u && (shadowViewBase + 6u) <= viewTableLimit)
+            {
+                UInt faceView = NVSSelectPointCubeFaceView(shadowViewBase, worldPos);
+                outLk = NVSResolveViewPageLookupMipEx(
+                    faceView,
+                    worldPos,
+                    worldNormal,
+                    Vec2(0.0, 0.0),
+                    extraLodBias,
+                    ~0u,
+                    true);
+                if (outLk.status == 6u)
+                {
+                    UInt dynSix = 6u + UInt(NVSLoopDynamicZero());
+                    for (UInt fOff = 0u; fOff < dynSix; fOff++)
+                    {
+                        UInt altFace = shadowViewBase + fOff;
+                        if (altFace != faceView && altFace < (shadowViewBase + 6u))
+                        {
+                            NVSLookupResult altLk = NVSResolveViewPageLookupMipEx(
+                                altFace,
+                                worldPos,
+                                worldNormal,
+                                Vec2(0.0, 0.0),
+                                extraLodBias,
+                                ~0u,
+                                true);
+                            if (altLk.status != 6u && altLk.status != 7u)
+                            {
+                                outLk = altLk;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return outLk;
+    }
+
+    Float NVSSampleLightShadowMipPCF3x3(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float radiusTexels,
+        Float extraLodBias,
+        Float invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        NVSResolvedLightShadowViews views = NVSResolveLightShadowViewsMipEx(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal,
+            extraLodBias);
+
+        if (views.baseStatus == 6u)
+        {
+            result = 1.0;
+        }
+        else if (views.baseStatus != 5u && views.baseStatus != 7u && views.activeView != (~0u))
+        {
+            Vec2 grad0 = NVSComputeReceiverPlaneDepthGradientPerTexel(views.activeView, views.activeLookup, worldNormal);
+            Vec2 grad1 = views.doTransition
+                ? NVSComputeReceiverPlaneDepthGradientPerTexel(views.nextView, views.nextLookup, worldNormal)
+                : grad0;
+            if (radiusTexels <= 0.0001)
+            {
+                NVSShadowTapSample tap0 = NVSSampleCompareTapAtTexelOffsetGrad(
+                    views.activeView,
+                    views.activeLookup,
+                    worldNormal,
+                    Vec2(0.0, 0.0),
+                    grad0);
+                Float vis0 = tap0.valid
+                    ? tap0.visibility
+                    : ((views.activeLookup.status == 6u) ? 1.0 : invalidPageFallbackVisibility);
+                if (views.doTransition)
+                {
+                    NVSShadowTapSample tap1 = NVSSampleCompareTapAtTexelOffsetGrad(
+                        views.nextView,
+                        views.nextLookup,
+                        worldNormal,
+                        Vec2(0.0, 0.0),
+                        grad1);
+                    Float vis1 = tap1.valid
+                        ? tap1.visibility
+                        : ((views.nextLookup.status == 6u) ? 1.0 : vis0);
+                    result = Lerp(vis0, vis1, views.transitionFactor);
+                }
+                else
+                {
+                    result = vis0;
+                }
+            }
+            else
+            {
+                Float r         = Max(radiusTexels, 0.0001);
+                UInt  totalTaps = (views.doTransition ? 18u : 9u) + UInt(NVSLoopDynamicZero());
+                Float sum0      = 0.0;
+                Float cnt0      = 0.0;
+                Float sum1      = 0.0;
+                Float cnt1      = 0.0;
+
+                for (UInt m = 0u; m < totalTaps; m++)
+                {
+                    Bool            isSecond  = (m >= 9u);
+                    UInt            localIdx  = isSecond ? (m - 9u) : m;
+                    UInt            curView   = isSecond ? views.nextView : views.activeView;
+                    Vec2            curGrad   = isSecond ? grad1 : grad0;
+                    NVSLookupResult curLookup = views.activeLookup;
+                    if (isSecond)
+                    {
+                        curLookup = views.nextLookup;
+                    }
+                    if (curLookup.status != 5u && curLookup.status != 6u && curLookup.status != 7u)
+                    {
+                        Int   dx     = Int(localIdx % 3u) - 1;
+                        Int   dy     = Int(localIdx / 3u) - 1;
+                        Float wx     = (dx == 0) ? 2.0 : 1.0;
+                        Float wy     = (dy == 0) ? 2.0 : 1.0;
+                        Float wTap   = wx * wy;
+                        Vec2  offset = Vec2(Float(dx) * r, Float(dy) * r);
+                        NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                            curView,
+                            curLookup,
+                            worldNormal,
+                            offset,
+                            curGrad);
+                        if (tap.valid)
+                        {
+                            if (isSecond)
+                            {
+                                sum1 = sum1 + (wTap * tap.visibility);
+                                cnt1 = cnt1 + wTap;
+                            }
+                            else
+                            {
+                                sum0 = sum0 + (wTap * tap.visibility);
+                                cnt0 = cnt0 + wTap;
+                            }
+                        }
+                    }
+                }
+
+                Float vis0 = (views.activeLookup.status == 6u)
+                    ? 1.0
+                    : ((cnt0 > 0.0) ? (sum0 / cnt0) : invalidPageFallbackVisibility);
+                if (views.doTransition)
+                {
+                    Float vis1 = (views.nextLookup.status == 6u)
+                        ? 1.0
+                        : ((cnt1 > 0.0) ? (sum1 / cnt1) : vis0);
+                    result = Lerp(vis0, vis1, views.transitionFactor);
+                }
+                else
+                {
+                    result = vis0;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    Float NVSSampleSpotShadowMipPCF3x3(
+        UInt  spotViewIndex,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float radiusTexels,
+        Float extraLodBias,
+        Float invalidPageFallbackVisibility)
+    {
+        return NVSSampleLightShadowMipPCF3x3(
+            spotViewIndex,
+            1u,
+            worldPos,
+            worldNormal,
+            radiusTexels,
+            extraLodBias,
+            invalidPageFallbackVisibility);
+    }
+
+    Float NVSSamplePointShadowMipPCF3x3(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float radiusTexels,
+        Float extraLodBias,
+        Float invalidPageFallbackVisibility)
+    {
+        return NVSSampleLightShadowMipPCF3x3(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal,
+            radiusTexels,
+            extraLodBias,
+            invalidPageFallbackVisibility);
+    }
+
+    // Evaluates shadow visibility for any NVS shadow-casting light (Directional 4-level
+    // clipmaps with cross-level transition, Spot virtual mip cone, or Point 6-face virtual mip cube).
+    Float NVSSampleLightShadowPCF3x3(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float radiusTexels,
+        Float invalidPageFallbackVisibility)
+    {
+        return NVSSampleLightShadowMipPCF3x3(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal,
+            radiusTexels,
+            0.0,
+            invalidPageFallbackVisibility);
+    }
+
+    Float NVSSampleLightShadowPCF5x5(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float radiusTexels,
+        Float invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        NVSResolvedLightShadowViews views = NVSResolveLightShadowViews(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal);
+
+        if (views.baseStatus == 6u)
+        {
+            result = 1.0;
+        }
+        else if (views.baseStatus != 5u && views.baseStatus != 7u && views.activeView != (~0u))
+        {
+            Vec2 grad0 = NVSComputeReceiverPlaneDepthGradientPerTexel(views.activeView, views.activeLookup, worldNormal);
+            Vec2 grad1 = views.doTransition
+                ? NVSComputeReceiverPlaneDepthGradientPerTexel(views.nextView, views.nextLookup, worldNormal)
+                : grad0;
+            if (radiusTexels <= 0.0001)
+            {
+                NVSShadowTapSample tap0 = NVSSampleCompareTapAtTexelOffsetGrad(
+                    views.activeView,
+                    views.activeLookup,
+                    worldNormal,
+                    Vec2(0.0, 0.0),
+                    grad0);
+                Float vis0 = tap0.valid
+                    ? tap0.visibility
+                    : ((views.activeLookup.status == 6u) ? 1.0 : invalidPageFallbackVisibility);
+                if (views.doTransition)
+                {
+                    NVSShadowTapSample tap1 = NVSSampleCompareTapAtTexelOffsetGrad(
+                        views.nextView,
+                        views.nextLookup,
+                        worldNormal,
+                        Vec2(0.0, 0.0),
+                        grad1);
+                    Float vis1 = tap1.valid
+                        ? tap1.visibility
+                        : ((views.nextLookup.status == 6u) ? 1.0 : vis0);
+                    result = Lerp(vis0, vis1, views.transitionFactor);
+                }
+                else
+                {
+                    result = vis0;
+                }
+            }
+            else
+            {
+                Float r          = Max(radiusTexels, 0.0001);
+                Float stepTexels = 0.5 * r;
+                UInt  totalTaps  = (views.doTransition ? 50u : 25u) + UInt(NVSLoopDynamicZero());
+                Float sum0       = 0.0;
+                Float cnt0       = 0.0;
+                Float sum1       = 0.0;
+                Float cnt1       = 0.0;
+
+                for (UInt m = 0u; m < totalTaps; m++)
+                {
+                    Bool            isSecond  = (m >= 25u);
+                    UInt            localIdx  = isSecond ? (m - 25u) : m;
+                    UInt            curView   = isSecond ? views.nextView : views.activeView;
+                    Vec2            curGrad   = isSecond ? grad1 : grad0;
+                    NVSLookupResult curLookup = views.activeLookup;
+                    if (isSecond)
+                    {
+                        curLookup = views.nextLookup;
+                    }
+                    if (curLookup.status != 5u && curLookup.status != 6u && curLookup.status != 7u)
+                    {
+                        Int   dx     = Int(localIdx % 5u) - 2;
+                        Int   dy     = Int(localIdx / 5u) - 2;
+                        Float adx    = Abs(Float(dx));
+                        Float ady    = Abs(Float(dy));
+                        Float wx     = (adx < 0.5) ? 6.0 : ((adx < 1.5) ? 4.0 : 1.0);
+                        Float wy     = (ady < 0.5) ? 6.0 : ((ady < 1.5) ? 4.0 : 1.0);
+                        Float wTap   = wx * wy;
+                        Vec2  offset = Vec2(Float(dx) * stepTexels, Float(dy) * stepTexels);
+                        NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                            curView,
+                            curLookup,
+                            worldNormal,
+                            offset,
+                            curGrad);
+                        if (tap.valid)
+                        {
+                            if (isSecond)
+                            {
+                                sum1 = sum1 + (wTap * tap.visibility);
+                                cnt1 = cnt1 + wTap;
+                            }
+                            else
+                            {
+                                sum0 = sum0 + (wTap * tap.visibility);
+                                cnt0 = cnt0 + wTap;
+                            }
+                        }
+                    }
+                }
+
+                Float vis0 = (views.activeLookup.status == 6u)
+                    ? 1.0
+                    : ((cnt0 > 0.0) ? (sum0 / cnt0) : invalidPageFallbackVisibility);
+                if (views.doTransition)
+                {
+                    Float vis1 = (views.nextLookup.status == 6u)
+                        ? 1.0
+                        : ((cnt1 > 0.0) ? (sum1 / cnt1) : vis0);
+                    result = Lerp(vis0, vis1, views.transitionFactor);
+                }
+                else
+                {
+                    result = vis0;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    Float NVSSampleLightShadowPCSS(
+        UInt  shadowViewBase,
+        UInt  shadowViewCount,
+        Vec3  worldPos,
+        Vec3  worldNormal,
+        Float lightSourceSoftness,
+        Float rotationRadians,
+        Float invalidPageFallbackVisibility)
+    {
+        Float result = invalidPageFallbackVisibility;
+        NVSResolvedLightShadowViews views = NVSResolveLightShadowViews(
+            shadowViewBase,
+            shadowViewCount,
+            worldPos,
+            worldNormal);
+
+        if (views.baseStatus == 6u)
+        {
+            result = 1.0;
+        }
+        else if (views.baseStatus != 5u && views.baseStatus != 7u && views.activeView != (~0u))
+        {
+            Float vis0 = NVSSampleViewPCSSSoft(
+                views.activeView,
+                views.activeLookup,
+                worldPos,
+                worldNormal,
+                lightSourceSoftness,
+                rotationRadians,
+                invalidPageFallbackVisibility);
+            if (views.doTransition)
+            {
+                Float vis1 = NVSSampleViewPCSSSoft(
+                    views.nextView,
+                    views.nextLookup,
+                    worldPos,
+                    worldNormal,
+                    lightSourceSoftness,
+                    rotationRadians,
+                    vis0);
+                result = Lerp(vis0, vis1, views.transitionFactor);
+            }
+            else
+            {
+                result = vis0;
+            }
+        }
+
+        return result;
+    }
+
+    Vec3 NVSDebugClipmapLevelColor(UInt subIndex)
+    {
+        Vec3 col = Vec3(0.85, 0.85, 0.85);
+        if (subIndex == 0u)      { col = Vec3(0.95, 0.15, 0.15); }
+        else if (subIndex == 1u) { col = Vec3(0.15, 0.90, 0.15); }
+        else if (subIndex == 2u) { col = Vec3(0.15, 0.40, 0.98); }
+        else if (subIndex == 3u) { col = Vec3(0.98, 0.88, 0.15); }
+        else if (subIndex == 4u) { col = Vec3(0.92, 0.20, 0.90); }
+        else if (subIndex == 5u) { col = Vec3(0.15, 0.90, 0.92); }
+        else if (subIndex == 6u) { col = Vec3(0.98, 0.55, 0.15); }
+        else if (subIndex == 7u) { col = Vec3(0.55, 0.35, 0.95); }
+        return col;
+    }
+
+    Vec3 NVSDebugVirtualMipColor(UInt mipLevel)
+    {
+        return NVSDebugClipmapLevelColor(mipLevel);
+    }
+
+    Vec3 NVSDebugPageSliceColor(UInt physicalPageIndex, Vec2 sliceUV)
+    {
+        Vec3 col = Vec3(0.25, 0.25, 0.25);
+        if (physicalPageIndex != (~0u))
+        {
+            Float p = Float(physicalPageIndex);
+            Float r = Frac(Sin(p * 12.9898 + 0.1) * 43758.5453);
+            Float g = Frac(Sin(p * 78.2330 + 1.2) * 43758.5453);
+            Float b = Frac(Sin(p * 45.1640 + 2.3) * 43758.5453);
+            col = Vec3(r * 0.7 + 0.3, g * 0.7 + 0.3, b * 0.7 + 0.3);
+            if (sliceUV.x < 0.015 || sliceUV.x > 0.985 || sliceUV.y < 0.015 || sliceUV.y > 0.985)
+            {
+                col = Vec3(0.02, 0.02, 0.02);
+            }
+        }
+        return col;
+    }
+
+    Vec3 NVSDebugStatusColor(UInt status)
+    {
+        Vec3 col = Vec3(0.30, 0.30, 0.30);                  // INVALID_LIGHT: Dark Gray
+        if (status == 0u)      { col = Vec3(0.15, 0.92, 0.25); } // VALID_SHADOW_DATA: Green
+        else if (status == 1u) { col = Vec3(0.95, 0.50, 0.10); } // MISSING: Orange
+        else if (status == 2u) { col = Vec3(0.95, 0.90, 0.15); } // NOT_RENDERED: Yellow
+        else if (status == 3u) { col = Vec3(0.95, 0.15, 0.15); } // INVALIDATED: Red
+        else if (status == 4u) { col = Vec3(0.95, 0.10, 0.85); } // GENERATION_MISMATCH: Magenta
+        else if (status == 5u) { col = Vec3(0.20, 0.65, 0.95); } // AWAITING_UPDATE: Cyan
+        else if (status == 6u) { col = Vec3(0.75, 0.75, 0.75); } // OUT_OF_RANGE: Light Gray
+        return col;
+    }
+}

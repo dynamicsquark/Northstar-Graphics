@@ -1,0 +1,212 @@
+// =====================================================================
+//  RuntimeDirtyDepthSliceBuild.nsl — NorthstarRuntime Internal Compute
+//  Builds a validated, deduplicated dirty depth slice list on the GPU
+//  along with the dirty slice status/count and IndirectDraw arguments
+//  for GPU-driven selective layered depth clear.
+//
+//  Execution & Synchronization Model:
+//    - Dispatched as a single thread group: threadGroupCount = (1, 1, 1),
+//      [numthreads(64, 1, 1)]. Any extra group (gid != 0) exits uniformly
+//      before the first barrier.
+//    - All 64 threads in Group 0 process arbitrary candidateCount values
+//      (0, 1, 63, 64, 65, 128, 256, 512, 1024, ...) via a 64-wide strided
+//      loop into groupshared bitmask gs_SliceBitmask[16] (up to 512 layers).
+//    - All barrier intrinsics execute at top-level uniform control flow.
+//    - Phase 1 (init) -> GroupMemoryBarrierWithGroupSync() ->
+//      Phase 2 (strided accumulation) -> GroupMemoryBarrierWithGroupSync() ->
+//      Phase 3 (Thread 0 compaction + status + indirect args) ->
+//      AllMemoryBarrierWithGroupSync() ->
+//      Phase 4 (disjoint tail sentinel fill [emittedCount .. clearLimit)) ->
+//      AllMemoryBarrierWithGroupSync().
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY DirtySliceBuildParams {
+    Buffer Config {
+        Add(candidateCount)       : UInt = 0
+        Add(maxArrayLayers)       : UInt = 256
+        Add(maxOutputSlices)      : UInt = 256
+        Add(inputMode)            : UInt = 1
+        Add(outputBufferCapacity) : UInt = 256
+        Add(statusBufferCapacity) : UInt = 1
+        Add(overflowPolicy)       : UInt = 0
+        Add(clearTailSentinel)    : UInt = 1
+    }
+    StructuredBuffer CandidateSlices {
+        Add(value) : UInt
+    }
+    RWStructuredBuffer OutDirtySliceIndices {
+        Add(sliceIndex) : UInt
+    }
+    RWStructuredBuffer OutDirtyCount {
+        Add(count) : UInt
+    }
+    RWStructuredBuffer OutIndirectDrawArgs {
+        Add(arg) : UInt
+    }
+}
+
+SHADER {
+    groupshared UInt gs_SliceBitmask[16];
+    groupshared UInt gs_EmittedCount;
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        // Uniform single-group guard: only Group (0, 0, 0) executes the reduction.
+        // Because gid (SV_GroupID) is uniform across the entire thread group, all 64
+        // threads in Group 0 stay active and execute every barrier below uniformly.
+        if (gid.x > 0u || gid.y > 0u || gid.z > 0u) {
+            return;
+        }
+
+        UInt tid = gtid.x;
+
+        // Phase 1: Reset shared deduplication bitmask (supports up to 512 array layers)
+        if (tid < 16u) {
+            gs_SliceBitmask[tid] = 0u;
+        }
+        if (tid == 0u) {
+            gs_EmittedCount = 0u;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        UInt rawMode        = DirtySliceBuildParams.Config.inputMode;
+        UInt mode           = rawMode & 255u;
+        UInt policyFromMode = (rawMode >> 8u) & 255u;
+        UInt overflowPolicy = DirtySliceBuildParams.Config.overflowPolicy;
+        if (policyFromMode != 0u) {
+            overflowPolicy = policyFromMode;
+        }
+
+        UInt candidateCount = DirtySliceBuildParams.Config.candidateCount;
+        UInt maxLayers      = DirtySliceBuildParams.Config.maxArrayLayers;
+        if (maxLayers > 512u) {
+            maxLayers = 512u;
+        }
+
+        UInt physCap = DirtySliceBuildParams.Config.outputBufferCapacity;
+        if (physCap == 0u || physCap > 512u) {
+            physCap = 512u;
+        }
+
+        UInt clearLimit = DirtySliceBuildParams.Config.maxOutputSlices;
+        if (clearLimit > physCap) {
+            clearLimit = physCap;
+        }
+
+        // Phase 2: Strided loop over all candidates (handles candidateCount > 64 across all chunks)
+        if (mode != 0u && candidateCount > 0u && maxLayers > 0u) {
+            for (UInt i = tid; i < candidateCount; i = i + 64u) {
+                UInt rawVal = DirtySliceBuildParams.CandidateSlices[i].value;
+                if (mode == 1u) {
+                    // Mode 1: CandidateSlices[i] is a candidate slice index
+                    if (rawVal < maxLayers) {
+                        UInt wordIdx = rawVal >> 5u;
+                        UInt bitMask = 1u << (rawVal & 31u);
+                        UInt prevVal = 0u;
+                        InterlockedOr(gs_SliceBitmask[wordIdx], bitMask, prevVal);
+                    }
+                } else if (mode == 2u) {
+                    // Mode 2: CandidateSlices[i] is a per-slice dirty flag (non-zero = dirty)
+                    if (rawVal != 0u && i < maxLayers) {
+                        UInt wordIdx = i >> 5u;
+                        UInt bitMask = 1u << (i & 31u);
+                        UInt prevVal = 0u;
+                        InterlockedOr(gs_SliceBitmask[wordIdx], bitMask, prevVal);
+                    }
+                }
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // Phase 3: Thread 0 counts all unique dirty slices, checks capacity overflow,
+        // compacts valid slices up to clearLimit, and writes OutDirtyCount + OutIndirectDrawArgs.
+        if (tid == 0u) {
+            UInt totalUniqueCount = 0u;
+            UInt emittedCount     = 0u;
+
+            if (mode != 0u && candidateCount > 0u && maxLayers > 0u) {
+                UInt wordCount = (maxLayers + 31u) >> 5u;
+                for (UInt w = 0u; w < wordCount; w = w + 1u) {
+                    UInt mask = gs_SliceBitmask[w];
+                    if (mask != 0u) {
+                        for (UInt b = 0u; b < 32u; b = b + 1u) {
+                            if ((mask & (1u << b)) != 0u) {
+                                UInt sliceIdx = (w << 5u) + b;
+                                if (sliceIdx < maxLayers) {
+                                    totalUniqueCount = totalUniqueCount + 1u;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                UInt hasOverflow = (totalUniqueCount > clearLimit) ? 1u : 0u;
+                // Policy 0 (CLAMP_AND_FLAG): emit up to clearLimit slices and set overflowFlag=1.
+                // Policy 1 (ABORT_ON_OVERFLOW): if overflow occurs, emit 0 slices (instanceCount=0)
+                // so partial clear cannot silently proceed without fallback handling.
+                if (clearLimit > 0u && !(overflowPolicy == 1u && hasOverflow != 0u)) {
+                    for (UInt w2 = 0u; w2 < wordCount; w2 = w2 + 1u) {
+                        UInt mask2 = gs_SliceBitmask[w2];
+                        if (mask2 != 0u) {
+                            for (UInt b2 = 0u; b2 < 32u; b2 = b2 + 1u) {
+                                if ((mask2 & (1u << b2)) != 0u) {
+                                    UInt sliceIdx2 = (w2 << 5u) + b2;
+                                    if (sliceIdx2 < maxLayers && emittedCount < clearLimit) {
+                                        DirtySliceBuildParams.OutDirtySliceIndices[emittedCount].sliceIndex = sliceIdx2;
+                                        emittedCount = emittedCount + 1u;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            UInt overflowFlag = (totalUniqueCount > clearLimit) ? 1u : 0u;
+            UInt droppedCount = (totalUniqueCount > emittedCount) ? (totalUniqueCount - emittedCount) : 0u;
+
+            gs_EmittedCount = emittedCount;
+
+            // Write DirtySliceBuildStatus into OutDirtyCount:
+            // [0] = emittedDirtyCount (used by indirect count / legacy 1-word status)
+            // [1] = totalUniqueDirtyCount (if statusBufferCapacity >= 4)
+            // [2] = overflowFlag (1 = capacity overflow occurred, 0 = all dirty slices fit)
+            // [3] = droppedSliceCount (number of dirty slices NOT cleared in this batch)
+            DirtySliceBuildParams.OutDirtyCount[0u].count = emittedCount;
+            if (DirtySliceBuildParams.Config.statusBufferCapacity >= 4u) {
+                DirtySliceBuildParams.OutDirtyCount[1u].count = totalUniqueCount;
+                DirtySliceBuildParams.OutDirtyCount[2u].count = overflowFlag;
+                DirtySliceBuildParams.OutDirtyCount[3u].count = droppedCount;
+            }
+
+            // Write GPUIndirectDrawArgs (4 UINT32s):
+            // [0] = vertexCountPerInstance (3 for fullscreen triangle)
+            // [1] = instanceCount (emittedCount dirty slices; 0 when DirtyCount == 0 or aborted on overflow)
+            // [2] = startVertexLocation (0)
+            // [3] = startInstanceLocation (0)
+            DirtySliceBuildParams.OutIndirectDrawArgs[0u].arg = 3u;
+            DirtySliceBuildParams.OutIndirectDrawArgs[1u].arg = emittedCount;
+            DirtySliceBuildParams.OutIndirectDrawArgs[2u].arg = 0u;
+            DirtySliceBuildParams.OutIndirectDrawArgs[3u].arg = 0u;
+        }
+
+        // Order both groupshared (gs_EmittedCount) and UAV writes across all threads in the group
+        AllMemoryBarrierWithGroupSync();
+
+        // Phase 4: Clear only the disjoint unused tail [gs_EmittedCount .. clearLimit) to 0xFFFFFFFFu.
+        // Elements >= clearLimit (and >= outputBufferCapacity) are NEVER touched, guaranteeing strict
+        // GPU buffer bounds safety and preserving canary/out-of-window regions when clearLimit < physCap.
+        if (DirtySliceBuildParams.Config.clearTailSentinel != 0u) {
+            UInt startClear = gs_EmittedCount + tid;
+            for (UInt c = startClear; c < clearLimit; c = c + 64u) {
+                DirtySliceBuildParams.OutDirtySliceIndices[c].sliceIndex = 4294967295u;
+            }
+        }
+
+        AllMemoryBarrierWithGroupSync();
+    }
+}

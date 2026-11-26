@@ -1,0 +1,123 @@
+// =====================================================================
+//  StandardLitInstancedSkinnedVS.nsl
+//  Northstar Graphics — Built-in GPU-Instanced 4-Bone Skinned Vertex Shader
+//
+//  Implements ShaderVariant::INSTANCED_SKINNED via per-instance world
+//  matrices, bone palette offsets, and cofactor adjugate normal transforms.
+// =====================================================================
+
+STAGE VERTEX
+
+INPUT_LAYOUT
+{
+    Get(VERTEX_POSITION)
+    Get(VERTEX_NORMAL)
+    Get(VERTEX_TANGENT)
+    Get(VERTEX_BITANGENT)
+    Get(VERTEX_UV0)
+    Get(VERTEX_UV1)
+    Get(VERTEX_COLOR)
+    Get(VERTEX_BONE_INDICES)
+    Get(VERTEX_BONE_WEIGHTS)
+    Get(INSTANCE_ID)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(CLIP_POSITION)
+    Add(WORLD_POSITION)
+    Add(WORLD_NORMAL)
+    Add(TANGENT)
+    Add(BITANGENT)
+    Add(UV0)
+    Add(UV1)
+    Add(COLOR)
+}
+
+PROPERTY Transforms
+{
+    Buffer Matrices
+    {
+        Get(VP_MATRIX)
+    }
+    StructuredBuffer Instances
+    {
+        Get(INSTANCE_WORLD_MATRIX)
+        Get(INSTANCE_BONE_OFFSET)
+        Get(INSTANCE_BONE_COUNT)
+    }
+}
+
+PROPERTY Skeleton
+{
+    StructuredBuffer BonePalette
+    {
+        Get(GLOBAL_BONE_MATRIX)
+    }
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+
+        Mat4 instWorld = Transforms.Instances[input.INSTANCE_ID].INSTANCE_WORLD_MATRIX;
+        UInt bOff      = Transforms.Instances[input.INSTANCE_ID].INSTANCE_BONE_OFFSET;
+        UInt bCnt      = Transforms.Instances[input.INSTANCE_ID].INSTANCE_BONE_COUNT;
+
+        Vec3 skinnedPos = input.VERTEX_POSITION;
+        Vec3 skinnedNrm = input.VERTEX_NORMAL;
+        Vec3 skinnedTan = input.VERTEX_TANGENT;
+        Vec3 skinnedBit = input.VERTEX_BITANGENT;
+
+        if (bCnt > 0u)
+        {
+            Vec4  rawW = input.VERTEX_BONE_WEIGHTS;
+            Float wSum = rawW.x + rawW.y + rawW.z + rawW.w;
+            Vec4  w    = (wSum > 0.0001) ? (rawW / wSum) : Vec4(1.0, 0.0, 0.0, 0.0);
+
+            UInt  maxIdx = bCnt - 1u;
+            UInt4 idx    = input.VERTEX_BONE_INDICES;
+            Mat4  bone0  = Skeleton.BonePalette[bOff + Min(idx.x, maxIdx)].GLOBAL_BONE_MATRIX;
+            Mat4  bone1  = Skeleton.BonePalette[bOff + Min(idx.y, maxIdx)].GLOBAL_BONE_MATRIX;
+            Mat4  bone2  = Skeleton.BonePalette[bOff + Min(idx.z, maxIdx)].GLOBAL_BONE_MATRIX;
+            Mat4  bone3  = Skeleton.BonePalette[bOff + Min(idx.w, maxIdx)].GLOBAL_BONE_MATRIX;
+
+            Vec4 p4    = Vec4(input.VERTEX_POSITION, 1.0);
+            skinnedPos = Mul(bone0, p4).xyz * w.x + Mul(bone1, p4).xyz * w.y + Mul(bone2, p4).xyz * w.z + Mul(bone3, p4).xyz * w.w;
+
+            Vec4 n4    = Vec4(input.VERTEX_NORMAL, 0.0);
+            skinnedNrm = Normalize(Mul(bone0, n4).xyz * w.x + Mul(bone1, n4).xyz * w.y + Mul(bone2, n4).xyz * w.z + Mul(bone3, n4).xyz * w.w);
+
+            Vec4 t4    = Vec4(input.VERTEX_TANGENT, 0.0);
+            skinnedTan = Normalize(Mul(bone0, t4).xyz * w.x + Mul(bone1, t4).xyz * w.y + Mul(bone2, t4).xyz * w.z + Mul(bone3, t4).xyz * w.w);
+
+            Vec4 b4    = Vec4(input.VERTEX_BITANGENT, 0.0);
+            skinnedBit = Normalize(Mul(bone0, b4).xyz * w.x + Mul(bone1, b4).xyz * w.y + Mul(bone2, b4).xyz * w.z + Mul(bone3, b4).xyz * w.w);
+        }
+
+        Vec4  wp       = Mul(instWorld, Vec4(skinnedPos, 1.0));
+        Vec3  c0       = Mul(instWorld, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3  c1       = Mul(instWorld, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3  c2       = Mul(instWorld, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        Vec3  c1xc2    = Cross(c1, c2);
+        Float detSign  = (Dot(c0, c1xc2) < 0.0) ? -1.0 : 1.0;
+
+        Vec3 worldNrm  = Normalize((c1xc2 * skinnedNrm.x + Cross(c2, c0) * skinnedNrm.y + Cross(c0, c1) * skinnedNrm.z) * detSign);
+        Vec3 rawTan    = Mul(instWorld, Vec4(skinnedTan, 0.0)).xyz;
+        Vec3 worldTan  = Normalize(rawTan - worldNrm * Dot(rawTan, worldNrm));
+        Vec3 worldBit  = Normalize(Mul(instWorld, Vec4(skinnedBit, 0.0)).xyz);
+
+        o.WORLD_POSITION = wp.xyz;
+        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, wp);
+        o.WORLD_NORMAL   = worldNrm;
+        o.TANGENT        = worldTan;
+        o.BITANGENT      = worldBit;
+        o.UV0            = input.VERTEX_UV0;
+        o.UV1            = input.VERTEX_UV1;
+        o.COLOR          = input.VERTEX_COLOR;
+
+        return o;
+    }
+}

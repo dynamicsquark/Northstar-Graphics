@@ -1,0 +1,1657 @@
+// =====================================================================
+//  RuntimeNVSCasterCull.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Shadows (NVS)
+//  GPU-Driven Shadow Caster Culling & Virtual Page Assignment
+//
+//  Responsibilities:
+//    Mode 0 (RESET_AND_SORT_PAGES):
+//      Clears OutCasterTelemetry, OutCasterValidBitmask, OutWorklistIndirectArgs,
+//      and compacts active resident pages into deterministic ascending
+//      physicalPageIndex order in OutCasterPageRanges.
+//    Mode 1 (FILTER_SCENE_CASTERS):
+//      Scans InGPUSceneObjects[0 .. sceneSlotCount - 1] on the GPU, filters
+//      eligible shadow casters (never rejecting off-screen casters with
+//      GPU_SCENE_OBJ_FRUSTUM_CULL), deduplicates static batches, rejects
+//      non-shadow transparent materials, precomputes 16-bit clipmap candidate
+//      masks + Light 0 bounds, and populates OutFilteredCasters &
+//      2-level hierarchical OutCasterValidBitmask.
+//    Mode 2 (COUNT_PAGE_CASTERS):
+//      Per-active-page cooperative 64-thread evaluation of Broad-Phase
+//      (level mask + world bounding sphere + world AABB) and Narrow-Phase
+//      (Arvo O(1) light-space 3D AABB + optional small-caster texel threshold).
+//    Mode 3 (PREFIX_SUM_RANGES):
+//      Computes deterministic prefix-sum offsets (firstCasterOffset, casterCount)
+//      across OutCasterPageRanges[0 .. activePageCount - 1], enforces
+//      maxWorklistCapacity with NVS_CASTER_PAGE_FLAG_OVERFLOW_INCOMPLETE,
+//      and populates OutWorklistIndirectArgs.
+//    Mode 4 (SCATTER_WORKLIST):
+//      Scatters compacted NVSCasterDrawCandidate records (64B) into
+//      OutCasterWorklist[firstCasterOffset + localIdx] in deterministic
+//      ascending gpuSceneSlotIndex order per page.
+//    Mode 5 (DYNAMIC_INVALIDATION):
+//      Selectively invalidates resident VALID_SHADOW_DATA pages whose 3D
+//      shadow volume intersects any old or new world AABB in
+//      InDynamicInvalidationBoxes.
+//    Mode 6 (VERIFY_MATRIX_CLIP):
+//      Preflight 2.1 GPU verification of worldToPageClipCol0..3 and
+//      column-major Mat4 Mul(M, v) against CPU reference.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVSCasterCullParams {
+    Buffer Config {
+        Add(dispatchMode)                  : UInt  = 0
+        Add(currentFrame)                  : UInt  = 1
+        Add(sceneSlotCount)                : UInt  = 0
+        Add(activePageInputCount)          : UInt  = 0
+        Add(physicalPoolCapacity)          : UInt  = 256
+        Add(totalVirtualPages)             : UInt  = 65536
+        Add(clipmapTableSize)              : UInt  = 16
+        Add(maxWorklistCapacity)           : UInt  = 262144
+        Add(staticBatchPolicy)             : UInt  = 0
+        Add(skipTransparentCasters)        : UInt  = 1
+        Add(disablePrepassFilter)          : UInt  = 0
+        Add(skipAlreadyRenderedValidPages) : UInt  = 0
+        Add(minCasterProjectedTexels)      : Float = 0.0
+        Add(lodThresholdScale)             : Float = 1.0
+        Add(forceLodOverride)              : UInt  = 0
+        Add(dynamicInvalidationBoxCount)   : UInt  = 0
+    }
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : UInt
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldMatrix)         : Mat4
+    }
+    StructuredBuffer InClipmapLevels {
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(pagesPerAxis)         : UInt
+        Add(flags)                : UInt
+        Add(snappedOriginPageX)   : Int
+        Add(snappedOriginPageY)   : Int
+        Add(worldExtent)          : Float
+        Add(pageWorldSize)        : Float
+        Add(texelWorldSize)       : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(cameraLightZ)         : Float
+        Add(lightRightAndCenterX) : Vec4
+        Add(lightUpAndCenterY)    : Vec4
+        Add(lightDirAndExtrusion) : Vec4
+        Add(transitionAndPadding) : Vec4
+        Add(worldToLightViewCol0) : Vec4
+        Add(worldToLightViewCol1) : Vec4
+        Add(worldToLightViewCol2) : Vec4
+        Add(worldToLightViewCol3) : Vec4
+        Add(lightViewToWorldCol0) : Vec4
+        Add(lightViewToWorldCol1) : Vec4
+        Add(lightViewToWorldCol2) : Vec4
+        Add(lightViewToWorldCol3) : Vec4
+    }
+    StructuredBuffer InPageRenderData {
+        Add(physicalPageIndex)    : UInt
+        Add(virtualFlatIndex)     : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(renderFlags)          : UInt
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(virtualPageX)         : UInt
+        Add(virtualPageY)         : UInt
+        Add(worldPageX)           : Int
+        Add(worldPageY)           : Int
+        Add(physicalGeneration)   : UInt
+        Add(lastUsedFrame)        : UInt
+        Add(lightMinX)            : Float
+        Add(lightMinY)            : Float
+        Add(lightMaxX)            : Float
+        Add(lightMaxY)            : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(worldCenterX)         : Float
+        Add(worldCenterY)         : Float
+        Add(worldCenterZ)         : Float
+        Add(pageWorldSize)        : Float
+        Add(worldBoundsMinX)      : Float
+        Add(worldBoundsMinY)      : Float
+        Add(worldBoundsMinZ)      : Float
+        Add(texelWorldSize)       : Float
+        Add(worldBoundsMaxX)      : Float
+        Add(worldBoundsMaxY)      : Float
+        Add(worldBoundsMaxZ)      : Float
+        Add(shadowVolumeRadius)   : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(viewportWidth)        : UInt
+        Add(viewportHeight)       : UInt
+        Add(worldToPageClipCol0)  : Vec4
+        Add(worldToPageClipCol1)  : Vec4
+        Add(worldToPageClipCol2)  : Vec4
+        Add(worldToPageClipCol3)  : Vec4
+        Add(lightViewCol0)        : Vec4
+        Add(lightViewCol1)        : Vec4
+        Add(lightViewCol2)        : Vec4
+        Add(lightViewCol3)        : Vec4
+        Add(pageProjCol0)         : Vec4
+        Add(pageProjCol1)         : Vec4
+        Add(pageProjCol2)         : Vec4
+        Add(pageProjCol3)         : Vec4
+    }
+    StructuredBuffer InActiveRenderPageList {
+        Add(physicalPageIndex) : UInt
+    }
+    StructuredBuffer InDynamicInvalidationBoxes {
+        Add(worldMin)          : Vec3
+        Add(gpuSceneSlotIndex) : UInt
+        Add(worldMax)          : Vec3
+        Add(invalidationFlags) : UInt
+    }
+    RWStructuredBuffer OutFilteredCasters {
+        Add(aabbMin)             : Vec3
+        Add(boundingRadius)      : Float
+        Add(aabbMax)             : Vec3
+        Add(candidateLevelMask)  : UInt
+        Add(sphereCenter)        : Vec3
+        Add(gpuSceneSlotIndex)   : UInt
+        Add(light0MinX)          : Float
+        Add(light0MaxX)          : Float
+        Add(light0MinY)          : Float
+        Add(light0MaxY)          : Float
+        Add(light0MinZ)          : Float
+        Add(light0MaxZ)          : Float
+        Add(objectFlags)         : UInt
+        Add(variantAndLodPacked) : UInt
+    }
+    RWStructuredBuffer OutCasterValidBitmask {
+        Add(maskWord) : UInt
+    }
+    RWStructuredBuffer OutCasterPageRanges {
+        Add(virtualPageFlatIndex)   : UInt
+        Add(physicalPageIndex)      : UInt
+        Add(virtualAddressPacked)   : UInt
+        Add(lightId)                : UInt
+        Add(clipmapLevel)           : UInt
+        Add(firstCasterOffset)      : UInt
+        Add(casterCount)            : UInt
+        Add(rawCandidateCount)      : UInt
+        Add(pageFlags)              : UInt
+        Add(broadPhasePassedCount)  : UInt
+        Add(narrowPhasePassedCount) : UInt
+        Add(physicalGeneration)     : UInt
+    }
+    RWStructuredBuffer OutCasterWorklist {
+        Add(gpuSceneSlotIndex)      : UInt
+        Add(renderObjectHandle)     : UInt
+        Add(virtualPageFlatIndex)   : UInt
+        Add(physicalPageIndex)      : UInt
+        Add(virtualAddressPacked)   : UInt
+        Add(lightIdAndClipmapLevel) : UInt
+        Add(meshId)                 : UInt
+        Add(submeshIndex)           : UInt
+        Add(materialId)             : UInt
+        Add(pipelineVariantFlags)   : UInt
+        Add(selectedLODIndex)       : UInt
+        Add(instanceGroupId)        : UInt
+        Add(batchGroupId)           : UInt
+        Add(startIndex)             : UInt
+        Add(indexCount)             : UInt
+        Add(casterDepthSortKey)     : Float
+    }
+    RWStructuredBuffer OutWorklistIndirectArgs {
+        Add(arg) : UInt
+    }
+    RWStructuredBuffer OutCasterTelemetry {
+        Add(totalSceneObjectsScanned)    : UInt
+        Add(validShadowCastersCount)     : UInt
+        Add(rejectedDisabledOrHidden)    : UInt
+        Add(rejectedNonShadowCaster)     : UInt
+        Add(rejectedInvalidBoundsOrGeom) : UInt
+        Add(rejectedStaticBatchDedup)    : UInt
+        Add(rejectedTransparentMaterial) : UInt
+        Add(activeShadowPagesProcessed)  : UInt
+        Add(totalPageCasterTests)        : UInt
+        Add(broadPhasePassedCount)       : UInt
+        Add(broadPhaseRejectedCount)     : UInt
+        Add(narrowPhasePassedCount)      : UInt
+        Add(narrowPhaseRejectedCount)    : UInt
+        Add(totalAssignedCasterDraws)    : UInt
+        Add(overflowDroppedAssignments)  : UInt
+        Add(emptyActivePageCount)        : UInt
+        Add(nonEmptyActivePageCount)     : UInt
+        Add(overflowIncompletePageCount) : UInt
+        Add(maxCastersPerPage)           : UInt
+        Add(dynamicInvalidatedPageCount) : UInt
+    }
+    RWStructuredBuffer InOutVirtualPageTable {
+        Add(stateAndFlags)        : UInt
+        Add(physicalPageIndex)    : UInt
+        Add(virtualAddressPacked) : UInt
+        Add(lastTouchedFrame)     : UInt
+    }
+    RWStructuredBuffer InOutPhysicalPageTable {
+        Add(stateAndFlags)         : UInt
+        Add(ownerVirtualFlatIndex) : UInt
+        Add(ownerVirtualAddress)   : UInt
+        Add(physicalGeneration)    : UInt
+        Add(lastUsedFrame)         : UInt
+        Add(allocatedFrame)        : UInt
+        Add(minEvictableFrame)     : UInt
+        Add(metaAux)               : UInt
+    }
+}
+
+SHADER {
+    groupshared UInt  gs_PageBitmask[64];
+    groupshared UInt  gs_BroadPassed;
+    groupshared UInt  gs_NarrowPassed;
+    groupshared UInt  gs_TestsCount;
+    groupshared UInt  gs_ChunkPassMask0;
+    groupshared UInt  gs_ChunkPassMask1;
+    groupshared UInt  gs_PageValid;
+    groupshared UInt  gs_PagePhysIdx;
+    groupshared UInt  gs_PageVirtFlat;
+    groupshared UInt  gs_PageVirtPacked;
+    groupshared UInt  gs_PageLightId;
+    groupshared UInt  gs_PageLevel;
+    groupshared UInt  gs_PageTableIdx;
+    groupshared UInt  gs_PageIsPerspective;
+    groupshared UInt  gs_UseLight0Cache;
+    groupshared UInt  gs_PageLevelBit;
+    groupshared UInt  gs_PageFirstOffset;
+    groupshared UInt  gs_PageEmitCount;
+    groupshared Vec3  gs_PageWorldCenter;
+    groupshared Float gs_PageVolumeRadius;
+    groupshared Vec3  gs_PageWorldMin;
+    groupshared Vec3  gs_PageWorldMax;
+    groupshared Float gs_PageLightMinX;
+    groupshared Float gs_PageLightMaxX;
+    groupshared Float gs_PageLightMinY;
+    groupshared Float gs_PageLightMaxY;
+    groupshared Float gs_PageCasterMinZ;
+    groupshared Float gs_PageCasterMaxZ;
+    groupshared Float gs_PageTexelSize;
+    groupshared Vec3  gs_LightRight;
+    groupshared Vec3  gs_LightUp;
+    groupshared Vec3  gs_LightDir;
+    groupshared Vec3  gs_LightPos;
+
+    Bool IsFiniteFloat(Float v) {
+        UInt bits = asuint(v);
+        return (bits & 2139095040u) != 2139095040u;
+    }
+
+    Bool IsFiniteVec3(Vec3 v) {
+        return IsFiniteFloat(v.x) && IsFiniteFloat(v.y) && IsFiniteFloat(v.z);
+    }
+
+    Int FloorDivPow2(Int value, UInt shift) {
+        Int res = value;
+        if (shift > 0u) {
+            if (value >= 0) {
+                res = Int(UInt(value) >> shift);
+            } else {
+                res = -Int((UInt(-1 - value) >> shift) + 1u);
+            }
+        }
+        return res;
+    }
+
+    Int OrthoSnapOriginAtMip(Int originMip0, UInt mip) {
+        Int roundBias = (mip > 0u) ? Int(1u << (mip - 1u)) : 0;
+        return FloorDivPow2(originMip0 + roundBias, mip);
+    }
+
+    UInt SelectShadowCasterLOD(
+        UInt  objFlags,
+        UInt  maxLod,
+        Float radius,
+        UInt  clipLevel,
+        Float pageTexelSize,
+        Float lodScale,
+        UInt  forceLodCfg)
+    {
+        UInt selectedLod = 0u;
+        if ((forceLodCfg & 256u) != 0u) {
+            UInt forced = forceLodCfg & 255u;
+            selectedLod = (forced < maxLod) ? forced : maxLod;
+        } else if ((objFlags & 512u) != 0u && maxLod > 0u) {
+            UInt levelLod = (clipLevel < maxLod) ? clipLevel : maxLod;
+            selectedLod = levelLod;
+            if (lodScale > 0.0 && pageTexelSize > 0.0 && radius > 0.0) {
+                Float denom      = pageTexelSize * lodScale;
+                Float diamTexels = (denom > 0.00000001) ? ((2.0 * radius) / denom) : 1024.0;
+                UInt  texelLod   = 0u;
+                if (diamTexels < 16.0) {
+                    texelLod = 3u;
+                } else if (diamTexels < 32.0) {
+                    texelLod = 2u;
+                } else if (diamTexels < 64.0) {
+                    texelLod = 1u;
+                }
+                UInt combined = (levelLod > texelLod) ? levelLod : texelLod;
+                selectedLod   = (combined < maxLod) ? combined : maxLod;
+            }
+        }
+        return selectedLod;
+    }
+
+    void ProjectBoundsToLightSpace(
+        Vec3  bMin,
+        Vec3  bMax,
+        Vec3  R,
+        Vec3  U,
+        Vec3  D,
+        out Vec3 outLMin,
+        out Vec3 outLMax)
+    {
+        Vec3 center  = (bMin + bMax) * 0.5;
+        Vec3 halfExt = (bMax - bMin) * 0.5;
+
+        Float cx = dot(center, R);
+        Float cy = dot(center, U);
+        Float cz = dot(center, D);
+
+        Float ex = abs(R.x) * halfExt.x + abs(R.y) * halfExt.y + abs(R.z) * halfExt.z;
+        Float ey = abs(U.x) * halfExt.x + abs(U.y) * halfExt.y + abs(U.z) * halfExt.z;
+        Float ez = abs(D.x) * halfExt.x + abs(D.y) * halfExt.y + abs(D.z) * halfExt.z;
+
+        outLMin = Vec3(cx - ex, cy - ey, cz - ez);
+        outLMax = Vec3(cx + ex, cy + ey, cz + ez);
+    }
+
+    void ProjectBoundsToLightSpaceRelative(
+        Vec3  bMin,
+        Vec3  bMax,
+        Vec3  lightPos,
+        Vec3  R,
+        Vec3  U,
+        Vec3  D,
+        out Vec3 outLMin,
+        out Vec3 outLMax)
+    {
+        ProjectBoundsToLightSpace(bMin - lightPos, bMax - lightPos, R, U, D, outLMin, outLMax);
+    }
+
+    Bool DoesLightBoundsOverlapPerspectiveWedge(
+        Vec3  lMin,
+        Vec3  lMax,
+        Float tanMinX,
+        Float tanMaxX,
+        Float tanMinY,
+        Float tanMaxY,
+        Float cMinZ,
+        Float cMaxZ)
+    {
+        if (lMax.z < cMinZ || lMin.z > cMaxZ) {
+            return false;
+        }
+        Float zNearBox = Max(lMin.z, cMinZ);
+        Float zFarBox  = Min(lMax.z, cMaxZ);
+        if (zFarBox < zNearBox || zFarBox <= 0.00001) {
+            return false;
+        }
+        Float minBoundX = tanMinX * ((tanMinX >= 0.0) ? zNearBox : zFarBox);
+        Float maxBoundX = tanMaxX * ((tanMaxX >= 0.0) ? zFarBox  : zNearBox);
+        Float minBoundY = tanMinY * ((tanMinY >= 0.0) ? zNearBox : zFarBox);
+        Float maxBoundY = tanMaxY * ((tanMaxY >= 0.0) ? zFarBox  : zNearBox);
+        return (lMax.x >= minBoundX) && (lMin.x <= maxBoundX) &&
+               (lMax.y >= minBoundY) && (lMin.y <= maxBoundY);
+    }
+
+    UInt EvaluateRawCasterEligibility(
+        UInt slot,
+        UInt staticBatchPolicy,
+        UInt skipTransparent,
+        out UInt outVariantFlags,
+        out UInt outMaxLod)
+    {
+        outVariantFlags = 0u;
+        outMaxLod       = 0u;
+        UInt status     = 0u;
+
+        UInt invalidIdx = ~0u;
+        UInt recSlot    = NVSCasterCullParams.InGPUSceneObjects[slot].slotIndex;
+        UInt gen        = NVSCasterCullParams.InGPUSceneObjects[slot].generation;
+        UInt flags      = NVSCasterCullParams.InGPUSceneObjects[slot].objectFlags;
+
+        // 1. Slot occupancy, generation, scene-level visibility, and STANDARD-only filter
+        //    (GPU_SCENE_OBJ_FRUSTUM_CULL is NEVER checked; GPU_SCENE_OBJ_VIRTUAL_GEOMETRY = 1048576 is handled by NVG shadow pipeline)
+        if (recSlot != slot || recSlot == invalidIdx || gen == 0u || (flags & 1u) == 0u || (flags & 2u) == 0u || (flags & 1048576u) != 0u) {
+            status = 1u;
+        } else if ((flags & 8u) == 0u) {
+            // 2. Shadow caster enable bit (GPU_SCENE_OBJ_CAST_SHADOW = 8)
+            status = 2u;
+        } else {
+            // 3. Valid finite bounds, mesh & material
+            Vec3 bMin   = NVSCasterCullParams.InGPUSceneObjects[slot].aabbMin;
+            Vec3 bMax   = NVSCasterCullParams.InGPUSceneObjects[slot].aabbMax;
+            Vec4 sphere = NVSCasterCullParams.InGPUSceneObjects[slot].boundingSphere;
+            UInt meshId = NVSCasterCullParams.InGPUSceneObjects[slot].meshId;
+            UInt matId  = NVSCasterCullParams.InGPUSceneObjects[slot].materialId;
+            UInt vCount = NVSCasterCullParams.InGPUSceneObjects[slot].vertexCount;
+            UInt iCount = NVSCasterCullParams.InGPUSceneObjects[slot].indexCount;
+
+            if ((flags & 524288u) == 0u ||
+                !IsFiniteVec3(bMin) || !IsFiniteVec3(bMax) ||
+                !IsFiniteVec3(sphere.xyz) || !IsFiniteFloat(sphere.w) ||
+                bMax.x < bMin.x || bMax.y < bMin.y || bMax.z < bMin.z ||
+                sphere.w <= 0.0 ||
+                meshId == 0u || (iCount == 0u && vCount == 0u) || matId == 0u) {
+                status = 3u;
+            } else {
+                // 4. Static Batch deduplication (for skinned objects bit 1024, batchGroupId stores packed bone palette range)
+                UInt batchGrp           = NVSCasterCullParams.InGPUSceneObjects[slot].batchGroupId;
+                Bool isBatchMember      = ((flags & 4096u) != 0u) || (((flags & 1024u) == 0u) && (batchGrp != 0u));
+                Bool isCombinedUmbrella = ((flags & 2048u) != 0u) && !isBatchMember;
+                if (staticBatchPolicy == 0u && isCombinedUmbrella) {
+                    status = 4u;
+                } else if (staticBatchPolicy == 1u && isBatchMember) {
+                    status = 4u;
+                } else {
+                    // 5. Transparent material rejection (bit 17 = 131072 = hasShadowPass in 3-bit BlendMode layout)
+                    UInt lodMatFlags   = NVSCasterCullParams.InGPUSceneObjects[slot].lodAndMaterialFlags;
+                    Bool isTransparent = (flags & 32768u) != 0u;
+                    Bool isAlphaTest   = (flags & 16384u) != 0u;
+                    Bool hasShadowPass = ((flags & 262144u) != 0u) || ((lodMatFlags & 131072u) != 0u);
+                    if (skipTransparent != 0u && isTransparent && !isAlphaTest && !hasShadowPass) {
+                        status = 5u;
+                    } else {
+                        UInt vFlags = 0u;
+                        if (isAlphaTest) {
+                            vFlags = vFlags | 1u;
+                        }
+                        UInt cullMode = (lodMatFlags >> 8u) & 3u;
+                        if ((flags & 65536u) != 0u || cullMode == 0u) {
+                            vFlags = vFlags | 2u;
+                        }
+                        if (hasShadowPass) {
+                            vFlags = vFlags | 4u;
+                        }
+                        if ((flags & 8192u) != 0u) {
+                            vFlags = vFlags | 8u;
+                        }
+                        if (isBatchMember) {
+                            vFlags = vFlags | 16u;
+                        }
+                        if (isCombinedUmbrella) {
+                            vFlags = vFlags | 32u;
+                        }
+                        if ((flags & 4u) == 0u) {
+                            vFlags = vFlags | 64u;
+                        }
+                        if ((flags & 1024u) != 0u) {
+                            vFlags = vFlags | 128u;
+                        }
+
+                        UInt rawLod = lodMatFlags & 255u;
+                        UInt maxLod = 0u;
+                        if (rawLod > 1u) {
+                            maxLod = rawLod - 1u;
+                            if (maxLod > 3u) {
+                                maxLod = 3u;
+                            }
+                        }
+
+                        outVariantFlags = vFlags;
+                        outMaxLod       = maxLod;
+                    }
+                }
+            }
+        }
+        return status;
+    }
+
+    UInt ComputeObjectCandidateLevelMask(Vec3 bMin, Vec3 bMax, UInt tableSize) {
+        UInt mask16 = 0u;
+        UInt count  = (tableSize < 16u) ? tableSize : 16u;
+        for (UInt t = 0u; t < count; t = t + 1u) {
+            UInt cmFlags   = NVSCasterCullParams.InClipmapLevels[t].flags;
+            UInt pagesAxis = NVSCasterCullParams.InClipmapLevels[t].pagesPerAxis;
+            Float wExtent  = NVSCasterCullParams.InClipmapLevels[t].worldExtent;
+            if ((cmFlags & 1u) != 0u && pagesAxis > 0u && wExtent > 0.0) {
+                Vec3 R = NVSCasterCullParams.InClipmapLevels[t].lightRightAndCenterX.xyz;
+                Vec3 U = NVSCasterCullParams.InClipmapLevels[t].lightUpAndCenterY.xyz;
+                Vec3 D = NVSCasterCullParams.InClipmapLevels[t].lightDirAndExtrusion.xyz;
+                Vec3 lMin = Vec3(0.0, 0.0, 0.0);
+                Vec3 lMax = Vec3(0.0, 0.0, 0.0);
+
+                Int   halfPages = Int(pagesAxis >> 1u);
+                Float pageSize  = wExtent / Float(pagesAxis);
+                Int   snapX     = NVSCasterCullParams.InClipmapLevels[t].snappedOriginPageX;
+                Int   snapY     = NVSCasterCullParams.InClipmapLevels[t].snappedOriginPageY;
+                Float winMinX   = Float(snapX - halfPages) * pageSize;
+                Float winMinY   = Float(snapY - halfPages) * pageSize;
+                Float winMaxX   = winMinX + wExtent;
+                Float winMaxY   = winMinY + wExtent;
+                Float cMinZ     = NVSCasterCullParams.InClipmapLevels[t].casterMinZ;
+                Float cMaxZ     = NVSCasterCullParams.InClipmapLevels[t].casterMaxZ;
+
+                if ((cmFlags & 4u) != 0u) {
+                    Vec3 lightPos = NVSCasterCullParams.InClipmapLevels[t].lightViewToWorldCol3.xyz;
+                    ProjectBoundsToLightSpaceRelative(bMin, bMax, lightPos, R, U, D, lMin, lMax);
+                    if (DoesLightBoundsOverlapPerspectiveWedge(lMin, lMax, winMinX, winMaxX, winMinY, winMaxY, cMinZ, cMaxZ)) {
+                        mask16 = mask16 | (1u << t);
+                    }
+                } else {
+                    ProjectBoundsToLightSpace(bMin, bMax, R, U, D, lMin, lMax);
+                    if (lMax.x >= winMinX && lMin.x <= winMaxX &&
+                        lMax.y >= winMinY && lMin.y <= winMaxY &&
+                        lMax.z >= cMinZ   && lMin.z <= cMaxZ) {
+                        mask16 = mask16 | (1u << t);
+                    }
+                }
+            }
+        }
+        return mask16;
+    }
+
+    // Computes a 32-bit (4 x 2 x 4) 3D Spatial World Grid Mask within the active pages' union AABB
+    // stored in OutWorklistIndirectArgs[8..15] when clipmapTableSize > 16 (massive multi-light mode).
+    // Eliminates O(Lights x Casters) scanning while preserving exact broad-phase intersection.
+    UInt ComputeSpatialWorldGridMask32(Vec3 bMin, Vec3 bMax) {
+        UInt elemCount  = 0u;
+        UInt elemStride = 0u;
+        GetDimensions(NVSCasterCullParams.OutWorklistIndirectArgs, elemCount, elemStride);
+        if (elemCount < 16u) {
+            return 0xFFFFFFFFu;
+        }
+        UInt hasGrid = NVSCasterCullParams.OutWorklistIndirectArgs[15u].arg;
+        if (hasGrid == 0u) {
+            return 0u;
+        }
+        Vec3 uMin = Vec3(
+            asfloat(NVSCasterCullParams.OutWorklistIndirectArgs[8u].arg),
+            asfloat(NVSCasterCullParams.OutWorklistIndirectArgs[9u].arg),
+            asfloat(NVSCasterCullParams.OutWorklistIndirectArgs[10u].arg));
+        Vec3 uMax = Vec3(
+            asfloat(NVSCasterCullParams.OutWorklistIndirectArgs[11u].arg),
+            asfloat(NVSCasterCullParams.OutWorklistIndirectArgs[12u].arg),
+            asfloat(NVSCasterCullParams.OutWorklistIndirectArgs[13u].arg));
+
+        if (bMax.x < uMin.x || bMin.x > uMax.x ||
+            bMax.y < uMin.y || bMin.y > uMax.y ||
+            bMax.z < uMin.z || bMin.z > uMax.z) {
+            return 0u;
+        }
+
+        Vec3 span    = Max(uMax - uMin, Vec3(0.001, 0.001, 0.001));
+        Vec3 invSpan = Vec3(4.0 / span.x, 2.0 / span.y, 4.0 / span.z);
+
+        Int x0 = Clamp(Int(Floor((bMin.x - uMin.x) * invSpan.x)), 0, 3);
+        Int x1 = Clamp(Int(Floor((bMax.x - uMin.x) * invSpan.x)), 0, 3);
+        Int y0 = Clamp(Int(Floor((bMin.y - uMin.y) * invSpan.y)), 0, 1);
+        Int y1 = Clamp(Int(Floor((bMax.y - uMin.y) * invSpan.y)), 0, 1);
+        Int z0 = Clamp(Int(Floor((bMin.z - uMin.z) * invSpan.z)), 0, 3);
+        Int z1 = Clamp(Int(Floor((bMax.z - uMin.z) * invSpan.z)), 0, 3);
+
+        UInt mask32 = 0u;
+        for (Int cz = z0; cz <= z1; cz = cz + 1) {
+            for (Int cy = y0; cy <= y1; cy = cy + 1) {
+                for (Int cx = x0; cx <= x1; cx = cx + 1) {
+                    UInt bitIdx = UInt((cz << 3) + (cy << 2) + cx);
+                    mask32 = mask32 | (1u << bitIdx);
+                }
+            }
+        }
+        return mask32;
+    }
+
+    UInt ComputeUnifiedCandidateMask(Vec3 bMin, Vec3 bMax, UInt tableSize) {
+        if (tableSize > 16u) {
+            return ComputeSpatialWorldGridMask32(bMin, bMax);
+        }
+        return ComputeObjectCandidateLevelMask(bMin, bMax, tableSize);
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt tid          = gtid.x;
+        UInt linearGid    = gid.x + (gid.y * 65535u);
+        UInt globalTid    = (linearGid << 6u) + tid;
+        UInt dispatchMode = NVSCasterCullParams.Config.dispatchMode;
+        UInt prev         = 0u;
+        UInt invalidIdx   = ~0u;
+
+        // =================================================================
+        //  MODE 0: Reset Telemetry, Bitmasks & Sort Active Pages on GPU
+        // =================================================================
+        if (dispatchMode == 0u) {
+            gs_PageBitmask[tid] = 0u;
+
+            UInt sceneSlots  = NVSCasterCullParams.Config.sceneSlotCount;
+            UInt activeWords = (sceneSlots + 31u) >> 5u;
+            if (activeWords > 2048u) {
+                activeWords = 2048u;
+            }
+            for (UInt w = tid; w < activeWords; w = w + 64u) {
+                NVSCasterCullParams.OutCasterValidBitmask[w].maskWord = 0u;
+            }
+            NVSCasterCullParams.OutCasterValidBitmask[2048u + tid].maskWord = 0u;
+
+            if (tid < 8u) {
+                NVSCasterCullParams.OutWorklistIndirectArgs[tid].arg = (tid == 1u || tid == 2u) ? 1u : 0u;
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt poolCap = NVSCasterCullParams.Config.physicalPoolCapacity;
+            if (poolCap > 2048u) {
+                poolCap = 2048u;
+            }
+            UInt skipValid       = NVSCasterCullParams.Config.skipAlreadyRenderedValidPages;
+            UInt forceFlags      = NVSCasterCullParams.Config.forceLodOverride;
+            UInt useExplicitList = (forceFlags & 1073741824u) != 0u ? 1u : 0u;
+            UInt preserveDynInv  = (forceFlags & 2147483648u) != 0u ? 1u : 0u;
+
+            if (useExplicitList != 0u) {
+                UInt listCount = NVSCasterCullParams.Config.activePageInputCount;
+                if (listCount > poolCap) {
+                    listCount = poolCap;
+                }
+                for (UInt i = tid; i < listCount; i = i + 64u) {
+                    UInt p = NVSCasterCullParams.InActiveRenderPageList[i].physicalPageIndex;
+                    if (p < poolCap) {
+                        UInt rFlags = NVSCasterCullParams.InPageRenderData[p].renderFlags;
+                        if ((rFlags & 1u) != 0u) {
+                            if (skipValid != 0u && (rFlags & 4u) != 0u && (rFlags & 2u) == 0u) {
+                                // Skip already rendered valid cached page
+                            } else {
+                                InterlockedOr(gs_PageBitmask[p >> 5u], 1u << (p & 31u), prev);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (UInt p = tid; p < poolCap; p = p + 64u) {
+                    UInt rFlags = NVSCasterCullParams.InPageRenderData[p].renderFlags;
+                    if ((rFlags & 1u) != 0u) {
+                        if (skipValid != 0u && (rFlags & 4u) != 0u && (rFlags & 2u) == 0u) {
+                            // Skip already rendered valid cached page
+                        } else {
+                            InterlockedOr(gs_PageBitmask[p >> 5u], 1u << (p & 31u), prev);
+                        }
+                    }
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            if (tid == 0u) {
+                UInt activeCount = 0u;
+                UInt maxWord     = (poolCap + 31u) >> 5u;
+                Vec3 unionMin    = Vec3( 1.0e30,  1.0e30,  1.0e30);
+                Vec3 unionMax    = Vec3(-1.0e30, -1.0e30, -1.0e30);
+                for (UInt pw = 0u; pw < maxWord; pw = pw + 1u) {
+                    UInt mask = gs_PageBitmask[pw];
+                    while (mask != 0u) {
+                        UInt bitPos  = FirstBitLow(mask);
+                        mask         = mask & (mask - 1u);
+                        UInt physIdx = (pw << 5u) + bitPos;
+                        UInt rFlags  = NVSCasterCullParams.InPageRenderData[physIdx].renderFlags;
+                        UInt pFlags  = 1u;
+                        if ((rFlags & 8u) != 0u) {
+                            pFlags = pFlags | 8u;
+                        }
+                        if ((rFlags & 4u) != 0u) {
+                            pFlags = pFlags | 16u;
+                        }
+
+                        Vec3 pWMin = Vec3(
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinX,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinY,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinZ);
+                        Vec3 pWMax = Vec3(
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxX,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxY,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxZ);
+                        unionMin = Min(unionMin, pWMin);
+                        unionMax = Max(unionMax, pWMax);
+
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].virtualPageFlatIndex   = NVSCasterCullParams.InPageRenderData[physIdx].virtualFlatIndex;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].physicalPageIndex      = physIdx;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].virtualAddressPacked   = NVSCasterCullParams.InPageRenderData[physIdx].virtualAddressPacked;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].lightId                = NVSCasterCullParams.InPageRenderData[physIdx].lightId;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].clipmapLevel           = NVSCasterCullParams.InPageRenderData[physIdx].clipmapLevel;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].firstCasterOffset      = 0u;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].casterCount            = 0u;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].rawCandidateCount      = 0u;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].pageFlags              = pFlags;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].broadPhasePassedCount  = 0u;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].narrowPhasePassedCount = 0u;
+                        NVSCasterCullParams.OutCasterPageRanges[activeCount].physicalGeneration     = NVSCasterCullParams.InPageRenderData[physIdx].physicalGeneration;
+                        activeCount = activeCount + 1u;
+                    }
+                }
+
+                UInt indCount  = 0u;
+                UInt indStride = 0u;
+                GetDimensions(NVSCasterCullParams.OutWorklistIndirectArgs, indCount, indStride);
+                if (indCount >= 16u) {
+                    if (activeCount > 0u) {
+                        NVSCasterCullParams.OutWorklistIndirectArgs[8u].arg  = asuint(unionMin.x);
+                        NVSCasterCullParams.OutWorklistIndirectArgs[9u].arg  = asuint(unionMin.y);
+                        NVSCasterCullParams.OutWorklistIndirectArgs[10u].arg = asuint(unionMin.z);
+                        NVSCasterCullParams.OutWorklistIndirectArgs[11u].arg = asuint(unionMax.x);
+                        NVSCasterCullParams.OutWorklistIndirectArgs[12u].arg = asuint(unionMax.y);
+                        NVSCasterCullParams.OutWorklistIndirectArgs[13u].arg = asuint(unionMax.z);
+                        NVSCasterCullParams.OutWorklistIndirectArgs[14u].arg = activeCount;
+                        NVSCasterCullParams.OutWorklistIndirectArgs[15u].arg = 1u;
+                    } else {
+                        NVSCasterCullParams.OutWorklistIndirectArgs[14u].arg = 0u;
+                        NVSCasterCullParams.OutWorklistIndirectArgs[15u].arg = 0u;
+                    }
+                }
+
+                UInt prevDynInv = (preserveDynInv != 0u)
+                    ? NVSCasterCullParams.OutCasterTelemetry[0u].dynamicInvalidatedPageCount
+                    : 0u;
+
+                NVSCasterCullParams.OutCasterTelemetry[0u].totalSceneObjectsScanned    = sceneSlots;
+                NVSCasterCullParams.OutCasterTelemetry[0u].validShadowCastersCount     = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].rejectedDisabledOrHidden    = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].rejectedNonShadowCaster     = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].rejectedInvalidBoundsOrGeom = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].rejectedStaticBatchDedup    = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].rejectedTransparentMaterial = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].activeShadowPagesProcessed  = activeCount;
+                NVSCasterCullParams.OutCasterTelemetry[0u].totalPageCasterTests        = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].broadPhasePassedCount       = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].broadPhaseRejectedCount     = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].narrowPhasePassedCount      = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].narrowPhaseRejectedCount    = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].totalAssignedCasterDraws    = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].overflowDroppedAssignments  = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].emptyActivePageCount        = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].nonEmptyActivePageCount     = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].overflowIncompletePageCount = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].maxCastersPerPage           = 0u;
+                NVSCasterCullParams.OutCasterTelemetry[0u].dynamicInvalidatedPageCount = prevDynInv;
+            }
+        }
+        // =================================================================
+        //  MODE 2: Per-Active-Page Broad-Phase & Narrow-Phase Caster Counting
+        // =================================================================
+        else if (dispatchMode == 2u) {
+            UInt pIdx = linearGid;
+            if (tid == 0u) {
+                UInt activePages = NVSCasterCullParams.OutCasterTelemetry[0u].activeShadowPagesProcessed;
+                UInt tableSize   = NVSCasterCullParams.Config.clipmapTableSize;
+                if (pIdx < activePages) {
+                    UInt physIdx  = NVSCasterCullParams.OutCasterPageRanges[pIdx].physicalPageIndex;
+                    UInt lightId  = NVSCasterCullParams.InPageRenderData[physIdx].lightId;
+                    UInt lvl      = NVSCasterCullParams.InPageRenderData[physIdx].clipmapLevel;
+                    UInt tableIdx = (lightId << 2u) + (lvl & 3u);
+                    if (tableIdx < tableSize) {
+                        UInt cmFlags  = NVSCasterCullParams.InClipmapLevels[tableIdx].flags;
+                        UInt f0       = NVSCasterCullParams.InClipmapLevels[0u].flags;
+                        Vec3 rVec     = NVSCasterCullParams.InClipmapLevels[tableIdx].lightRightAndCenterX.xyz;
+                        Vec3 uVec     = NVSCasterCullParams.InClipmapLevels[tableIdx].lightUpAndCenterY.xyz;
+                        Vec3 dVec     = NVSCasterCullParams.InClipmapLevels[tableIdx].lightDirAndExtrusion.xyz;
+                        Vec3 r0       = NVSCasterCullParams.InClipmapLevels[0u].lightRightAndCenterX.xyz;
+                        Vec3 d0       = NVSCasterCullParams.InClipmapLevels[0u].lightDirAndExtrusion.xyz;
+
+                        Vec3 pWMin = Vec3(
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinX,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinY,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinZ);
+                        Vec3 pWMax = Vec3(
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxX,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxY,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxZ);
+
+                        gs_PageValid         = 1u;
+                        gs_PagePhysIdx       = physIdx;
+                        gs_PageLightId       = lightId;
+                        gs_PageLevel         = lvl;
+                        gs_PageTableIdx      = tableIdx;
+                        gs_PageIsPerspective = ((cmFlags & 4u) != 0u) ? 1u : 0u;
+                        gs_UseLight0Cache    = (((cmFlags & 4u) == 0u) && ((f0 & 4u) == 0u) &&
+                                                (dot(dVec, d0) > 0.999999) && (dot(rVec, r0) > 0.999999)) ? 1u : 0u;
+                        gs_PageLevelBit      = (tableSize > 16u) ? ComputeSpatialWorldGridMask32(pWMin, pWMax) : (1u << tableIdx);
+                        gs_PageWorldCenter   = Vec3(
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldCenterX,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldCenterY,
+                            NVSCasterCullParams.InPageRenderData[physIdx].worldCenterZ);
+                        gs_PageVolumeRadius  = NVSCasterCullParams.InPageRenderData[physIdx].shadowVolumeRadius;
+                        gs_PageWorldMin      = pWMin;
+                        gs_PageWorldMax      = pWMax;
+                        gs_PageLightMinX     = NVSCasterCullParams.InPageRenderData[physIdx].lightMinX;
+                        gs_PageLightMaxX     = NVSCasterCullParams.InPageRenderData[physIdx].lightMaxX;
+                        gs_PageLightMinY     = NVSCasterCullParams.InPageRenderData[physIdx].lightMinY;
+                        gs_PageLightMaxY     = NVSCasterCullParams.InPageRenderData[physIdx].lightMaxY;
+                        gs_PageCasterMinZ    = NVSCasterCullParams.InPageRenderData[physIdx].casterMinZ;
+                        gs_PageCasterMaxZ    = NVSCasterCullParams.InPageRenderData[physIdx].casterMaxZ;
+                        gs_PageTexelSize     = NVSCasterCullParams.InPageRenderData[physIdx].texelWorldSize;
+                        gs_LightRight        = rVec;
+                        gs_LightUp           = uVec;
+                        gs_LightDir          = dVec;
+                        gs_LightPos          = NVSCasterCullParams.InClipmapLevels[tableIdx].lightViewToWorldCol3.xyz;
+                        gs_BroadPassed       = 0u;
+                        gs_NarrowPassed      = 0u;
+                        gs_TestsCount        = 0u;
+                    } else {
+                        gs_PageValid = 0u;
+                    }
+                } else {
+                    gs_PageValid = 0u;
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt  sceneSlots    = (gs_PageValid != 0u) ? NVSCasterCullParams.Config.sceneSlotCount : 0u;
+            UInt  noPrepass     = NVSCasterCullParams.Config.disablePrepassFilter;
+            Float minProjTexels = NVSCasterCullParams.Config.minCasterProjectedTexels;
+            UInt  myTests       = 0u;
+            UInt  myBroad       = 0u;
+            UInt  myNarrow      = 0u;
+
+            for (UInt baseSlot = 0u; baseSlot < sceneSlots; baseSlot = baseSlot + 64u) {
+                Bool chunkActive = true;
+                if (noPrepass == 0u && baseSlot < 65536u) {
+                    if (NVSCasterCullParams.OutCasterValidBitmask[2048u + (baseSlot >> 10u)].maskWord == 0u) {
+                        chunkActive = false;
+                    } else {
+                        UInt w0 = NVSCasterCullParams.OutCasterValidBitmask[baseSlot >> 5u].maskWord;
+                        UInt w1 = ((baseSlot + 32u) < sceneSlots)
+                            ? NVSCasterCullParams.OutCasterValidBitmask[(baseSlot >> 5u) + 1u].maskWord
+                            : 0u;
+                        if ((w0 | w1) == 0u) {
+                            chunkActive = false;
+                        }
+                    }
+                }
+
+                UInt slot = baseSlot + tid;
+                if (chunkActive && slot < sceneSlots) {
+                    Bool  isValidCaster = false;
+                    Vec3  bMin          = Vec3(0.0, 0.0, 0.0);
+                    Vec3  bMax          = Vec3(0.0, 0.0, 0.0);
+                    Vec3  sCenter       = Vec3(0.0, 0.0, 0.0);
+                    Float sRadius       = 0.0;
+                    UInt  candMask      = 0u;
+                    UInt  objFlags      = 0u;
+                    Vec3  lMin          = Vec3(0.0, 0.0, 0.0);
+                    Vec3  lMax          = Vec3(0.0, 0.0, 0.0);
+
+                    if (noPrepass == 0u && slot < 65536u) {
+                        UInt wMask = NVSCasterCullParams.OutCasterValidBitmask[slot >> 5u].maskWord;
+                        if ((wMask & (1u << (slot & 31u))) != 0u) {
+                            isValidCaster = true;
+                            bMin          = NVSCasterCullParams.OutFilteredCasters[slot].aabbMin;
+                            sRadius       = NVSCasterCullParams.OutFilteredCasters[slot].boundingRadius;
+                            bMax          = NVSCasterCullParams.OutFilteredCasters[slot].aabbMax;
+                            candMask      = NVSCasterCullParams.OutFilteredCasters[slot].candidateLevelMask;
+                            sCenter       = NVSCasterCullParams.OutFilteredCasters[slot].sphereCenter;
+                            objFlags      = NVSCasterCullParams.OutFilteredCasters[slot].objectFlags;
+                        }
+                    } else {
+                        UInt dummyVar = 0u;
+                        UInt dummyLod = 0u;
+                        if (EvaluateRawCasterEligibility(
+                                slot,
+                                NVSCasterCullParams.Config.staticBatchPolicy,
+                                NVSCasterCullParams.Config.skipTransparentCasters,
+                                dummyVar,
+                                dummyLod) == 0u) {
+                            isValidCaster = true;
+                            bMin          = NVSCasterCullParams.InGPUSceneObjects[slot].aabbMin;
+                            bMax          = NVSCasterCullParams.InGPUSceneObjects[slot].aabbMax;
+                            Vec4 sph      = NVSCasterCullParams.InGPUSceneObjects[slot].boundingSphere;
+                            sCenter       = sph.xyz;
+                            sRadius       = sph.w;
+                            objFlags      = NVSCasterCullParams.InGPUSceneObjects[slot].objectFlags;
+                            candMask      = ComputeUnifiedCandidateMask(bMin, bMax, NVSCasterCullParams.Config.clipmapTableSize);
+                        }
+                    }
+
+                    if (isValidCaster) {
+                        myTests = myTests + 1u;
+
+                        // Broad-Phase Step 1: 16-bit candidate (lightId, clipmapLevel) bitmask test
+                        if ((candMask & gs_PageLevelBit) != 0u) {
+                            // Broad-Phase Step 2: World-space bounding sphere vs. page 3D shadow volume sphere
+                            Vec3  delta   = sCenter - gs_PageWorldCenter;
+                            Float maxDist = sRadius + gs_PageVolumeRadius;
+                            if (dot(delta, delta) <= (maxDist * maxDist)) {
+                                // Broad-Phase Step 3: World-space AABB vs. page 3D world AABB
+                                if (bMax.x >= gs_PageWorldMin.x && bMin.x <= gs_PageWorldMax.x &&
+                                    bMax.y >= gs_PageWorldMin.y && bMin.y <= gs_PageWorldMax.y &&
+                                    bMax.z >= gs_PageWorldMin.z && bMin.z <= gs_PageWorldMax.z) {
+                                    myBroad = myBroad + 1u;
+
+                                    // Narrow-Phase Step 1: Light-space 3D AABB / Perspective Wedge intersection
+                                    Bool narrowHit = false;
+                                    Float effTexelSize = gs_PageTexelSize;
+                                    if (gs_PageIsPerspective != 0u) {
+                                        ProjectBoundsToLightSpaceRelative(bMin, bMax, gs_LightPos, gs_LightRight, gs_LightUp, gs_LightDir, lMin, lMax);
+                                        narrowHit = DoesLightBoundsOverlapPerspectiveWedge(
+                                            lMin,
+                                            lMax,
+                                            gs_PageLightMinX,
+                                            gs_PageLightMaxX,
+                                            gs_PageLightMinY,
+                                            gs_PageLightMaxY,
+                                            gs_PageCasterMinZ,
+                                            gs_PageCasterMaxZ);
+                                        effTexelSize = gs_PageTexelSize * Max(lMin.z, gs_PageCasterMinZ);
+                                    } else {
+                                        if (noPrepass == 0u && gs_UseLight0Cache != 0u && slot < 65536u) {
+                                            lMin = Vec3(
+                                                NVSCasterCullParams.OutFilteredCasters[slot].light0MinX,
+                                                NVSCasterCullParams.OutFilteredCasters[slot].light0MinY,
+                                                NVSCasterCullParams.OutFilteredCasters[slot].light0MinZ);
+                                            lMax = Vec3(
+                                                NVSCasterCullParams.OutFilteredCasters[slot].light0MaxX,
+                                                NVSCasterCullParams.OutFilteredCasters[slot].light0MaxY,
+                                                NVSCasterCullParams.OutFilteredCasters[slot].light0MaxZ);
+                                        } else {
+                                            ProjectBoundsToLightSpace(bMin, bMax, gs_LightRight, gs_LightUp, gs_LightDir, lMin, lMax);
+                                        }
+                                        narrowHit = (lMax.x >= gs_PageLightMinX && lMin.x <= gs_PageLightMaxX &&
+                                                     lMax.y >= gs_PageLightMinY && lMin.y <= gs_PageLightMaxY &&
+                                                     lMax.z >= gs_PageCasterMinZ && lMin.z <= gs_PageCasterMaxZ);
+                                    }
+
+                                    if (narrowHit) {
+                                        // Narrow-Phase Step 2: Optional small-caster projected texel threshold
+                                        Bool passSmall = true;
+                                        if (minProjTexels > 0.0 && (objFlags & 128u) != 0u && effTexelSize > 0.00000001) {
+                                            Float wTex  = (lMax.x - lMin.x) / effTexelSize;
+                                            Float hTex  = (lMax.y - lMin.y) / effTexelSize;
+                                            Float mTex  = (wTex > hTex) ? wTex : hTex;
+                                            if (mTex < minProjTexels) {
+                                                passSmall = false;
+                                            }
+                                        }
+                                        if (passSmall) {
+                                            myNarrow = myNarrow + 1u;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (myTests > 0u) {
+                InterlockedAdd(gs_TestsCount, myTests, prev);
+            }
+            if (myBroad > 0u) {
+                InterlockedAdd(gs_BroadPassed, myBroad, prev);
+            }
+            if (myNarrow > 0u) {
+                InterlockedAdd(gs_NarrowPassed, myNarrow, prev);
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            if (tid == 0u && gs_PageValid != 0u) {
+                UInt totalTests   = gs_TestsCount;
+                UInt broadPassed  = gs_BroadPassed;
+                UInt narrowPassed = gs_NarrowPassed;
+                UInt broadRej     = (totalTests >= broadPassed) ? (totalTests - broadPassed) : 0u;
+                UInt narrowRej    = (broadPassed >= narrowPassed) ? (broadPassed - narrowPassed) : 0u;
+
+                NVSCasterCullParams.OutCasterPageRanges[pIdx].rawCandidateCount      = narrowPassed;
+                NVSCasterCullParams.OutCasterPageRanges[pIdx].broadPhasePassedCount  = broadPassed;
+                NVSCasterCullParams.OutCasterPageRanges[pIdx].narrowPhasePassedCount = narrowPassed;
+
+                InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].totalPageCasterTests,     totalTests,   prev);
+                InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].broadPhasePassedCount,    broadPassed,  prev);
+                InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].broadPhaseRejectedCount,  broadRej,     prev);
+                InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].narrowPhasePassedCount,   narrowPassed, prev);
+                InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].narrowPhaseRejectedCount, narrowRej,    prev);
+            }
+        }
+        // =================================================================
+        //  MODE 4: Deterministic Page-Caster Worklist Scatter (Ascending Slot Order)
+        // =================================================================
+        else if (dispatchMode == 4u) {
+            UInt pIdx = linearGid;
+            if (tid == 0u) {
+                UInt activePages = NVSCasterCullParams.OutCasterTelemetry[0u].activeShadowPagesProcessed;
+                UInt tableSize   = NVSCasterCullParams.Config.clipmapTableSize;
+                if (pIdx < activePages) {
+                    UInt emitCount = NVSCasterCullParams.OutCasterPageRanges[pIdx].casterCount;
+                    if (emitCount > 0u) {
+                        UInt physIdx  = NVSCasterCullParams.OutCasterPageRanges[pIdx].physicalPageIndex;
+                        UInt lightId  = NVSCasterCullParams.InPageRenderData[physIdx].lightId;
+                        UInt lvl      = NVSCasterCullParams.InPageRenderData[physIdx].clipmapLevel;
+                        UInt tableIdx = (lightId << 2u) + (lvl & 3u);
+                        if (tableIdx < tableSize) {
+                            UInt cmFlags  = NVSCasterCullParams.InClipmapLevels[tableIdx].flags;
+                            UInt f0       = NVSCasterCullParams.InClipmapLevels[0u].flags;
+                            Vec3 rVec     = NVSCasterCullParams.InClipmapLevels[tableIdx].lightRightAndCenterX.xyz;
+                            Vec3 uVec     = NVSCasterCullParams.InClipmapLevels[tableIdx].lightUpAndCenterY.xyz;
+                            Vec3 dVec     = NVSCasterCullParams.InClipmapLevels[tableIdx].lightDirAndExtrusion.xyz;
+                            Vec3 r0       = NVSCasterCullParams.InClipmapLevels[0u].lightRightAndCenterX.xyz;
+                            Vec3 d0       = NVSCasterCullParams.InClipmapLevels[0u].lightDirAndExtrusion.xyz;
+
+                            Vec3 pWMin = Vec3(
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinX,
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinY,
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMinZ);
+                            Vec3 pWMax = Vec3(
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxX,
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxY,
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldBoundsMaxZ);
+
+                            gs_PageValid         = 1u;
+                            gs_PagePhysIdx       = physIdx;
+                            gs_PageVirtFlat      = NVSCasterCullParams.OutCasterPageRanges[pIdx].virtualPageFlatIndex;
+                            gs_PageVirtPacked    = NVSCasterCullParams.OutCasterPageRanges[pIdx].virtualAddressPacked;
+                            gs_PageLightId       = lightId;
+                            gs_PageLevel         = lvl;
+                            gs_PageTableIdx      = tableIdx;
+                            gs_PageIsPerspective = ((cmFlags & 4u) != 0u) ? 1u : 0u;
+                            gs_UseLight0Cache    = (((cmFlags & 4u) == 0u) && ((f0 & 4u) == 0u) &&
+                                                    (dot(dVec, d0) > 0.999999) && (dot(rVec, r0) > 0.999999)) ? 1u : 0u;
+                            gs_PageLevelBit      = (tableSize > 16u) ? ComputeSpatialWorldGridMask32(pWMin, pWMax) : (1u << tableIdx);
+                            gs_PageFirstOffset   = NVSCasterCullParams.OutCasterPageRanges[pIdx].firstCasterOffset;
+                            gs_PageEmitCount     = emitCount;
+                            gs_PageWorldCenter   = Vec3(
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldCenterX,
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldCenterY,
+                                NVSCasterCullParams.InPageRenderData[physIdx].worldCenterZ);
+                            gs_PageVolumeRadius  = NVSCasterCullParams.InPageRenderData[physIdx].shadowVolumeRadius;
+                            gs_PageWorldMin      = pWMin;
+                            gs_PageWorldMax      = pWMax;
+                            gs_PageLightMinX     = NVSCasterCullParams.InPageRenderData[physIdx].lightMinX;
+                            gs_PageLightMaxX     = NVSCasterCullParams.InPageRenderData[physIdx].lightMaxX;
+                            gs_PageLightMinY     = NVSCasterCullParams.InPageRenderData[physIdx].lightMinY;
+                            gs_PageLightMaxY     = NVSCasterCullParams.InPageRenderData[physIdx].lightMaxY;
+                            gs_PageCasterMinZ    = NVSCasterCullParams.InPageRenderData[physIdx].casterMinZ;
+                            gs_PageCasterMaxZ    = NVSCasterCullParams.InPageRenderData[physIdx].casterMaxZ;
+                            gs_PageTexelSize     = NVSCasterCullParams.InPageRenderData[physIdx].texelWorldSize;
+                            gs_LightRight        = rVec;
+                            gs_LightUp           = uVec;
+                            gs_LightDir          = dVec;
+                            gs_LightPos          = NVSCasterCullParams.InClipmapLevels[tableIdx].lightViewToWorldCol3.xyz;
+                        } else {
+                            gs_PageValid     = 0u;
+                            gs_PageEmitCount = 0u;
+                        }
+                    } else {
+                        gs_PageValid     = 0u;
+                        gs_PageEmitCount = 0u;
+                    }
+                } else {
+                    gs_PageValid     = 0u;
+                    gs_PageEmitCount = 0u;
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt  sceneSlots         = (gs_PageValid != 0u) ? NVSCasterCullParams.Config.sceneSlotCount : 0u;
+            UInt  noPrepass          = NVSCasterCullParams.Config.disablePrepassFilter;
+            Float minProjTexels      = NVSCasterCullParams.Config.minCasterProjectedTexels;
+            Float lodScale           = NVSCasterCullParams.Config.lodThresholdScale;
+            UInt  forceLodCfg        = NVSCasterCullParams.Config.forceLodOverride & 511u;
+            UInt  firstOffset        = gs_PageFirstOffset;
+            UInt  emitCount          = gs_PageEmitCount;
+            UInt  runningLocalOffset = 0u;
+
+            for (UInt baseSlot = 0u; baseSlot < sceneSlots; baseSlot = baseSlot + 64u) {
+                if (tid == 0u) {
+                    gs_ChunkPassMask0 = 0u;
+                    gs_ChunkPassMask1 = 0u;
+                }
+
+                GroupMemoryBarrierWithGroupSync();
+
+                Bool chunkActive = (runningLocalOffset < emitCount);
+                if (chunkActive && noPrepass == 0u && baseSlot < 65536u) {
+                    if (NVSCasterCullParams.OutCasterValidBitmask[2048u + (baseSlot >> 10u)].maskWord == 0u) {
+                        chunkActive = false;
+                    } else {
+                        UInt w0 = NVSCasterCullParams.OutCasterValidBitmask[baseSlot >> 5u].maskWord;
+                        UInt w1 = ((baseSlot + 32u) < sceneSlots)
+                            ? NVSCasterCullParams.OutCasterValidBitmask[(baseSlot >> 5u) + 1u].maskWord
+                            : 0u;
+                        if ((w0 | w1) == 0u) {
+                            chunkActive = false;
+                        }
+                    }
+                }
+
+                UInt  slot         = baseSlot + tid;
+                Bool  passedNarrow = false;
+                Float depthSortKey = 0.0;
+                UInt  variantFlags = 0u;
+                UInt  maxLod       = 0u;
+                UInt  objFlags     = 0u;
+                Float sRadius      = 0.0;
+
+                if (chunkActive && slot < sceneSlots) {
+                    Bool isValidCaster = false;
+                    Vec3 bMin          = Vec3(0.0, 0.0, 0.0);
+                    Vec3 bMax          = Vec3(0.0, 0.0, 0.0);
+                    Vec3 sCenter       = Vec3(0.0, 0.0, 0.0);
+                    UInt candMask      = 0u;
+
+                    if (noPrepass == 0u && slot < 65536u) {
+                        UInt wMask = NVSCasterCullParams.OutCasterValidBitmask[slot >> 5u].maskWord;
+                        if ((wMask & (1u << (slot & 31u))) != 0u) {
+                            isValidCaster = true;
+                            bMin          = NVSCasterCullParams.OutFilteredCasters[slot].aabbMin;
+                            sRadius       = NVSCasterCullParams.OutFilteredCasters[slot].boundingRadius;
+                            bMax          = NVSCasterCullParams.OutFilteredCasters[slot].aabbMax;
+                            candMask      = NVSCasterCullParams.OutFilteredCasters[slot].candidateLevelMask;
+                            sCenter       = NVSCasterCullParams.OutFilteredCasters[slot].sphereCenter;
+                            objFlags      = NVSCasterCullParams.OutFilteredCasters[slot].objectFlags;
+                            UInt packedVL = NVSCasterCullParams.OutFilteredCasters[slot].variantAndLodPacked;
+                            variantFlags  = packedVL & 65535u;
+                            maxLod        = (packedVL >> 16u) & 65535u;
+                        }
+                    } else {
+                        if (EvaluateRawCasterEligibility(
+                                slot,
+                                NVSCasterCullParams.Config.staticBatchPolicy,
+                                NVSCasterCullParams.Config.skipTransparentCasters,
+                                variantFlags,
+                                maxLod) == 0u) {
+                            isValidCaster = true;
+                            bMin          = NVSCasterCullParams.InGPUSceneObjects[slot].aabbMin;
+                            bMax          = NVSCasterCullParams.InGPUSceneObjects[slot].aabbMax;
+                            Vec4 sph      = NVSCasterCullParams.InGPUSceneObjects[slot].boundingSphere;
+                            sCenter       = sph.xyz;
+                            sRadius       = sph.w;
+                            objFlags      = NVSCasterCullParams.InGPUSceneObjects[slot].objectFlags;
+                            candMask      = ComputeUnifiedCandidateMask(bMin, bMax, NVSCasterCullParams.Config.clipmapTableSize);
+                        }
+                    }
+
+                    if (isValidCaster && (candMask & gs_PageLevelBit) != 0u) {
+                        Vec3  delta   = sCenter - gs_PageWorldCenter;
+                        Float maxDist = sRadius + gs_PageVolumeRadius;
+                        if (dot(delta, delta) <= (maxDist * maxDist)) {
+                            if (bMax.x >= gs_PageWorldMin.x && bMin.x <= gs_PageWorldMax.x &&
+                                bMax.y >= gs_PageWorldMin.y && bMin.y <= gs_PageWorldMax.y &&
+                                bMax.z >= gs_PageWorldMin.z && bMin.z <= gs_PageWorldMax.z) {
+                                Vec3  lMin         = Vec3(0.0, 0.0, 0.0);
+                                Vec3  lMax         = Vec3(0.0, 0.0, 0.0);
+                                Bool  narrowHit    = false;
+                                Float effTexelSize = gs_PageTexelSize;
+                                if (gs_PageIsPerspective != 0u) {
+                                    ProjectBoundsToLightSpaceRelative(bMin, bMax, gs_LightPos, gs_LightRight, gs_LightUp, gs_LightDir, lMin, lMax);
+                                    narrowHit = DoesLightBoundsOverlapPerspectiveWedge(
+                                        lMin,
+                                        lMax,
+                                        gs_PageLightMinX,
+                                        gs_PageLightMaxX,
+                                        gs_PageLightMinY,
+                                        gs_PageLightMaxY,
+                                        gs_PageCasterMinZ,
+                                        gs_PageCasterMaxZ);
+                                    effTexelSize = gs_PageTexelSize * Max(lMin.z, gs_PageCasterMinZ);
+                                } else {
+                                    if (noPrepass == 0u && gs_UseLight0Cache != 0u && slot < 65536u) {
+                                        lMin = Vec3(
+                                            NVSCasterCullParams.OutFilteredCasters[slot].light0MinX,
+                                            NVSCasterCullParams.OutFilteredCasters[slot].light0MinY,
+                                            NVSCasterCullParams.OutFilteredCasters[slot].light0MinZ);
+                                        lMax = Vec3(
+                                            NVSCasterCullParams.OutFilteredCasters[slot].light0MaxX,
+                                            NVSCasterCullParams.OutFilteredCasters[slot].light0MaxY,
+                                            NVSCasterCullParams.OutFilteredCasters[slot].light0MaxZ);
+                                    } else {
+                                        ProjectBoundsToLightSpace(bMin, bMax, gs_LightRight, gs_LightUp, gs_LightDir, lMin, lMax);
+                                    }
+                                    narrowHit = (lMax.x >= gs_PageLightMinX && lMin.x <= gs_PageLightMaxX &&
+                                                 lMax.y >= gs_PageLightMinY && lMin.y <= gs_PageLightMaxY &&
+                                                 lMax.z >= gs_PageCasterMinZ && lMin.z <= gs_PageCasterMaxZ);
+                                }
+
+                                if (narrowHit) {
+                                    Bool passSmall = true;
+                                    if (minProjTexels > 0.0 && (objFlags & 128u) != 0u && effTexelSize > 0.00000001) {
+                                        Float wTex = (lMax.x - lMin.x) / effTexelSize;
+                                        Float hTex = (lMax.y - lMin.y) / effTexelSize;
+                                        Float mTex = (wTex > hTex) ? wTex : hTex;
+                                        if (mTex < minProjTexels) {
+                                            passSmall = false;
+                                        }
+                                    }
+                                    if (passSmall) {
+                                        passedNarrow = true;
+                                        depthSortKey = lMin.z;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (passedNarrow) {
+                    if (tid < 32u) {
+                        InterlockedOr(gs_ChunkPassMask0, 1u << tid, prev);
+                    } else {
+                        InterlockedOr(gs_ChunkPassMask1, 1u << (tid - 32u), prev);
+                    }
+                }
+
+                GroupMemoryBarrierWithGroupSync();
+
+                UInt mask0 = gs_ChunkPassMask0;
+                UInt mask1 = gs_ChunkPassMask1;
+                if (passedNarrow) {
+                    UInt rank = 0u;
+                    if (tid < 32u) {
+                        UInt lowerMask0 = (tid == 0u) ? 0u : ((1u << tid) - 1u);
+                        rank = CountBits(mask0 & lowerMask0);
+                    } else {
+                        UInt b1         = tid - 32u;
+                        UInt lowerMask1 = (b1 == 0u) ? 0u : ((1u << b1) - 1u);
+                        rank = CountBits(mask0) + CountBits(mask1 & lowerMask1);
+                    }
+
+                    UInt localIdx = runningLocalOffset + rank;
+                    if (localIdx < emitCount) {
+                        UInt outIdx   = firstOffset + localIdx;
+                        UInt gen      = NVSCasterCullParams.InGPUSceneObjects[slot].generation;
+                        UInt meshId   = NVSCasterCullParams.InGPUSceneObjects[slot].meshId;
+                        UInt matId    = NVSCasterCullParams.InGPUSceneObjects[slot].materialId;
+                        UInt subIdx   = NVSCasterCullParams.InGPUSceneObjects[slot].submeshIndex;
+                        UInt batchGrp = NVSCasterCullParams.InGPUSceneObjects[slot].batchGroupId;
+                        UInt sIdx     = NVSCasterCullParams.InGPUSceneObjects[slot].startIndex;
+                        UInt iCnt     = NVSCasterCullParams.InGPUSceneObjects[slot].indexCount;
+                        UInt vCnt     = NVSCasterCullParams.InGPUSceneObjects[slot].vertexCount;
+                        UInt effCount = (iCnt > 0u) ? iCnt : vCnt;
+                        UInt instGrp  = ((objFlags & 8192u) != 0u) ? ((meshId * 65537u) ^ matId) : 0u;
+                        Float lodTexel  = (gs_PageIsPerspective != 0u) ? (gs_PageTexelSize * Max(depthSortKey, gs_PageCasterMinZ)) : gs_PageTexelSize;
+                        UInt  lodLevel  = (gs_PageIsPerspective != 0u) ? 0u : gs_PageLevel;
+                        UInt  selLod    = SelectShadowCasterLOD(
+                            objFlags,
+                            maxLod,
+                            sRadius,
+                            lodLevel,
+                            lodTexel,
+                            lodScale,
+                            forceLodCfg);
+
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].gpuSceneSlotIndex      = slot;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].renderObjectHandle     = (gen > 65535u) ? gen : (((gen & 65535u) << 16u) | (slot & 65535u));
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].virtualPageFlatIndex   = gs_PageVirtFlat;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].physicalPageIndex      = gs_PagePhysIdx;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].virtualAddressPacked   = gs_PageVirtPacked;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].lightIdAndClipmapLevel = (gs_PageLightId & 65535u) | ((gs_PageLevel & 65535u) << 16u);
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].meshId                 = meshId;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].submeshIndex           = subIdx;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].materialId             = matId;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].pipelineVariantFlags   = variantFlags;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].selectedLODIndex       = selLod;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].instanceGroupId        = instGrp;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].batchGroupId           = batchGrp;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].startIndex             = sIdx;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].indexCount             = effCount;
+                        NVSCasterCullParams.OutCasterWorklist[outIdx].casterDepthSortKey     = depthSortKey;
+                    }
+                }
+
+                runningLocalOffset = runningLocalOffset + CountBits(mask0) + CountBits(mask1);
+            }
+        }
+        // =================================================================
+        //  MODE 1: GPU Scene Shadow Caster Filtering & Light 0 Precomputation
+        // =================================================================
+        else if (dispatchMode == 1u) {
+            UInt sceneSlots = NVSCasterCullParams.Config.sceneSlotCount;
+            if (globalTid < sceneSlots) {
+                UInt variantFlags = 0u;
+                UInt maxLod       = 0u;
+                UInt reason       = EvaluateRawCasterEligibility(
+                    globalTid,
+                    NVSCasterCullParams.Config.staticBatchPolicy,
+                    NVSCasterCullParams.Config.skipTransparentCasters,
+                    variantFlags,
+                    maxLod);
+
+                if (reason == 1u) {
+                    InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].rejectedDisabledOrHidden, 1u, prev);
+                } else if (reason == 2u) {
+                    InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].rejectedNonShadowCaster, 1u, prev);
+                } else if (reason == 3u) {
+                    InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].rejectedInvalidBoundsOrGeom, 1u, prev);
+                } else if (reason == 4u) {
+                    InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].rejectedStaticBatchDedup, 1u, prev);
+                } else if (reason == 5u) {
+                    InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].rejectedTransparentMaterial, 1u, prev);
+                } else {
+                    Vec3 bMin   = NVSCasterCullParams.InGPUSceneObjects[globalTid].aabbMin;
+                    Vec3 bMax   = NVSCasterCullParams.InGPUSceneObjects[globalTid].aabbMax;
+                    Vec4 sphere = NVSCasterCullParams.InGPUSceneObjects[globalTid].boundingSphere;
+                    UInt flags  = NVSCasterCullParams.InGPUSceneObjects[globalTid].objectFlags;
+
+                    UInt tableSz = NVSCasterCullParams.Config.clipmapTableSize;
+                    UInt mask16  = ComputeUnifiedCandidateMask(bMin, bMax, tableSz);
+
+                    // Light 0 precomputation is only cached for slots < kNVSMaxFilteredCastersCapacity (65,536).
+                    // Slots >= 65,536 are evaluated through the raw GPU Scene path in Modes 2/4, so they must
+                    // never be written here (OutFilteredCasters capacity is clamped to 65,536 entries).
+                    if (globalTid < 65536u && (tableSz <= 16u || mask16 != 0u)) {
+                        Vec3 R0    = NVSCasterCullParams.InClipmapLevels[0u].lightRightAndCenterX.xyz;
+                        Vec3 U0    = NVSCasterCullParams.InClipmapLevels[0u].lightUpAndCenterY.xyz;
+                        Vec3 D0    = NVSCasterCullParams.InClipmapLevels[0u].lightDirAndExtrusion.xyz;
+                        Vec3 lMin0 = Vec3(0.0, 0.0, 0.0);
+                        Vec3 lMax0 = Vec3(0.0, 0.0, 0.0);
+                        ProjectBoundsToLightSpace(bMin, bMax, R0, U0, D0, lMin0, lMax0);
+
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].aabbMin             = bMin;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].boundingRadius      = sphere.w;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].aabbMax             = bMax;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].candidateLevelMask  = mask16;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].sphereCenter        = sphere.xyz;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].gpuSceneSlotIndex   = globalTid;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].light0MinX          = lMin0.x;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].light0MaxX          = lMax0.x;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].light0MinY          = lMin0.y;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].light0MaxY          = lMax0.y;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].light0MinZ          = lMin0.z;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].light0MaxZ          = lMax0.z;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].objectFlags         = flags;
+                        NVSCasterCullParams.OutFilteredCasters[globalTid].variantAndLodPacked = (variantFlags & 65535u) | ((maxLod & 65535u) << 16u);
+
+                        UInt wordIdx = globalTid >> 5u;
+                        UInt bitIdx  = globalTid & 31u;
+                        InterlockedOr(NVSCasterCullParams.OutCasterValidBitmask[wordIdx].maskWord, 1u << bitIdx, prev);
+                        InterlockedOr(NVSCasterCullParams.OutCasterValidBitmask[2048u + (wordIdx >> 5u)].maskWord, 1u << (wordIdx & 31u), prev);
+                    }
+
+                    InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].validShadowCastersCount, 1u, prev);
+                }
+            }
+        }
+        // =================================================================
+        //  MODE 3: Deterministic Prefix-Sum Page Range Compaction & Overflow Guard
+        // =================================================================
+        else if (dispatchMode == 3u) {
+            if (gid.x == 0u && gid.y == 0u && gid.z == 0u && tid == 0u) {
+                UInt activePages   = NVSCasterCullParams.OutCasterTelemetry[0u].activeShadowPagesProcessed;
+                UInt maxCap        = NVSCasterCullParams.Config.maxWorklistCapacity;
+                UInt runningOffset = 0u;
+                UInt emptyPages    = 0u;
+                UInt nonEmptyPages = 0u;
+                UInt overflowPages = 0u;
+                UInt droppedDraws  = 0u;
+                UInt maxPerPage    = 0u;
+
+                for (UInt pIdx = 0u; pIdx < activePages; pIdx = pIdx + 1u) {
+                    UInt rawCount  = NVSCasterCullParams.OutCasterPageRanges[pIdx].rawCandidateCount;
+                    UInt pFlags    = NVSCasterCullParams.OutCasterPageRanges[pIdx].pageFlags;
+                    UInt emitCount = rawCount;
+
+                    if (rawCount == 0u) {
+                        pFlags     = pFlags | 2u; // NVS_CASTER_PAGE_FLAG_EMPTY_VALID
+                        emptyPages = emptyPages + 1u;
+                    } else {
+                        nonEmptyPages = nonEmptyPages + 1u;
+                        if (runningOffset >= maxCap) {
+                            emitCount     = 0u;
+                            pFlags        = pFlags | 4u; // NVS_CASTER_PAGE_FLAG_OVERFLOW_INCOMPLETE
+                            overflowPages = overflowPages + 1u;
+                            droppedDraws  = droppedDraws + rawCount;
+                        } else if ((runningOffset + rawCount) > maxCap) {
+                            emitCount     = maxCap - runningOffset;
+                            pFlags        = pFlags | 4u; // NVS_CASTER_PAGE_FLAG_OVERFLOW_INCOMPLETE
+                            overflowPages = overflowPages + 1u;
+                            droppedDraws  = droppedDraws + (rawCount - emitCount);
+                        }
+                    }
+
+                    NVSCasterCullParams.OutCasterPageRanges[pIdx].firstCasterOffset = runningOffset;
+                    NVSCasterCullParams.OutCasterPageRanges[pIdx].casterCount       = emitCount;
+                    NVSCasterCullParams.OutCasterPageRanges[pIdx].pageFlags         = pFlags;
+
+                    runningOffset = runningOffset + emitCount;
+                    if (rawCount > maxPerPage) {
+                        maxPerPage = rawCount;
+                    }
+                }
+
+                NVSCasterCullParams.OutCasterTelemetry[0u].totalAssignedCasterDraws    = runningOffset;
+                NVSCasterCullParams.OutCasterTelemetry[0u].overflowDroppedAssignments  = droppedDraws;
+                NVSCasterCullParams.OutCasterTelemetry[0u].emptyActivePageCount        = emptyPages;
+                NVSCasterCullParams.OutCasterTelemetry[0u].nonEmptyActivePageCount     = nonEmptyPages;
+                NVSCasterCullParams.OutCasterTelemetry[0u].overflowIncompletePageCount = overflowPages;
+                NVSCasterCullParams.OutCasterTelemetry[0u].maxCastersPerPage           = maxPerPage;
+
+                UInt dispatchGroups = (runningOffset + 63u) >> 6u;
+                NVSCasterCullParams.OutWorklistIndirectArgs[0u].arg = dispatchGroups;
+                NVSCasterCullParams.OutWorklistIndirectArgs[1u].arg = 1u;
+                NVSCasterCullParams.OutWorklistIndirectArgs[2u].arg = 1u;
+                NVSCasterCullParams.OutWorklistIndirectArgs[3u].arg = runningOffset;
+                NVSCasterCullParams.OutWorklistIndirectArgs[4u].arg = activePages;
+                NVSCasterCullParams.OutWorklistIndirectArgs[5u].arg = nonEmptyPages;
+                NVSCasterCullParams.OutWorklistIndirectArgs[6u].arg = (overflowPages > 0u) ? 1u : 0u;
+                NVSCasterCullParams.OutWorklistIndirectArgs[7u].arg = droppedDraws;
+            }
+        }
+        // =================================================================
+        //  MODE 5: Selective GPU Cache Invalidation for Dynamic Shadow Casters
+        // =================================================================
+        else if (dispatchMode == 5u) {
+            UInt poolCap  = NVSCasterCullParams.Config.physicalPoolCapacity;
+            UInt boxCount = NVSCasterCullParams.Config.dynamicInvalidationBoxCount;
+            if (globalTid < poolCap && boxCount > 0u) {
+                UInt psf            = NVSCasterCullParams.InOutPhysicalPageTable[globalTid].stateAndFlags;
+                UInt pState         = psf & 15u;
+                UInt invAllResident = (NVSCasterCullParams.Config.forceLodOverride & 536870912u) != 0u ? 1u : 0u;
+                Bool stateEligible  = (invAllResident != 0u) ? (pState >= 1u && pState <= 3u) : (pState == 3u);
+
+                UInt vFlat     = NVSCasterCullParams.InOutPhysicalPageTable[globalTid].ownerVirtualFlatIndex;
+                UInt totalVirt = NVSCasterCullParams.Config.totalVirtualPages;
+                if (stateEligible && vFlat < totalVirt) {
+                    Bool isExt    = ((psf & 128u) != 0u);
+                    UInt packed   = NVSCasterCullParams.InOutPhysicalPageTable[globalTid].ownerVirtualAddress;
+                    UInt vx       = packed & 255u;
+                    UInt vy       = (packed >> 8u) & 255u;
+                    UInt mip      = isExt ? ((packed >> 16u) & 15u) : 0u;
+                    UInt lvl      = (packed >> 16u) & 3u;
+                    UInt lightId  = (packed >> 18u) & 63u;
+                    UInt tableIdx = isExt ? NVSCasterCullParams.InOutPhysicalPageTable[globalTid].metaAux : ((lightId << 2u) + lvl);
+                    if (tableIdx < NVSCasterCullParams.Config.clipmapTableSize) {
+                        UInt  cmFlags   = NVSCasterCullParams.InClipmapLevels[tableIdx].flags;
+                        UInt  baseAxis  = NVSCasterCullParams.InClipmapLevels[tableIdx].pagesPerAxis;
+                        UInt  pagesAxis = (baseAxis > 0u) ? Max(baseAxis >> mip, 1u) : 0u;
+                        Float pageSize  = NVSCasterCullParams.InClipmapLevels[tableIdx].pageWorldSize * Float(1u << mip);
+                        Float cMinZ     = NVSCasterCullParams.InClipmapLevels[tableIdx].casterMinZ;
+                        Float cMaxZ     = NVSCasterCullParams.InClipmapLevels[tableIdx].casterMaxZ;
+                        Float dz        = cMaxZ - cMinZ;
+                        Bool  isPersp   = ((cmFlags & 4u) != 0u);
+                        if ((cmFlags & 1u) != 0u && pagesAxis > 0u && vx < pagesAxis && vy < pagesAxis && pageSize > 0.000001 && dz > 0.000001) {
+                            Vec4 rVecFull = NVSCasterCullParams.InClipmapLevels[tableIdx].lightRightAndCenterX;
+                            Vec4 uVecFull = NVSCasterCullParams.InClipmapLevels[tableIdx].lightUpAndCenterY;
+                            Int snapX     = (isPersp || pagesAxis == 1u)
+                                ? 0
+                                : OrthoSnapOriginAtMip(NVSCasterCullParams.InClipmapLevels[tableIdx].snappedOriginPageX, mip);
+                            Int snapY     = (isPersp || pagesAxis == 1u)
+                                ? 0
+                                : OrthoSnapOriginAtMip(NVSCasterCullParams.InClipmapLevels[tableIdx].snappedOriginPageY, mip);
+                            Int halfPages = Int(pagesAxis >> 1u);
+
+                            Int nPages = Int(pagesAxis);
+                            Int relX   = (pagesAxis == 1u) ? 0 : ((Int(vx) - snapX) % nPages);
+                            if (relX < 0) {
+                                relX = relX + nPages;
+                            }
+                            Int relY   = (pagesAxis == 1u) ? 0 : ((Int(vy) - snapY) % nPages);
+                            if (relY < 0) {
+                                relY = relY + nPages;
+                            }
+
+                            Int   worldPageX   = (pagesAxis == 1u) ? 0 : ((snapX - halfPages) + relX);
+                            Int   worldPageY   = (pagesAxis == 1u) ? 0 : ((snapY - halfPages) + relY);
+                            Float singleShiftX = (pagesAxis == 1u) ? ((isPersp ? 0.0 : rVecFull.w) - (0.5 * pageSize)) : 0.0;
+                            Float singleShiftY = (pagesAxis == 1u) ? ((isPersp ? 0.0 : uVecFull.w) - (0.5 * pageSize)) : 0.0;
+                            Float minX         = Float(worldPageX) * pageSize + singleShiftX;
+                            Float minY         = Float(worldPageY) * pageSize + singleShiftY;
+                            Float maxX         = minX + pageSize;
+                            Float maxY         = minY + pageSize;
+                            Float cx           = 0.5 * (minX + maxX);
+                            Float cy           = 0.5 * (minY + maxY);
+                            Float cz           = 0.5 * (cMinZ + cMaxZ);
+
+                            Vec3 R        = rVecFull.xyz;
+                            Vec3 U        = uVecFull.xyz;
+                            Vec3 D        = NVSCasterCullParams.InClipmapLevels[tableIdx].lightDirAndExtrusion.xyz;
+                            Vec3 lightPos = NVSCasterCullParams.InClipmapLevels[tableIdx].lightViewToWorldCol3.xyz;
+
+                            Vec3 pageWMin = Vec3(0.0, 0.0, 0.0);
+                            Vec3 pageWMax = Vec3(0.0, 0.0, 0.0);
+                            if (isPersp) {
+                                Float zNear = Max(cMinZ, 0.001);
+                                Float zFar  = Max(cMaxZ, zNear + 0.001);
+                                Vec3 c00n   = lightPos + R * (minX * zNear) + U * (minY * zNear) + D * zNear;
+                                Vec3 c10n   = lightPos + R * (maxX * zNear) + U * (minY * zNear) + D * zNear;
+                                Vec3 c01n   = lightPos + R * (minX * zNear) + U * (maxY * zNear) + D * zNear;
+                                Vec3 c11n   = lightPos + R * (maxX * zNear) + U * (maxY * zNear) + D * zNear;
+                                Vec3 c00f   = lightPos + R * (minX * zFar)  + U * (minY * zFar)  + D * zFar;
+                                Vec3 c10f   = lightPos + R * (maxX * zFar)  + U * (minY * zFar)  + D * zFar;
+                                Vec3 c01f   = lightPos + R * (minX * zFar)  + U * (maxY * zFar)  + D * zFar;
+                                Vec3 c11f   = lightPos + R * (maxX * zFar)  + U * (maxY * zFar)  + D * zFar;
+
+                                pageWMin = Min(Min(Min(c00n, c10n), Min(c01n, c11n)), Min(Min(c00f, c10f), Min(c01f, c11f)));
+                                pageWMax = Max(Max(Max(c00n, c10n), Max(c01n, c11n)), Max(Max(c00f, c10f), Max(c01f, c11f)));
+                            } else {
+                                Vec3  worldCenter = R * cx + U * cy + D * cz;
+                                Float hx          = 0.5 * pageSize;
+                                Float hy          = 0.5 * pageSize;
+                                Float hz          = 0.5 * dz;
+                                Vec3  extWorld    = Vec3(
+                                    abs(R.x) * hx + abs(U.x) * hy + abs(D.x) * hz,
+                                    abs(R.y) * hx + abs(U.y) * hy + abs(D.y) * hz,
+                                    abs(R.z) * hx + abs(U.z) * hy + abs(D.z) * hz);
+                                pageWMin = worldCenter - extWorld;
+                                pageWMax = worldCenter + extWorld;
+                            }
+
+                            UInt shouldInvalidate = 0u;
+                            for (UInt b = 0u; b < boxCount; b = b + 1u) {
+                                Vec3 boxMin = NVSCasterCullParams.InDynamicInvalidationBoxes[b].worldMin;
+                                Vec3 boxMax = NVSCasterCullParams.InDynamicInvalidationBoxes[b].worldMax;
+                                if (boxMax.x >= boxMin.x && boxMax.y >= boxMin.y && boxMax.z >= boxMin.z) {
+                                    if (boxMax.x >= pageWMin.x && boxMin.x <= pageWMax.x &&
+                                        boxMax.y >= pageWMin.y && boxMin.y <= pageWMax.y &&
+                                        boxMax.z >= pageWMin.z && boxMin.z <= pageWMax.z) {
+                                        Vec3 lMin = Vec3(0.0, 0.0, 0.0);
+                                        Vec3 lMax = Vec3(0.0, 0.0, 0.0);
+                                        if (isPersp) {
+                                            ProjectBoundsToLightSpaceRelative(boxMin, boxMax, lightPos, R, U, D, lMin, lMax);
+                                            if (DoesLightBoundsOverlapPerspectiveWedge(lMin, lMax, minX, maxX, minY, maxY, cMinZ, cMaxZ)) {
+                                                shouldInvalidate = 1u;
+                                                break;
+                                            }
+                                        } else {
+                                            ProjectBoundsToLightSpace(boxMin, boxMax, R, U, D, lMin, lMax);
+                                            if (lMax.x >= minX && lMin.x <= maxX &&
+                                                lMax.y >= minY && lMin.y <= maxY &&
+                                                lMax.z >= cMinZ && lMin.z <= cMaxZ) {
+                                                shouldInvalidate = 1u;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (shouldInvalidate != 0u) {
+                                UInt oldAddr = NVSCasterCullParams.InOutVirtualPageTable[vFlat].virtualAddressPacked;
+                                UInt newAddr = 0u;
+                                if (isExt) {
+                                    UInt oldGen12 = ((oldAddr >> 20u) & 4095u) + 1u;
+                                    if (oldGen12 > 4095u) {
+                                        oldGen12 = 1u;
+                                    }
+                                    newAddr = (oldAddr & 1048575u) | (oldGen12 << 20u);
+                                } else {
+                                    UInt oldGen8 = ((oldAddr >> 24u) & 255u) + 1u;
+                                    if (oldGen8 > 255u) {
+                                        oldGen8 = 1u;
+                                    }
+                                    newAddr = (oldAddr & 16777215u) | (oldGen8 << 24u);
+                                }
+
+                                // Transition virtual page to NVS_PAGE_STATE_INVALIDATED (4) and unmap physicalPageIndex
+                                NVSCasterCullParams.InOutVirtualPageTable[vFlat].stateAndFlags        = isExt ? (4u | 512u) : 4u;
+                                NVSCasterCullParams.InOutVirtualPageTable[vFlat].physicalPageIndex    = invalidIdx;
+                                NVSCasterCullParams.InOutVirtualPageTable[vFlat].virtualAddressPacked = newAddr;
+
+                                // Release physical page back to NVS_PHYS_STATE_FREE (0)
+                                NVSCasterCullParams.InOutPhysicalPageTable[globalTid].stateAndFlags         = 0u;
+                                NVSCasterCullParams.InOutPhysicalPageTable[globalTid].ownerVirtualFlatIndex = invalidIdx;
+                                NVSCasterCullParams.InOutPhysicalPageTable[globalTid].ownerVirtualAddress   = 0u;
+                                NVSCasterCullParams.InOutPhysicalPageTable[globalTid].metaAux               = 0u;
+
+                                InterlockedAdd(NVSCasterCullParams.OutCasterTelemetry[0u].dynamicInvalidatedPageCount, 1u, prev);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // =================================================================
+        //  MODE 6: Preflight 2.1 GPU Matrix Convention & PageClip Verification
+        // =================================================================
+        else if (dispatchMode == 6u) {
+            UInt pointCount = NVSCasterCullParams.Config.dynamicInvalidationBoxCount;
+            if (globalTid < pointCount) {
+                Vec3 worldPos = NVSCasterCullParams.InDynamicInvalidationBoxes[globalTid].worldMin;
+                UInt physIdx  = NVSCasterCullParams.InDynamicInvalidationBoxes[globalTid].gpuSceneSlotIndex;
+
+                Vec4 col0 = NVSCasterCullParams.InPageRenderData[physIdx].worldToPageClipCol0;
+                Vec4 col1 = NVSCasterCullParams.InPageRenderData[physIdx].worldToPageClipCol1;
+                Vec4 col2 = NVSCasterCullParams.InPageRenderData[physIdx].worldToPageClipCol2;
+                Vec4 col3 = NVSCasterCullParams.InPageRenderData[physIdx].worldToPageClipCol3;
+
+                // 1. Direct column-major linear combination using worldToPageClipCol0..3
+                Vec4  clipCol = col0 * worldPos.x + col1 * worldPos.y + col2 * worldPos.z + col3;
+                Float invW    = (abs(clipCol.w) > 0.0000001) ? (1.0 / clipCol.w) : 1.0;
+                Vec3  ndc     = clipCol.xyz * invW;
+                Vec2  uv      = Vec2(0.5 * ndc.x + 0.5, 0.5 * ndc.y + 0.5);
+
+                // 2. Direct NSL Mul(Mat4, Vec4) using column_major float4x4 in InGPUSceneObjects[physIdx].worldMatrix
+                Vec4 clipMat = Mul(NVSCasterCullParams.InGPUSceneObjects[physIdx].worldMatrix, Vec4(worldPos, 1.0));
+
+                NVSCasterCullParams.OutFilteredCasters[globalTid].aabbMin             = clipCol.xyz;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].boundingRadius      = clipCol.w;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].aabbMax             = ndc;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].candidateLevelMask  = physIdx;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].sphereCenter        = Vec3(uv.x, uv.y, 0.0);
+                NVSCasterCullParams.OutFilteredCasters[globalTid].gpuSceneSlotIndex   = globalTid;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].light0MinX          = clipMat.x;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].light0MaxX          = clipMat.y;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].light0MinY          = clipMat.z;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].light0MaxY          = clipMat.w;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].light0MinZ          = 0.0;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].light0MaxZ          = 0.0;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].objectFlags         = 1u;
+                NVSCasterCullParams.OutFilteredCasters[globalTid].variantAndLodPacked = 0u;
+            }
+        }
+    }
+}
+

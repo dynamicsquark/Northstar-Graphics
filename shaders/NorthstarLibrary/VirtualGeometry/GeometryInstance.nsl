@@ -1,0 +1,97 @@
+// =====================================================================
+//  GeometryInstance.nsl — Northstar NSL Standard Library: GPU Scene Object Access
+//
+//  Provides scene-wide GPU Scene object record access (160B GPUSceneObjectData)
+//  available live on both STANDARD and VIRTUALIZED geometry draws.
+//  Consolidated under PROPERTY NVGResources to share a single logical block.
+// =====================================================================
+
+PROPERTY NVGResources
+{
+    StructuredBuffer GPUSceneObjects
+    {
+        Get(NVG_OBJ_SLOT_INDEX)
+        Get(NVG_OBJ_GENERATION)
+        Get(NVG_OBJ_FLAGS)
+        Get(NVG_OBJ_RENDER_FLAGS)
+        Get(NVG_OBJ_MESH_ID)
+        Get(NVG_OBJ_MATERIAL_ID)
+        Get(NVG_OBJ_LOD_GROUP_ID)
+        Get(NVG_OBJ_BATCH_GROUP_ID)
+        Get(NVG_OBJ_VERTEX_COUNT)
+        Get(NVG_OBJ_INDEX_COUNT)
+        Get(NVG_OBJ_START_INDEX)
+        Get(NVG_OBJ_BASE_VERTEX)
+        Get(NVG_OBJ_AABB_MIN)
+        Get(NVG_OBJ_SUBMESH_INDEX)
+        Get(NVG_OBJ_AABB_MAX)
+        Get(NVG_OBJ_LOD_MATERIAL_FLAGS)
+        Get(NVG_OBJ_BOUNDING_SPHERE)
+        Get(NVG_OBJ_WORLD_MATRIX)
+    }
+}
+
+LIBRARY
+{
+    Bool NVGIsGPUSceneAvailable()
+    {
+        UInt objCount  = 0u;
+        UInt objStride = 0u;
+        GetDimensions(NVGResources.GPUSceneObjects, objCount, objStride);
+        return objCount > 0u;
+    }
+
+    UInt NVGGetGPUSceneObjectCount()
+    {
+        UInt objCount  = 0u;
+        UInt objStride = 0u;
+        GetDimensions(NVGResources.GPUSceneObjects, objCount, objStride);
+        return objCount;
+    }
+
+    Mat4 NVGGetObjectWorldMatrix(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_WORLD_MATRIX;
+    }
+
+    UInt NVGGetObjectFlags(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_FLAGS;
+    }
+
+    UInt NVGGetObjectMeshId(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_MESH_ID;
+    }
+
+    UInt NVGGetObjectMaterialId(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_MATERIAL_ID;
+    }
+
+    Vec3 NVGTransformPosition(Mat4 worldMatrix, Vec3 localPos)
+    {
+        return Mul(worldMatrix, Vec4(localPos, 1.0)).xyz;
+    }
+
+    Vec3 NVGTransformDirection(Mat4 worldMatrix, Vec3 localDir)
+    {
+        return Normalize(Mul(worldMatrix, Vec4(localDir, 0.0)).xyz);
+    }
+
+    // Exact cofactor normal transform supporting non-uniform scale & negative mirrored transforms
+    Vec3 NVGTransformNormal(Mat4 worldMatrix, Vec3 localNormal)
+    {
+        Vec3 c0 = Mul(worldMatrix, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+        Vec3 c1 = Mul(worldMatrix, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+        Vec3 c2 = Mul(worldMatrix, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        Vec3 r0 = Cross(c1, c2);
+        Vec3 r1 = Cross(c2, c0);
+        Vec3 r2 = Cross(c0, c1);
+        Float det = Dot(c0, r0);
+        Vec3 n = r0 * localNormal.x + r1 * localNormal.y + r2 * localNormal.z;
+        if (det < 0.0) { n = -n; }
+        Float lenSq = Dot(n, n);
+        return (lenSq > 0.0000000001) ? (n / Sqrt(lenSq)) : Vec3(0.0, 1.0, 0.0);
+    }
+}

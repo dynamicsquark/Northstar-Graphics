@@ -1,0 +1,736 @@
+// =====================================================================
+//  StandardLitPS.nsl
+//  Northstar Graphics — Built-in Physically-Based Standard Lit Pixel Shader
+//
+//  Mathematical & Physical Foundation:
+//    - Exact IEC 61966-2-1 Piecewise sRGB <-> Linear Transfer Functions
+//    - Specular NDF       : Isotropic Trowbridge-Reitz GGX (Walter et al. 2007)
+//    - Specular Visibility: Exact Height-Correlated Smith-GGX (Heitz 2014)
+//    - Specular Fresnel   : Schlick Fresnel + <2% Micro-Occlusion F90
+//    - Energy Conservation: Multi-Scattering Specular Compensation &
+//                           Diffuse-Specular Directional Albedo Preservation
+//                           (Kulla & Conty 2017, Turquin 2019, Lazarov 2013)
+//    - Rough Diffuse BRDF : Energy-Preserving EON Microfacet Diffuse
+//                           (Portsmouth et al. 2025)
+//    - Specular Filtering : Geometric Normal Variance Specular Anti-Aliasing
+//                           (Kaplanyan & Antonov 2016)
+//    - Ambient Occlusion  : Colored Multi-Bounce Diffuse AO (Jimenez et al. 2016)
+//                           + Lagarde Specular AO & Horizon Occlusion
+//    - Virtual Shadows    : Unified Directional / Point / Spot NVS Virtual Shadow
+//                           Sampling with RPDB & Softness Modes 0..4
+//    - Display Transform  : AP1 Working-Space Fitted ACES RRT+ODT Filmic Curve
+// =====================================================================
+
+STAGE PIXEL
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualShadows/VirtualShadows.nsl")
+}
+
+INPUT_LAYOUT
+{
+    Get(CLIP_POSITION)
+    Get(WORLD_POSITION)
+    Get(WORLD_NORMAL)
+    Get(TANGENT)
+    Get(BITANGENT)
+    Get(UV0)
+    Get(UV1)
+    Get(COLOR)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(COLOR_TARGET0)
+}
+
+PROPERTY Material
+{
+    Buffer MaterialParams
+    {
+        Add(baseColor)                : Vec4  = 1.0 1.0 1.0 1.0
+        Add(emissiveColor)            : Vec3  = 0.0 0.0 0.0
+        Add(emissiveStrength)         : Float = 1.0
+        Add(roughness)                : Float = 0.50
+        Add(metallic)                 : Float = 0.00
+        Add(specular)                 : Float = 0.50
+        Add(ao)                       : Float = 1.0
+        Add(normalStrength)           : Float = 1.0
+        Add(alphaCutoff)              : Float = 0.0
+        Add(exposure)                 : Float = 1.0
+        Add(uvTiling)                 : Vec2  = 1.0 1.0
+        Add(uvOffset)                 : Vec2  = 0.0 0.0
+        Add(shadowDebugMode)          : Int   = 0
+        Add(nvgDebugActive)           : Int   = 0
+        Add(useBaseColorMap)          : Bool  = true
+        Add(useNormalMap)             : Bool  = true
+        Add(useRoughnessMap)          : Bool  = true
+        Add(useEmissiveMap)           : Bool  = false
+        Add(useAOMap)                 : Bool  = true
+        Add(receiveShadows)           : Bool  = true
+        Add(enableToneMap)            : Bool  = true
+        Add(enableEnergyCompensation) : Bool  = true
+        Add(enableSpecularAA)         : Bool  = true
+    }
+
+    Texture2D Textures
+    {
+        Add(BaseColorMap)
+        Add(NormalMap)
+        Add(MetallicRoughnessMap)
+        Add(EmissiveMap)
+        Add(AOMap)
+    }
+
+    SamplerState Samplers
+    {
+        Add(LinearWrapSampler)
+    }
+}
+
+PROPERTY Lighting
+{
+    Buffer FrameData
+    {
+        Get(AMBIENT_COLOR)
+        Get(AMBIENT_INTENSITY)
+        Get(CAMERA_POSITION)
+        Get(CAMERA_DIRECTION)
+        Get(LIGHT_COUNT)
+        Get(GEOMETRY_MODE)
+    }
+
+    StructuredBuffer LightArray
+    {
+        Get(GLOBAL_LIGHT_POSITION)
+        Get(GLOBAL_LIGHT_COLOR)
+        Get(GLOBAL_LIGHT_DIRECTION)
+        Get(GLOBAL_LIGHT_INTENSITY)
+        Get(GLOBAL_LIGHT_RANGE)
+        Get(GLOBAL_LIGHT_TYPE)
+        Get(GLOBAL_LIGHT_INNER_CONE)
+        Get(GLOBAL_LIGHT_OUTER_CONE)
+        Get(GLOBAL_LIGHT_ATTENUATION)
+        Get(GLOBAL_LIGHT_CASTS_SHADOW)
+        Get(GLOBAL_LIGHT_SHADOW_VIEW_BASE)
+        Get(GLOBAL_LIGHT_SHADOW_VIEW_COUNT)
+        Get(GLOBAL_LIGHT_SHADOW_SOFTNESS)
+    }
+}
+
+SHADER
+{
+    Texture2D    baseColorTex  = Material.Textures.BaseColorMap;
+    Texture2D    normalTex     = Material.Textures.NormalMap;
+    Texture2D    metalRoughTex = Material.Textures.MetallicRoughnessMap;
+    Texture2D    emissiveTex   = Material.Textures.EmissiveMap;
+    Texture2D    aoTex         = Material.Textures.AOMap;
+    SamplerState linearSampler = Material.Samplers.LinearWrapSampler;
+
+    // ==================== COLOR SPACE & TRANSFER FUNCTIONS ====================
+    Float SrgbChannelToLinear(Float c)
+    {
+        Float x = Max(c, 0.0);
+        return (x <= 0.04045) ? (x * 0.07739938) : Pow((x + 0.055) * 0.94786729, 2.4);
+    }
+
+    Vec3 SrgbToLinearExact(Vec3 srgb)
+    {
+        return Vec3(
+            SrgbChannelToLinear(srgb.x),
+            SrgbChannelToLinear(srgb.y),
+            SrgbChannelToLinear(srgb.z)
+        );
+    }
+
+    Float LinearChannelToSrgb(Float c)
+    {
+        Float x = Max(c, 0.0);
+        return (x <= 0.0031308) ? (x * 12.92) : (1.055 * Pow(x, 0.41666667) - 0.055);
+    }
+
+    Vec3 LinearToSrgbExact(Vec3 lin)
+    {
+        return Saturate(Vec3(
+            LinearChannelToSrgb(lin.x),
+            LinearChannelToSrgb(lin.y),
+            LinearChannelToSrgb(lin.z)
+        ));
+    }
+
+    // AP1 working-space ACES RRT+ODT rational fit (preserves saturated red/gold hues)
+    Vec3 ACESFittedToneMap(Vec3 srgbLinear)
+    {
+        Vec3 c = Max(srgbLinear, Vec3(0.0, 0.0, 0.0));
+
+        // sRGB (D65) -> ACES Input (AP1 / RRT)
+        Vec3 ap1 = Vec3(
+            Dot(c, Vec3(0.59719, 0.35458, 0.04823)),
+            Dot(c, Vec3(0.07600, 0.90834, 0.01566)),
+            Dot(c, Vec3(0.02840, 0.13383, 0.83777))
+        );
+
+        // RRT + ODT curve fit
+        Vec3 a    = ap1 * (ap1 + Vec3(0.0245786, 0.0245786, 0.0245786)) - Vec3(0.000090537, 0.000090537, 0.000090537);
+        Vec3 b    = ap1 * (ap1 * 0.983729 + Vec3(0.4329510, 0.4329510, 0.4329510)) + Vec3(0.238081, 0.238081, 0.238081);
+        Vec3 odt  = a / Max(b, Vec3(0.0001, 0.0001, 0.0001));
+
+        // ACES Output -> sRGB (D65)
+        Vec3 outLinear = Vec3(
+            Dot(odt, Vec3( 1.60475, -0.53108, -0.07367)),
+            Dot(odt, Vec3(-0.10208,  1.10813, -0.00605)),
+            Dot(odt, Vec3(-0.00327, -0.07276,  1.07602))
+        );
+
+        return Saturate(outLinear);
+    }
+
+    // ==================== MICROFACET & DIFFUSE BRDF KERNELS ====================
+    Float Pow5(Float x)
+    {
+        Float x2 = x * x;
+        return x2 * x2 * x;
+    }
+
+    // Isotropic Trowbridge-Reitz GGX Normal Distribution Function
+    Float DistributionGGX(Float alpha2, Float NoH)
+    {
+        Float d = (NoH * alpha2 - NoH) * NoH + 1.0;
+        return alpha2 / Max(3.14159265 * d * d, 0.000001);
+    }
+
+    // Exact Height-Correlated Smith-GGX Visibility Term: Vis = G / (4 * NoL * NoV)
+    Float VisibilitySmithJointGGX(Float alpha2, Float NoV, Float NoL)
+    {
+        Float visV = NoL * Sqrt(NoV * (NoV - NoV * alpha2) + alpha2);
+        Float visL = NoV * Sqrt(NoL * (NoL - NoL * alpha2) + alpha2);
+        return 0.5 / Max(visV + visL, 0.00001);
+    }
+
+    // Schlick Fresnel with F90 micro-occlusion clamping (<2% physical reflectance threshold)
+    Vec3 FresnelSchlick(Vec3 f0, Float f90, Float VoH)
+    {
+        Float fc = Pow5(1.0 - VoH);
+        return Vec3(f90, f90, f90) * fc + f0 * (1.0 - fc);
+    }
+
+    // Analytical split-sum directional albedo approximation: E(NoV, roughness) = F0 * AB.x + F90 * AB.y
+    Vec2 EnvBRDFApproxLazarov(Float roughness, Float NoV)
+    {
+        Vec4  c0   = Vec4(-1.0, -0.0275, -0.572, 0.022);
+        Vec4  c1   = Vec4( 1.0,  0.0425,  1.040, -0.040);
+        Vec4  r    = c0 * roughness + c1;
+        Float a004 = Min(r.x * r.x, Pow(2.0, -9.28 * NoV)) * r.x + r.y;
+        return Vec2(-1.04 * a004 + r.z, 1.04 * a004 + r.w);
+    }
+
+    // Energy-Preserving Oren-Nayar / GGX Rough Diffuse BRDF (Portsmouth et al. 2025)
+    Vec3 DiffuseGGXRough(Vec3 diffuseAlbedo, Float roughness, Float NoV, Float NoL, Float VoH)
+    {
+        Float rEff  = Saturate(roughness * 0.4);
+        Vec3  rho   = diffuseAlbedo * (Vec3(1.0, 1.0, 1.0) + (Vec3(0.189468, 0.189468, 0.189468) - diffuseAlbedo * 0.189468) * rEff);
+        Float VoL   = 2.0 * VoH * VoH - 1.0;
+        Float sTerm = VoL - NoV * NoL;
+        Float sOverT = Max(sTerm / Max(Max(NoV, NoL), 0.00001), sTerm);
+
+        // constant1_FON = 0.5 - 2 / (3 * PI) = 0.2877934
+        Float af    = 1.0 - rEff * 0.223478;
+        Float fSS   = af * (1.0 + rEff * sOverT);
+        Float gOverPiV = 0.262048 * (1.0 - NoV);
+        Float fMS   = 1.0 - af * (1.0 + rEff * gOverPiV);
+
+        return rho * (Vec3(fSS, fSS, fSS) + rho * fMS) * 0.31830989;
+    }
+
+    // Geometric Normal Variance Specular Anti-Aliasing (Kaplanyan & Antonov 2016)
+    Float FilterRoughnessGeometricAA(Vec3 geomNormal, Float roughness)
+    {
+        Vec3  dndu     = Ddx(geomNormal);
+        Vec3  dndv     = Ddy(geomNormal);
+        Float variance = 0.20 * (Dot(dndu, dndu) + Dot(dndv, dndv));
+        Float kernelA2 = Min(2.0 * variance, 0.18);
+        Float alpha    = roughness * roughness;
+        Float filtA2   = Saturate(alpha * alpha + kernelA2);
+        return Sqrt(Sqrt(filtA2));
+    }
+
+    // Colored Multi-Bounce Diffuse Ambient Occlusion (Jimenez et al. 2016)
+    Vec3 GTAOMultiBounce(Float visibility, Vec3 albedo)
+    {
+        Vec3 a = albedo * 2.0404 - Vec3(0.3324, 0.3324, 0.3324);
+        Vec3 b = albedo * -4.7951 + Vec3(0.6417, 0.6417, 0.6417);
+        Vec3 c = albedo * 2.7552 + Vec3(0.6903, 0.6903, 0.6903);
+        return Max(Vec3(visibility, visibility, visibility), ((a * visibility + b) * visibility + c) * visibility);
+    }
+
+    // Lagarde Specular Ambient Occlusion
+    Float ComputeSpecularOcclusion(Float NoV, Float ao, Float roughness)
+    {
+        Float expo = Pow(2.0, -16.0 * roughness - 1.0);
+        return Saturate(Pow(Max(NoV + ao, 0.0001), expo) - 1.0 + ao);
+    }
+
+    // ==================== PIXEL SHADER ENTRY ====================
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT output;
+
+        // 1. Screen-space triangle normal computed in uniform control flow before alpha discard
+        Vec3  dPdx     = Ddx(input.WORLD_POSITION);
+        Vec3  dPdy     = Ddy(input.WORLD_POSITION);
+        Vec3  rawTriN  = Cross(dPdx, dPdy);
+        Float triLenSq = Dot(rawTriN, rawTriN);
+
+        Vec2 uv = input.UV0 * Material.MaterialParams.uvTiling + Material.MaterialParams.uvOffset;
+
+        // Optional Virtual Geometry diagnostic override
+        if (Material.MaterialParams.nvgDebugActive != 0)
+        {
+            Vec3  dbgN = Normalize(input.WORLD_NORMAL);
+            Float ndl  = 0.32 + 0.68 * Max(Dot(dbgN, Normalize(Vec3(0.45, 0.80, -0.40))), 0.0);
+            output.COLOR_TARGET0 = Vec4(Saturate(input.COLOR.rgb * ndl), 1.0);
+            return output;
+        }
+
+        // 2. Base Color & Alpha Masking
+        Vec4 srgbBase = Material.MaterialParams.baseColor * input.COLOR;
+        if (Material.MaterialParams.useBaseColorMap)
+        {
+            srgbBase = srgbBase * Sample(baseColorTex, linearSampler, uv);
+        }
+
+        if (srgbBase.a < Material.MaterialParams.alphaCutoff)
+        {
+            discard;
+        }
+
+        Vec3 baseColorLinear = Material.MaterialParams.enableToneMap
+            ? SrgbToLinearExact(srgbBase.rgb)
+            : Max(srgbBase.rgb, Vec3(0.0, 0.0, 0.0));
+
+        // 3. Orthonormal TBN & Tangent-Space Normal Mapping (supports RGBA8 & 2-channel BC5 normals)
+        Vec3 geomN = Normalize(input.WORLD_NORMAL);
+        Vec3 triN  = (triLenSq > 0.000000000001) ? (rawTriN * Rsqrt(triLenSq)) : geomN;
+        if (Dot(triN, geomN) < 0.0)
+        {
+            triN = -triN;
+        }
+
+        Vec3 V = Normalize(Lighting.FrameData.CAMERA_POSITION - input.WORLD_POSITION);
+        Vec3 N = geomN;
+
+        if (Material.MaterialParams.useNormalMap)
+        {
+            Vec2  nXY   = Sample(normalTex, linearSampler, uv).xy * 2.0 - Vec2(1.0, 1.0);
+            nXY         = nXY * Material.MaterialParams.normalStrength;
+            Float nZ    = Sqrt(Max(1.0 - Dot(nXY, nXY), 0.0001));
+            Vec3  tNorm = Normalize(Vec3(nXY.x, nXY.y, nZ));
+
+            Vec3 T      = Normalize(input.TANGENT - geomN * Dot(input.TANGENT, geomN));
+            Vec3 rawB   = input.BITANGENT;
+            Float hand  = (Dot(Cross(geomN, T), rawB) < 0.0) ? -1.0 : 1.0;
+            Vec3 B      = Cross(geomN, T) * hand;
+            N           = Normalize(T * tNorm.x + B * tNorm.y + geomN * tNorm.z);
+
+            // Prevent extreme normal perturbation from bending past the view horizon
+            Float nDotVRaw = Dot(N, V);
+            if (nDotVRaw < 0.0)
+            {
+                N = Normalize(N - V * nDotVRaw);
+            }
+        }
+
+        // 4. Surface Roughness, Metallic, Dielectric F0 & Energy Terms
+        Float rough = Clamp(Material.MaterialParams.roughness, 0.04, 1.0);
+        Float metal = Clamp(Material.MaterialParams.metallic,  0.00, 1.0);
+        Float aoVal = Clamp(Material.MaterialParams.ao,        0.00, 1.0);
+
+        if (Material.MaterialParams.useRoughnessMap)
+        {
+            Vec4 mr = Sample(metalRoughTex, linearSampler, uv);
+            rough   = Clamp(rough * mr.g, 0.04, 1.0);
+            metal   = Clamp(metal * mr.b, 0.00, 1.0);
+        }
+
+        if (Material.MaterialParams.enableSpecularAA)
+        {
+            rough = Clamp(FilterRoughnessGeometricAA(geomN, rough), 0.04, 1.0);
+        }
+
+        if (Material.MaterialParams.useAOMap)
+        {
+            aoVal = Saturate(aoVal * Sample(aoTex, linearSampler, uv).r);
+        }
+
+        Float NoV          = Saturate(Abs(Dot(N, V)) + 0.00001);
+        Float alpha        = rough * rough;
+        Float alpha2       = alpha * alpha;
+        Float dielectricF0 = 0.08 * Saturate(Material.MaterialParams.specular);
+        Vec3  f0           = Lerp(Vec3(dielectricF0, dielectricF0, dielectricF0), baseColorLinear, metal);
+        Float f90          = Saturate(50.0 * Dot(f0, Vec3(0.33333334, 0.33333334, 0.33333334)));
+        Vec3  diffuseColor = baseColorLinear * (1.0 - metal);
+
+        // Precompute view-dependent split-sum directional albedo & multi-scattering compensation
+        Vec2  abView           = EnvBRDFApproxLazarov(rough, NoV);
+        Float e0               = Max(abView.x + abView.y, 0.001);
+        Vec3  msSpecMultiplier = Material.MaterialParams.enableEnergyCompensation
+            ? (Vec3(1.0, 1.0, 1.0) + f0 * ((1.0 - e0) / e0))
+            : Vec3(1.0, 1.0, 1.0);
+        Vec3  specDirAlbedo    = msSpecMultiplier * (f0 * abView.x + Vec3(f90, f90, f90) * abView.y);
+        Float diffPreservation = Material.MaterialParams.enableEnergyCompensation
+            ? Saturate(1.0 - Dot(specDirAlbedo, Vec3(0.2126, 0.7152, 0.0722)))
+            : (1.0 - dielectricF0);
+
+        // 5. Unified Multi-Light Direct Illumination + NVS Virtual Shadows
+        UInt totalLightElements = 0u;
+        UInt lightStride        = 0u;
+        GetDimensions(Lighting.LightArray, totalLightElements, lightStride);
+
+        UInt activeLightCount = Lighting.FrameData.LIGHT_COUNT;
+        UInt lightLoopLimit   = Min(activeLightCount, totalLightElements);
+
+        Vec3 directLighting = Vec3(0.0, 0.0, 0.0);
+
+        UInt  dbgSubIndex   = ~0u;
+        UInt  dbgStatus     = 7u;
+        UInt  dbgPhysPage   = ~0u;
+        Vec2  dbgSliceUV    = Vec2(0.5, 0.5);
+        Float dbgTransition = 0.0;
+        Float dbgShadowVis  = 1.0;
+        Bool  dbgCaptured   = false;
+
+        Float pixelRot = NVSInterleavedGradientNoise(input.CLIP_POSITION.xy) * 6.2831853;
+
+        for (UInt i = 0u; i < lightLoopLimit; i++)
+        {
+            Float intensity = Lighting.LightArray.GLOBAL_LIGHT_INTENSITY[i];
+            if (intensity <= 0.0)
+            {
+                continue;
+            }
+
+            UInt lType      = Lighting.LightArray.GLOBAL_LIGHT_TYPE[i];
+            Vec3 lightColor = Lighting.LightArray.GLOBAL_LIGHT_COLOR[i];
+            Vec3 lightDir   = Lighting.LightArray.GLOBAL_LIGHT_DIRECTION[i];
+
+            Vec3  curL  = Vec3(0.0, 1.0, 0.0);
+            Float atten = 1.0;
+
+            if (lType == 0u)
+            {
+                curL  = Normalize(-lightDir);
+                atten = 1.0;
+            }
+            else
+            {
+                Vec3  lightPos   = Lighting.LightArray.GLOBAL_LIGHT_POSITION[i];
+                Vec3  lightVec   = lightPos - input.WORLD_POSITION;
+                Float dist       = Length(lightVec);
+                Float lightRange = Lighting.LightArray.GLOBAL_LIGHT_RANGE[i];
+                if (dist > lightRange && lightRange > 0.0)
+                {
+                    continue;
+                }
+
+                curL = lightVec / Max(dist, 0.0001);
+                Vec3  attenCoeff = Lighting.LightArray.GLOBAL_LIGHT_ATTENUATION[i];
+                Float polyAtten  = 1.0 / Max(attenCoeff.x + attenCoeff.y * dist + attenCoeff.z * dist * dist, 0.0001);
+                if (lightRange > 0.0)
+                {
+                    // Smooth physical inverse-square windowing (zero hard cutoff boundary)
+                    Float dRatio = dist / lightRange;
+                    Float dRat2  = dRatio * dRatio;
+                    Float window = Saturate(1.0 - dRat2 * dRat2);
+                    atten        = (window * window) * polyAtten;
+                }
+                else
+                {
+                    atten = polyAtten;
+                }
+
+                if (lType == 2u)
+                {
+                    Float innerAngle = Lighting.LightArray.GLOBAL_LIGHT_INNER_CONE[i];
+                    Float outerAngle = Lighting.LightArray.GLOBAL_LIGHT_OUTER_CONE[i];
+                    Float cosAngle   = Dot(-curL, Normalize(lightDir));
+                    Float cosInner   = Cos(innerAngle);
+                    Float cosOuter   = Cos(outerAngle);
+                    Float spotT      = Saturate((cosAngle - cosOuter) / Max(cosInner - cosOuter, 0.0001));
+                    atten            = atten * (spotT * spotT);
+                }
+            }
+
+            if (atten > 0.0001 &&
+                Material.MaterialParams.receiveShadows &&
+                Lighting.LightArray.GLOBAL_LIGHT_CASTS_SHADOW[i] != 0u)
+            {
+                UInt sViewBase  = Lighting.LightArray.GLOBAL_LIGHT_SHADOW_VIEW_BASE[i];
+                UInt sViewCount = Lighting.LightArray.GLOBAL_LIGHT_SHADOW_VIEW_COUNT[i];
+
+                if (sViewCount > 0u)
+                {
+                    Int   curDbgMode = Material.MaterialParams.shadowDebugMode;
+                    Bool  isFrontLit = (Dot(N, curL) > 0.0) && (Dot(geomN, curL) > -0.02);
+                    Float shadowVis  = isFrontLit ? 1.0 : 0.0;
+
+                    if (NVSSamplingIsAvailable() && (isFrontLit || (curDbgMode != 0 && curDbgMode != 2)))
+                    {
+                        UInt softness = Lighting.LightArray.GLOBAL_LIGHT_SHADOW_SOFTNESS[i];
+                        NVSResolvedLightShadowViews views = NVSResolveLightShadowViews(
+                            sViewBase,
+                            sViewCount,
+                            input.WORLD_POSITION,
+                            geomN);
+
+                        if (!isFrontLit)
+                        {
+                            shadowVis = 0.0;
+                        }
+                        else if (views.baseStatus == 6u)
+                        {
+                            shadowVis = 1.0;
+                        }
+                        else if (views.baseStatus != 5u && views.baseStatus != 7u && views.activeView != (~0u))
+                        {
+                            Vec2 grad0 = NVSComputeReceiverPlaneDepthGradientPerTexel(views.activeView, views.activeLookup, triN);
+                            Vec2 grad1 = views.doTransition
+                                ? NVSComputeReceiverPlaneDepthGradientPerTexel(views.nextView, views.nextLookup, triN)
+                                : grad0;
+
+                            UInt  tapsPerView = 1u;
+                            UInt  gridDim     = 1u;
+                            Int   halfExt     = 0;
+                            Float stepTexels  = 0.0;
+                            Bool  useVogel    = false;
+
+                            if (softness == 1u)
+                            {
+                                // MEDIUM_HARD: Crisp 3x3 tent-weighted RPDB cross-page PCF
+                                tapsPerView = 9u;
+                                gridDim     = 3u;
+                                halfExt     = 1;
+                                stepTexels  = 0.75;
+                            }
+                            else if (softness == 2u)
+                            {
+                                // MEDIUM: Balanced 3x3 tent-weighted RPDB cross-page PCF
+                                tapsPerView = 9u;
+                                gridDim     = 3u;
+                                halfExt     = 1;
+                                stepTexels  = 1.50;
+                            }
+                            else if (softness == 3u)
+                            {
+                                // MEDIUM_SOFT: 5x5 B-spline separable kernel PCF
+                                tapsPerView = 25u;
+                                gridDim     = 5u;
+                                halfExt     = 2;
+                                stepTexels  = 1.25;
+                            }
+                            else if (softness >= 4u)
+                            {
+                                // SOFT: 16-tap IGN-rotated golden-angle Vogel disk filter
+                                tapsPerView = 16u;
+                                stepTexels  = 3.50;
+                                useVogel    = true;
+                            }
+
+                            UInt  totalTaps = (views.doTransition ? (tapsPerView * 2u) : tapsPerView) + UInt(NVSLoopDynamicZero());
+                            Float sum0      = 0.0;
+                            Float cnt0      = 0.0;
+                            Float sum1      = 0.0;
+                            Float cnt1      = 0.0;
+
+                            for (UInt m = 0u; m < totalTaps; m++)
+                            {
+                                Bool            isSecond  = (m >= tapsPerView);
+                                UInt            localIdx  = isSecond ? (m - tapsPerView) : m;
+                                UInt            curView   = isSecond ? views.nextView : views.activeView;
+                                Vec2            curGrad   = isSecond ? grad1 : grad0;
+                                NVSLookupResult curLookup = views.activeLookup;
+                                if (isSecond)
+                                {
+                                    curLookup = views.nextLookup;
+                                }
+
+                                if (curLookup.status != 5u && curLookup.status != 6u && curLookup.status != 7u)
+                                {
+                                    Vec2  offset = Vec2(0.0, 0.0);
+                                    Float wTap   = 1.0;
+
+                                    if (useVogel)
+                                    {
+                                        Vec2 disk = NVSVogelDiskSample(localIdx, tapsPerView, pixelRot);
+                                        offset    = disk * stepTexels;
+                                        wTap      = 1.0 - 0.45 * Dot(disk, disk);
+                                    }
+                                    else if (gridDim > 1u)
+                                    {
+                                        Int   dx  = Int(localIdx % gridDim) - halfExt;
+                                        Int   dy  = Int(localIdx / gridDim) - halfExt;
+                                        Float adx = Abs(Float(dx));
+                                        Float ady = Abs(Float(dy));
+                                        Bool  is5 = (gridDim == 5u);
+                                        Float wx  = is5 ? ((adx < 0.5) ? 6.0 : ((adx < 1.5) ? 4.0 : 1.0)) : ((adx < 0.5) ? 2.0 : 1.0);
+                                        Float wy  = is5 ? ((ady < 0.5) ? 6.0 : ((ady < 1.5) ? 4.0 : 1.0)) : ((ady < 0.5) ? 2.0 : 1.0);
+                                        wTap      = wx * wy;
+                                        offset    = Vec2(Float(dx) * stepTexels, Float(dy) * stepTexels);
+                                    }
+
+                                    NVSShadowTapSample tap = NVSSampleCompareTapAtTexelOffsetGrad(
+                                        curView,
+                                        curLookup,
+                                        triN,
+                                        offset,
+                                        curGrad);
+
+                                    if (tap.valid)
+                                    {
+                                        if (isSecond)
+                                        {
+                                            sum1 = sum1 + (wTap * tap.visibility);
+                                            cnt1 = cnt1 + wTap;
+                                        }
+                                        else
+                                        {
+                                            sum0 = sum0 + (wTap * tap.visibility);
+                                            cnt0 = cnt0 + wTap;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Float vis0 = (views.activeLookup.status == 6u)
+                                ? 1.0
+                                : ((cnt0 > 0.0) ? (sum0 / cnt0) : 1.0);
+                            if (views.doTransition)
+                            {
+                                Float vis1 = (views.nextLookup.status == 6u)
+                                    ? 1.0
+                                    : ((cnt1 > 0.0) ? (sum1 / cnt1) : vis0);
+                                shadowVis = Lerp(vis0, vis1, views.transitionFactor);
+                            }
+                            else
+                            {
+                                shadowVis = vis0;
+                            }
+                        }
+
+                        if (!dbgCaptured)
+                        {
+                            dbgStatus     = views.activeLookup.status;
+                            dbgPhysPage   = views.activeLookup.physicalPageIndex;
+                            dbgSliceUV    = views.activeLookup.rawSliceUV;
+                            dbgTransition = views.transitionFactor;
+                            dbgShadowVis  = shadowVis;
+                            if (views.activeView != (~0u))
+                            {
+                                UInt vFlagsDbg = NVSShadowMetadata.LightViewTable[views.activeView].NVS_VIEW_FLAGS;
+                                dbgSubIndex    = ((vFlagsDbg & 4u) != 0u)
+                                    ? views.activeLookup.resolvedMipLevel
+                                    : NVSShadowMetadata.LightViewTable[views.activeView].NVS_VIEW_SUB_INDEX;
+                            }
+                            dbgCaptured = true;
+                        }
+                    }
+                    else if (!dbgCaptured && !isFrontLit)
+                    {
+                        dbgShadowVis = 0.0;
+                        dbgCaptured  = true;
+                    }
+
+                    atten = atten * shadowVis;
+                }
+            }
+
+            Float NoL = Saturate(Dot(N, curL));
+            if (NoL > 0.0001 && atten > 0.0001)
+            {
+                // Stable half-vector angles via rsqrt(2 + 2 * VoL) identity
+                Float VoL     = Clamp(Dot(V, curL), -0.9999, 1.0);
+                Float invLenH = Rsqrt(Max(2.0 + 2.0 * VoL, 0.00001));
+                Float NoH     = Saturate((NoL + NoV) * invLenH);
+                Float VoH     = Saturate(invLenH + invLenH * VoL);
+
+                Float D        = DistributionGGX(alpha2, NoH);
+                Float Vis      = VisibilitySmithJointGGX(alpha2, NoV, NoL);
+                Vec3  F        = FresnelSchlick(f0, f90, VoH);
+                Vec3  specBRDF = msSpecMultiplier * ((D * Vis) * F);
+
+                Vec3  diffBRDF = DiffuseGGXRough(diffuseColor, rough, NoV, NoL, VoH) * diffPreservation;
+
+                // Geometric horizon micro-shadowing prevents light leaking when normal map bends toward light on grazing polygons
+                Float geomNoL  = Saturate(Dot(geomN, curL) * 8.0 + 0.15);
+                Vec3  radiance = lightColor * (intensity * atten * NoL * geomNoL);
+                directLighting = directLighting + (diffBRDF + specBRDF) * radiance;
+            }
+        }
+
+        // 6. Split-Sum Hemispheric Ambient + Colored Multi-Bounce AO + Specular Occlusion
+        Float hemiUp     = Saturate(N.y * 0.5 + 0.5);
+        Vec3  ambBase    = Lighting.FrameData.AMBIENT_COLOR;
+        Vec3  groundIrr  = ambBase * Vec3(0.32, 0.29, 0.26);
+        Vec3  skyIrr     = ambBase * Vec3(1.15, 1.22, 1.35);
+        Vec3  diffuseIrr = Lerp(groundIrr, skyIrr, hemiUp);
+
+        Vec3  reflDir    = Reflect(-V, N);
+        Float reflUp     = Saturate(reflDir.y * 0.5 + 0.5);
+        Vec3  specEnvIrr = Lerp(groundIrr * 0.65, skyIrr * 1.15, Lerp(reflUp, hemiUp, alpha));
+
+        // Horizon specular occlusion against geometric normal
+        Float horizonVis = Saturate(1.0 + 1.2 * Dot(reflDir, geomN));
+        horizonVis       = horizonVis * horizonVis;
+
+        Vec3  multiBounceAO = GTAOMultiBounce(aoVal, diffuseColor);
+        Float specAO        = ComputeSpecularOcclusion(NoV, aoVal, rough) * horizonVis;
+
+        Vec3  ambDiffuse  = diffuseIrr * diffuseColor * diffPreservation * multiBounceAO;
+        Vec3  ambSpecular = specEnvIrr * specDirAlbedo * specAO;
+        Vec3  ambient     = (ambDiffuse + ambSpecular) * Lighting.FrameData.AMBIENT_INTENSITY;
+
+        // 7. Emissive Radiance
+        Vec3 emissive = SrgbToLinearExact(Material.MaterialParams.emissiveColor) * Material.MaterialParams.emissiveStrength;
+        if (Material.MaterialParams.useEmissiveMap)
+        {
+            Vec3 emTex = Sample(emissiveTex, linearSampler, uv).rgb;
+            emissive   = emissive + SrgbToLinearExact(emTex) * Material.MaterialParams.emissiveStrength;
+        }
+
+        Vec3 finalColor = ambient + directLighting + emissive;
+        if (Material.MaterialParams.enableToneMap)
+        {
+            finalColor = ACESFittedToneMap(finalColor * Material.MaterialParams.exposure);
+            finalColor = LinearToSrgbExact(finalColor);
+        }
+
+        // 8. Optional NVS Diagnostic Views
+        Int dbgMode = Material.MaterialParams.shadowDebugMode;
+        if (dbgMode == 1)
+        {
+            Vec3 cCol = NVSDebugClipmapLevelColor(dbgSubIndex);
+            if (dbgTransition > 0.0 && dbgSubIndex < 3u)
+            {
+                Vec3 nextCol = NVSDebugClipmapLevelColor(dbgSubIndex + 1u);
+                cCol = Lerp(cCol, nextCol, dbgTransition);
+            }
+            finalColor = cCol * (dbgShadowVis * 0.4 + 0.6);
+        }
+        else if (dbgMode == 2)
+        {
+            finalColor = Vec3(dbgShadowVis, dbgShadowVis, dbgShadowVis);
+        }
+        else if (dbgMode == 3)
+        {
+            Vec3 pageCol = NVSDebugPageSliceColor(dbgPhysPage, dbgSliceUV);
+            finalColor   = pageCol * (dbgShadowVis * 0.5 + 0.5);
+        }
+        else if (dbgMode == 4)
+        {
+            finalColor = NVSDebugStatusColor(dbgStatus);
+        }
+
+        output.COLOR_TARGET0 = Vec4(finalColor, srgbBase.a);
+        return output;
+    }
+}

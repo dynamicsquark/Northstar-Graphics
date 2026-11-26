@@ -1,0 +1,198 @@
+// =====================================================================
+//  RuntimeGPUSceneDiagnostic.nsl — NorthstarRuntime Internal Compute
+//  Reads the Persistent GPU Scene StructuredBuffer for a list of queried
+//  slots, validates object slot identity, generation, valid flags,
+//  world transform, world bounds, mesh/material/LOD/batch associations,
+//  and writes structured diagnostic output records for GPU verification.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY GPUSceneDiagParams {
+    Buffer Config {
+        Add(queryCount)        : UInt = 0
+        Add(sceneCapacity)     : UInt = 0
+        Add(sceneHighWater)    : UInt = 0
+        Add(sceneActiveCount)  : UInt = 0
+    }
+    StructuredBuffer SceneObjects {
+        Add(slotIndex)           : UInt
+        Add(generation)          : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(startIndex)          : UInt
+        Add(baseVertex)          : UInt
+        Add(aabbMin)             : Vec3
+        Add(submeshIndex)        : UInt
+        Add(aabbMax)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(boundingSphere)      : Vec4
+        Add(worldMatrix)         : Mat4
+    }
+    StructuredBuffer Queries {
+        Add(slotIndex)          : UInt
+        Add(expectedGeneration) : UInt
+        Add(requiredFlagsMask)  : UInt
+        Add(queryUserData)      : UInt
+    }
+    RWStructuredBuffer OutDiagnostics {
+        Add(statusFlags)         : UInt
+        Add(actualSlotIndex)     : UInt
+        Add(actualGeneration)    : UInt
+        Add(objectFlags)         : UInt
+        Add(renderObjectFlags)   : UInt
+        Add(meshId)              : UInt
+        Add(materialId)          : UInt
+        Add(lodGroupId)          : UInt
+        Add(batchGroupId)        : UInt
+        Add(vertexCount)         : UInt
+        Add(indexCount)          : UInt
+        Add(submeshIndex)        : UInt
+        Add(aabbMin)             : Vec3
+        Add(lodAndMaterialFlags) : UInt
+        Add(aabbMax)             : Vec3
+        Add(sphereRadius)        : Float
+        Add(worldTranslation)    : Vec3
+        Add(queryEcho)           : Float
+    }
+}
+
+SHADER {
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt qIdx       = dtid.x;
+        UInt queryCount = GPUSceneDiagParams.Config.queryCount;
+        if (qIdx >= queryCount) {
+            return;
+        }
+
+        UInt slotIdx     = GPUSceneDiagParams.Queries[qIdx].slotIndex;
+        UInt expectedGen = GPUSceneDiagParams.Queries[qIdx].expectedGeneration;
+        UInt reqFlags    = GPUSceneDiagParams.Queries[qIdx].requiredFlagsMask;
+        UInt userData    = GPUSceneDiagParams.Queries[qIdx].queryUserData;
+        UInt capacity    = GPUSceneDiagParams.Config.sceneCapacity;
+
+        if (slotIdx >= capacity) {
+            GPUSceneDiagParams.OutDiagnostics[qIdx].statusFlags         = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].actualSlotIndex     = 0xFFFFFFFFu;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].actualGeneration    = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].objectFlags         = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].renderObjectFlags   = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].meshId              = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].materialId          = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].lodGroupId          = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].batchGroupId        = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].vertexCount         = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].indexCount          = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].submeshIndex        = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].aabbMin             = Vec3(0.0, 0.0, 0.0);
+            GPUSceneDiagParams.OutDiagnostics[qIdx].lodAndMaterialFlags = 0u;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].aabbMax             = Vec3(0.0, 0.0, 0.0);
+            GPUSceneDiagParams.OutDiagnostics[qIdx].sphereRadius        = 0.0;
+            GPUSceneDiagParams.OutDiagnostics[qIdx].worldTranslation    = Vec3(0.0, 0.0, 0.0);
+            GPUSceneDiagParams.OutDiagnostics[qIdx].queryEcho           = Float(userData);
+            return;
+        }
+
+        UInt actualSlot = GPUSceneDiagParams.SceneObjects[slotIdx].slotIndex;
+        UInt actualGen  = GPUSceneDiagParams.SceneObjects[slotIdx].generation;
+        UInt objFlags   = GPUSceneDiagParams.SceneObjects[slotIdx].objectFlags;
+        UInt roFlags    = GPUSceneDiagParams.SceneObjects[slotIdx].renderObjectFlags;
+        UInt meshId     = GPUSceneDiagParams.SceneObjects[slotIdx].meshId;
+        UInt matId      = GPUSceneDiagParams.SceneObjects[slotIdx].materialId;
+        UInt lodId      = GPUSceneDiagParams.SceneObjects[slotIdx].lodGroupId;
+        UInt batchId    = GPUSceneDiagParams.SceneObjects[slotIdx].batchGroupId;
+        UInt vertCount  = GPUSceneDiagParams.SceneObjects[slotIdx].vertexCount;
+        UInt idxCount   = GPUSceneDiagParams.SceneObjects[slotIdx].indexCount;
+        UInt subIdx     = GPUSceneDiagParams.SceneObjects[slotIdx].submeshIndex;
+        Vec3 minBounds  = GPUSceneDiagParams.SceneObjects[slotIdx].aabbMin;
+        UInt lodMatBits = GPUSceneDiagParams.SceneObjects[slotIdx].lodAndMaterialFlags;
+        Vec3 maxBounds  = GPUSceneDiagParams.SceneObjects[slotIdx].aabbMax;
+        Vec4 sphere     = GPUSceneDiagParams.SceneObjects[slotIdx].boundingSphere;
+        Mat4 worldMat   = GPUSceneDiagParams.SceneObjects[slotIdx].worldMatrix;
+
+        // Status bits:
+        //   bit 0 (1)  : SLOT_IN_BOUNDS
+        //   bit 1 (2)  : SLOT_VALID (GPU_SCENE_OBJ_VALID == 1 && actualGen != 0)
+        //   bit 2 (4)  : GENERATION_MATCH (expectedGen == 0 || actualGen == expectedGen)
+        //   bit 3 (8)  : FLAGS_MATCH ((objFlags & reqFlags) == reqFlags)
+        //   bit 4 (16) : BOUNDS_VALID
+        //   bit 5 (32) : MESH_VALID (meshId != 0)
+        //   bit 6 (64) : MATERIAL_VALID (matId != 0)
+        UInt status = 1u;
+        if ((objFlags & 1u) != 0u && actualGen != 0u && actualSlot == slotIdx) {
+            status = status | 2u;
+        }
+        if (expectedGen != 0u) {
+            if (actualGen == expectedGen && (objFlags & 1u) != 0u) {
+                status = status | 4u;
+            }
+        } else {
+            if (actualGen == 0u && (objFlags & 1u) == 0u) {
+                status = status | 4u;
+            }
+        }
+        UInt objReqFlags = reqFlags & 2147483647u;
+        UInt verifyAbi   = (reqFlags >> 31u) & 1u;
+        if ((objFlags & objReqFlags) == objReqFlags) {
+            status = status | 8u;
+        }
+        if (maxBounds.x >= minBounds.x && maxBounds.y >= minBounds.y && maxBounds.z >= minBounds.z && sphere.w >= 0.0) {
+            status = status | 16u;
+        }
+        if (meshId != 0u) {
+            status = status | 32u;
+        }
+        if (matId != 0u) {
+            status = status | 64u;
+        }
+
+        // Bit 7 (128): LOD_MAT_ABI_VALID — when requested via bit 31 of requiredFlagsMask,
+        // unpacks lodAndMaterialFlags 1:1 with C++ PackGPUSceneLODAndMaterialFlags / UnpackGPUScene*:
+        //   bits [0..7]   : lodCount (0..255)
+        //   bits [8..9]   : cullMode (0..2)
+        //   bits [10..12] : blendMode (0..4)
+        //   bits [13..18] : depthTest, depthWrite, wireframe, hasGeometryPass, hasShadowPass, hasDepthPass
+        //   bits [19..31] : unused high bits (must be 0)
+        if (verifyAbi != 0u) {
+            UInt unpackedLodCnt = lodMatBits & 255u;
+            UInt unpackedCull   = (lodMatBits >> 8u) & 3u;
+            UInt unpackedBlend  = (lodMatBits >> 10u) & 7u;
+            UInt unusedLodBits  = lodMatBits >> 19u;
+            UInt useLodFlag     = (objFlags >> 9u) & 1u;
+            if (unusedLodBits == 0u && unpackedCull <= 2u && unpackedBlend <= 4u && unpackedLodCnt <= 255u) {
+                if (useLodFlag == 0u || (lodId != 0u && unpackedLodCnt > 0u)) {
+                    status = status | 128u;
+                }
+            }
+        }
+
+        Vec4 worldOrigin = Mul(worldMat, Vec4(0.0, 0.0, 0.0, 1.0));
+
+        GPUSceneDiagParams.OutDiagnostics[qIdx].statusFlags         = status;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].actualSlotIndex     = actualSlot;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].actualGeneration    = actualGen;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].objectFlags         = objFlags;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].renderObjectFlags   = roFlags;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].meshId              = meshId;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].materialId          = matId;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].lodGroupId          = lodId;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].batchGroupId        = batchId;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].vertexCount         = vertCount;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].indexCount          = idxCount;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].submeshIndex        = subIdx;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].aabbMin             = minBounds;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].lodAndMaterialFlags = lodMatBits;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].aabbMax             = maxBounds;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].sphereRadius        = sphere.w;
+        GPUSceneDiagParams.OutDiagnostics[qIdx].worldTranslation    = Vec3(worldOrigin.x, worldOrigin.y, worldOrigin.z);
+        GPUSceneDiagParams.OutDiagnostics[qIdx].queryEcho           = Float(userData);
+    }
+}
+

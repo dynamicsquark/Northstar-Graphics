@@ -1,0 +1,124 @@
+// =====================================================================
+//  StandardLitShadowSkinnedVS.nsl
+//  Northstar Graphics — Built-in 4-Bone Skinned NVS Shadow Caster Vertex Shader
+// =====================================================================
+
+STAGE VERTEX
+
+INPUT_LAYOUT
+{
+    Get(VERTEX_POSITION)
+    Get(VERTEX_NORMAL)
+    Get(VERTEX_TANGENT)
+    Get(VERTEX_BITANGENT)
+    Get(VERTEX_UV0)
+    Get(VERTEX_UV1)
+    Get(VERTEX_COLOR)
+    Get(VERTEX_BONE_INDICES)
+    Get(VERTEX_BONE_WEIGHTS)
+}
+
+OUTPUT_LAYOUT
+{
+    Add(CLIP_POSITION)
+    Add(UV0)
+    Add(RENDER_TARGET_ARRAY_INDEX)
+}
+
+PROPERTY Transforms
+{
+    Buffer Matrices
+    {
+        Get(WORLD_MATRIX)
+        Get(VP_MATRIX)
+        Get(NVS_PHYSICAL_PAGE_INDEX)
+        Get(NVS_DEPTH_BIAS_NDC)
+        Get(NVS_NORMAL_BIAS_WORLD)
+    }
+}
+
+PROPERTY Skeleton
+{
+    Buffer SkinningInfo
+    {
+        Get(BONE_PALETTE_OFFSET)
+        Get(BONE_COUNT)
+        Get(SKINNING_REVISION)
+    }
+    StructuredBuffer BonePalette
+    {
+        Get(GLOBAL_BONE_MATRIX)
+    }
+}
+
+SHADER
+{
+    STAGE_OUTPUT Main(STAGE_INPUT input)
+    {
+        STAGE_OUTPUT o;
+
+        Mat4  worldMatrix = Transforms.Matrices.WORLD_MATRIX;
+        Mat4  vpMatrix    = Transforms.Matrices.VP_MATRIX;
+        UInt  pageSlice   = Transforms.Matrices.NVS_PHYSICAL_PAGE_INDEX;
+        Float depthBias   = Transforms.Matrices.NVS_DEPTH_BIAS_NDC;
+        Float normalBias  = Transforms.Matrices.NVS_NORMAL_BIAS_WORLD;
+
+        Vec4  rawW = input.VERTEX_BONE_WEIGHTS;
+        Float wSum = rawW.x + rawW.y + rawW.z + rawW.w;
+        Vec4  w    = (wSum > 0.0001) ? (rawW / wSum) : Vec4(1.0, 0.0, 0.0, 0.0);
+
+        UInt  boneOffset = Skeleton.SkinningInfo.BONE_PALETTE_OFFSET;
+        UInt  maxIdx     = Max(Skeleton.SkinningInfo.BONE_COUNT, 1u) - 1u;
+        UInt4 boneIdx    = input.VERTEX_BONE_INDICES;
+
+        Mat4 bone0 = Skeleton.BonePalette[boneOffset + Min(boneIdx.x, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone1 = Skeleton.BonePalette[boneOffset + Min(boneIdx.y, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone2 = Skeleton.BonePalette[boneOffset + Min(boneIdx.z, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone3 = Skeleton.BonePalette[boneOffset + Min(boneIdx.w, maxIdx)].GLOBAL_BONE_MATRIX;
+
+        Vec4 pos4            = Vec4(input.VERTEX_POSITION, 1.0);
+        Vec3 skinnedLocalPos = Mul(bone0, pos4).xyz * w.x +
+                               Mul(bone1, pos4).xyz * w.y +
+                               Mul(bone2, pos4).xyz * w.z +
+                               Mul(bone3, pos4).xyz * w.w;
+
+        Vec4 nrm4            = Vec4(input.VERTEX_NORMAL, 0.0);
+        Vec3 skinnedLocalNrm = Mul(bone0, nrm4).xyz * w.x +
+                               Mul(bone1, nrm4).xyz * w.y +
+                               Mul(bone2, nrm4).xyz * w.z +
+                               Mul(bone3, nrm4).xyz * w.w;
+
+        Vec4 worldPos = Mul(worldMatrix, Vec4(skinnedLocalPos, 1.0));
+        if (normalBias != 0.0)
+        {
+            Vec3 c0       = Mul(worldMatrix, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+            Vec3 c1       = Mul(worldMatrix, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+            Vec3 c2       = Mul(worldMatrix, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+            Vec3 c1xc2    = Cross(c1, c2);
+            Vec3 nrmWorld = (c1xc2 * skinnedLocalNrm.x) +
+                            (Cross(c2, c0) * skinnedLocalNrm.y) +
+                            (Cross(c0, c1) * skinnedLocalNrm.z);
+            if (Dot(c0, c1xc2) < 0.0)
+            {
+                nrmWorld = -nrmWorld;
+            }
+            Float nLenSq = Dot(nrmWorld, nrmWorld);
+            if (nLenSq > 0.000001)
+            {
+                nrmWorld     = nrmWorld * Rsqrt(nLenSq);
+                worldPos.xyz = worldPos.xyz - nrmWorld * normalBias;
+            }
+        }
+
+        Vec4 clipPos = Mul(vpMatrix, worldPos);
+        if (depthBias != 0.0 && clipPos.w > 0.0)
+        {
+            clipPos.z = clipPos.z + (depthBias * clipPos.w);
+        }
+
+        o.CLIP_POSITION             = clipPos;
+        o.UV0                       = input.VERTEX_UV0;
+        o.RENDER_TARGET_ARRAY_INDEX = pageSlice;
+        return o;
+    }
+}

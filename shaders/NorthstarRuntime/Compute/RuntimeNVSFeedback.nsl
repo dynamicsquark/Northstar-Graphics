@@ -1,0 +1,1830 @@
+// =====================================================================
+//  RuntimeNVSFeedback.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Shadows (NVS) — Massive-Scale Screen-Space Feedback,
+//  32x32 Macro-Tile Light-View Culling, Receiver-Driven Virtual Mip LOD,
+//  Point Cubemap Cross-Face Border Demand & 4-Bucket Priority Compaction
+//
+//  Dispatch Modes:
+//    Mode 0 (RESET):
+//      Clears OutFeedbackTelemetry, OutResidencyTelemetry.requestedCount,
+//      OutBucketCounters, global screen AABB sentinel, OutPageBitmask (Path A),
+//      and OutRequestHashTable (Path B sparse unbounded multi-light mode).
+//    Mode 3 (REDUCE_MACRO_TILE_DEPTH_BOUNDS):
+//      Reduces valid reconstructed world-space surface AABB per 32x32 screen
+//      macro-tile and accumulates the global visible screen world AABB.
+//    Mode 4 (CULL_VIEWS_TO_MACRO_TILES):
+//      cullSubMode == 0: Filters activeViewTableCount (60,000+ shadow views)
+//                        against global screen world AABB into OutVisibleViewList.
+//      cullSubMode == 1: Cooperatively bins OutVisibleViewList per 32x32
+//                        macro-tile into OutMacroTileViewIndices.
+//    Mode 1 (MARK_SCREEN_DEPTH):
+//      Reconstructs per-pixel surface world position in 8x8 tiles, evaluates
+//      overlapping views (Directional 4-clipmap radial/planar selection +
+//      Spot virtual mip hierarchy + Point 6-face virtual cubemap mip hierarchy
+//      with cross-face border continuity + coarse fallback anchors), deduplicates
+//      in groupshared tile hash, and inserts into OutRequestHashTable.
+//    Mode 2 (COMPACT_PAGE_REQUESTS):
+//      Path A (multiLightViewMode == 0): 2048-word bitmask prefix compaction.
+//      Path B (multiLightViewMode != 0): 4-bucket priority compaction
+//        (cullSubMode 0 = Histogram, 1 = Prefix, 2 = Scatter) emitting
+//        64-bit extended NVSVirtualPageRequest records.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVSFeedbackParams {
+    Buffer Config {
+        Add(dispatchMode)            : UInt  = 0
+        Add(viewportOffsetX)         : UInt  = 0
+        Add(viewportOffsetY)         : UInt  = 0
+        Add(viewportWidth)           : UInt  = 0
+        Add(viewportHeight)          : UInt  = 0
+        Add(depthMode)               : UInt  = 0
+        Add(clearDepth)              : Float = 1.0
+        Add(depthEpsilon)            : Float = 0.000001
+        Add(lightId)                 : UInt  = 0
+        Add(activeLevelCount)        : UInt  = 4
+        Add(pagesPerAxis)            : UInt  = 32
+        Add(footprintMode)           : UInt  = 0
+        Add(footprintBorderMargin)   : Float = 0.03125
+        Add(maxRequestBudget)        : UInt  = 8192
+        Add(compactedBufferCapacity) : UInt  = 8192
+        Add(disableGroupSharedDedup) : UInt  = 0
+        Add(cameraWorldPos)          : Vec3
+        Add(maxShadowDistance)       : Float = 0.0
+        Add(lightRight)              : Vec3
+        Add(multiLightViewMode)      : UInt  = 0
+        Add(lightUp)                 : Vec3
+        Add(activeViewTableCount)    : UInt  = 0
+        Add(lightDir)                : Vec3
+        Add(cullSubMode)             : UInt  = 0
+        Add(levelWorldExtents)       : Vec4
+        Add(snappedOriginPageX)      : Int4
+        Add(snappedOriginPageY)      : Int4
+        Add(screenPixelWorldScale)   : Vec4
+        Add(hashAndTileParams)       : UInt4
+        Add(invViewProj)             : Mat4
+    }
+    Texture2D Textures {
+        Add(SceneDepth)
+    }
+    StructuredBuffer InClipmapLevels {
+        Add(lightId)              : UInt
+        Add(clipmapLevel)         : UInt
+        Add(pagesPerAxis)         : UInt
+        Add(flags)                : UInt
+        Add(snappedOriginPageX)   : Int
+        Add(snappedOriginPageY)   : Int
+        Add(worldExtent)          : Float
+        Add(pageWorldSize)        : Float
+        Add(texelWorldSize)       : Float
+        Add(receiverMinZ)         : Float
+        Add(receiverMaxZ)         : Float
+        Add(casterMinZ)           : Float
+        Add(casterMaxZ)           : Float
+        Add(depthBiasNdc)         : Float
+        Add(normalBiasWorld)      : Float
+        Add(cameraLightZ)         : Float
+        Add(lightRightAndCenterX) : Vec4
+        Add(lightUpAndCenterY)    : Vec4
+        Add(lightDirAndExtrusion) : Vec4
+        Add(transitionAndPadding) : Vec4
+        Add(worldToLightViewCol0) : Vec4
+        Add(worldToLightViewCol1) : Vec4
+        Add(worldToLightViewCol2) : Vec4
+        Add(worldToLightViewCol3) : Vec4
+        Add(lightViewToWorldCol0) : Vec4
+        Add(lightViewToWorldCol1) : Vec4
+        Add(lightViewToWorldCol2) : Vec4
+        Add(lightViewToWorldCol3) : Vec4
+    }
+    RWStructuredBuffer OutPageBitmask {
+        Add(word) : UInt
+    }
+    RWStructuredBuffer OutCompactedRequests {
+        Add(virtualAddressPacked) : UInt
+        Add(requestFlags)         : UInt
+        Add(requestPriority)      : UInt
+        Add(requestUserData)      : UInt
+    }
+    RWStructuredBuffer OutFeedbackTelemetry {
+        Add(examinedPixelCount)           : UInt
+        Add(validDepthPixelCount)         : UInt
+        Add(backgroundRejectedCount)      : UInt
+        Add(invalidDepthRejectedCount)    : UInt
+        Add(frustumRejectedCount)         : UInt
+        Add(outOfRangeRejectedCount)      : UInt
+        Add(acceptedSurfacePixelCount)    : UInt
+        Add(totalPageCandidateCount)      : UInt
+        Add(tileDeduplicatedCount)        : UInt
+        Add(globalDuplicateCount)         : UInt
+        Add(uniquePageRequestCount)       : UInt
+        Add(compactedRequestCount)        : UInt
+        Add(overflowRequestCount)         : UInt
+        Add(level0RequestCount)           : UInt
+        Add(level1RequestCount)           : UInt
+        Add(level2And3RequestCountPacked) : UInt
+    }
+    RWStructuredBuffer OutResidencyTelemetry {
+        Add(requestedCount)           : UInt
+        Add(validRequestCount)        : UInt
+        Add(invalidRequestCount)      : UInt
+        Add(uniqueRequestCount)       : UInt
+        Add(duplicateRequestCount)    : UInt
+        Add(cacheHitCount)            : UInt
+        Add(cacheMissCount)           : UInt
+        Add(allocatedFromFreeCount)   : UInt
+        Add(evictedCount)             : UInt
+        Add(overflowCount)            : UInt
+        Add(invalidatedCount)         : UInt
+        Add(dirtyClearSliceCount)     : UInt
+        Add(residentValidPages)       : UInt
+        Add(allocatedNotClearedPages) : UInt
+        Add(clearedNotRenderedPages)  : UInt
+        Add(freePhysicalPages)        : UInt
+    }
+    RWStructuredBuffer OutRequestHashTable {
+        Add(viewIndex)            : UInt
+        Add(packedCoord)          : UInt
+        Add(priorityAndBucket)    : UInt
+        Add(requestFlags)         : UInt
+    }
+    RWStructuredBuffer OutMacroTileBounds {
+        Add(minXBits)   : UInt
+        Add(minYBits)   : UInt
+        Add(minZBits)   : UInt
+        Add(validCount) : UInt
+        Add(maxXBits)   : UInt
+        Add(maxYBits)   : UInt
+        Add(maxZBits)   : UInt
+        Add(viewCount)  : UInt
+    }
+    RWStructuredBuffer OutMacroTileViewIndices {
+        Add(viewIndex) : UInt
+    }
+    RWStructuredBuffer OutBucketCounters {
+        Add(counter) : UInt
+    }
+}
+
+SHADER {
+    groupshared UInt gs_TileStats[8];
+    groupshared UInt gs_TileDedupCount;
+    groupshared UInt gs_TileGlobalDupCount;
+    groupshared UInt gs_TileHashKeys[64];
+    groupshared UInt gs_TileHashAux[64];
+    groupshared UInt gs_ThreadBitCounts[64];
+    groupshared UInt gs_MacroMinX;
+    groupshared UInt gs_MacroMinY;
+    groupshared UInt gs_MacroMinZ;
+    groupshared UInt gs_MacroMaxX;
+    groupshared UInt gs_MacroMaxY;
+    groupshared UInt gs_MacroMaxZ;
+    groupshared UInt gs_MacroValidCount;
+    groupshared UInt gs_ChunkPassMask0;
+    groupshared UInt gs_ChunkPassMask1;
+    groupshared UInt gs_Stage4VisCount;
+    groupshared UInt gs_Stage4GlobalOvf;
+    groupshared UInt gs_SparseTileView[128];
+    groupshared UInt gs_SparseTileCoord[128];
+    groupshared UInt gs_SparseTilePrio[128];
+    groupshared UInt gs_SparseTileFlags[128];
+
+    UInt FloatToOrderedUInt(Float f) {
+        UInt bits = AsUInt(f);
+        return ((bits & 0x80000000u) != 0u) ? (~bits) : (bits ^ 0x80000000u);
+    }
+
+    Float OrderedUIntToFloat(UInt u) {
+        UInt bits = ((u & 0x80000000u) != 0u) ? (u ^ 0x80000000u) : (~u);
+        return AsFloat(bits);
+    }
+
+    UInt ExtractViewMipCount(UInt cmFlags) {
+        UInt m1  = (cmFlags >> 12u) & 15u;
+        UInt cnt = m1 + 1u;
+        return (cnt <= 8u) ? cnt : 8u;
+    }
+
+    UInt ExtractViewMinMip(UInt cmFlags) {
+        return ((cmFlags & 8388608u) != 0u) ? ((cmFlags >> 16u) & 7u) : 0u;
+    }
+
+    Float ExtractViewLodBias(UInt cmFlags) {
+        return ((cmFlags & 8388608u) != 0u) ? ((Float((cmFlags >> 19u) & 15u) * 0.5) - 1.5) : 0.0;
+    }
+
+    UInt ExtractViewGeneration(UInt cmFlags) {
+        UInt g = (cmFlags >> 24u) & 255u;
+        return (g == 0u) ? 1u : g;
+    }
+
+    UInt PackSparseCoord(UInt vx, UInt vy, UInt mipLevel, UInt viewGen) {
+        UInt safeGen = (viewGen == 0u) ? 1u : (((viewGen - 1u) % 4095u) + 1u);
+        return (vx & 255u) |
+               ((vy & 255u) << 8u) |
+               ((mipLevel & 15u) << 16u) |
+               (safeGen << 20u);
+    }
+
+    Int FloorDivPow2(Int value, UInt shift) {
+        Int res = value;
+        if (shift > 0u) {
+            if (value >= 0) {
+                res = Int(UInt(value) >> shift);
+            } else {
+                res = -Int((UInt(-1 - value) >> shift) + 1u);
+            }
+        }
+        return res;
+    }
+
+    Int OrthoSnapOriginAtMip(Int originMip0, UInt mip) {
+        Int roundBias = (mip > 0u) ? Int(1u << (mip - 1u)) : 0;
+        return FloorDivPow2(originMip0 + roundBias, mip);
+    }
+
+    UInt ComputeOrthoMaxActiveMip(UInt mipCount) {
+        return (mipCount > 3u) ? (mipCount - 3u) : 0u;
+    }
+
+    Bool ReconstructPixelWorldPos(UInt px, UInt py, UInt vpWidth, UInt vpHeight, out Vec3 outWorldPos, out UInt outRejectBucket) {
+        outWorldPos     = Vec3(0.0, 0.0, 0.0);
+        outRejectBucket = 3u;
+
+        Int   texX      = Int(NVSFeedbackParams.Config.viewportOffsetX + px);
+        Int   texY      = Int(NVSFeedbackParams.Config.viewportOffsetY + py);
+        Float depth     = Load(NVSFeedbackParams.Textures.SceneDepth, Int3(texX, texY, 0)).x;
+        UInt  depthBits = AsUInt(depth);
+
+        if ((depthBits & 2139095040u) == 2139095040u || depth < 0.0 || depth > 1.0) {
+            outRejectBucket = 3u;
+            return false;
+        }
+
+        UInt  depthMode  = NVSFeedbackParams.Config.depthMode;
+        Float clearDepth = NVSFeedbackParams.Config.clearDepth;
+        Float depthEps   = NVSFeedbackParams.Config.depthEpsilon;
+        Bool  isBg       = (depthMode == 1u) ? (depth <= (clearDepth + depthEps)) : (depth >= (clearDepth - depthEps));
+        if (isBg) {
+            outRejectBucket = 2u;
+            return false;
+        }
+
+        Float u     = (Float(px) + 0.5) / Float(vpWidth);
+        Float v     = (Float(py) + 0.5) / Float(vpHeight);
+        Float ndcX  = (u * 2.0) - 1.0;
+        Float ndcY  = ((1.0 - v) * 2.0) - 1.0;
+        Vec4  wH    = Mul(NVSFeedbackParams.Config.invViewProj, Vec4(ndcX, ndcY, depth, 1.0));
+        UInt  wBits = AsUInt(wH.w);
+        if ((wBits & 2139095040u) == 2139095040u || wH.w <= 0.0000001) {
+            outRejectBucket = 4u;
+            return false;
+        }
+
+        Float invW    = 1.0 / wH.w;
+        Vec3  candPos = Vec3(wH.x * invW, wH.y * invW, wH.z * invW);
+        if (((AsUInt(candPos.x) & 2139095040u) == 2139095040u) ||
+            ((AsUInt(candPos.y) & 2139095040u) == 2139095040u) ||
+            ((AsUInt(candPos.z) & 2139095040u) == 2139095040u)) {
+            outRejectBucket = 4u;
+            return false;
+        }
+
+        outWorldPos     = candPos;
+        outRejectBucket = 0u;
+        return true;
+    }
+
+    Bool ComputeShadowViewWorldAABB(UInt viewSlot, out Vec3 outMin, out Vec3 outMax) {
+        outMin = Vec3(0.0, 0.0, 0.0);
+        outMax = Vec3(0.0, 0.0, 0.0);
+
+        UInt  cmFlags   = NVSFeedbackParams.InClipmapLevels[viewSlot].flags;
+        UInt  pagesAxis = NVSFeedbackParams.InClipmapLevels[viewSlot].pagesPerAxis;
+        Float wExtent   = NVSFeedbackParams.InClipmapLevels[viewSlot].worldExtent;
+        Float rMaxZ     = NVSFeedbackParams.InClipmapLevels[viewSlot].receiverMaxZ;
+        if ((cmFlags & 1u) == 0u || pagesAxis == 0u || wExtent <= 0.0001) {
+            return false;
+        }
+
+        Bool isPersp = (cmFlags & 4u) != 0u;
+        if (!isPersp) {
+            if ((viewSlot & 3u) != 0u) {
+                return false;
+            }
+            UInt totalViews = NVSFeedbackParams.Config.activeViewTableCount;
+            UInt outerSlot  = viewSlot;
+            for (UInt cLvl = 1u; cLvl < 4u; cLvl = cLvl + 1u) {
+                UInt candSlot = viewSlot + cLvl;
+                if (candSlot < totalViews && (NVSFeedbackParams.InClipmapLevels[candSlot].flags & 1u) != 0u) {
+                    outerSlot = candSlot;
+                }
+            }
+            UInt outerFlags = NVSFeedbackParams.InClipmapLevels[outerSlot].flags;
+            if ((outerFlags & 16u) != 0u) {
+                Vec4 camRad = NVSFeedbackParams.InClipmapLevels[outerSlot].lightViewToWorldCol3;
+                if (camRad.w > 0.0001) {
+                    Float rPad = camRad.w * 1.03;
+                    outMin = camRad.xyz - Vec3(rPad, rPad, rPad);
+                    outMax = camRad.xyz + Vec3(rPad, rPad, rPad);
+                    return true;
+                }
+            }
+            outMin = Vec3(-1.0e20, -1.0e20, -1.0e20);
+            outMax = Vec3( 1.0e20,  1.0e20,  1.0e20);
+            return true;
+        }
+
+        if (rMaxZ <= 0.0001) {
+            return false;
+        }
+
+        Vec3  lightPos = NVSFeedbackParams.InClipmapLevels[viewSlot].lightViewToWorldCol3.xyz;
+        Vec3  R        = NVSFeedbackParams.InClipmapLevels[viewSlot].lightRightAndCenterX.xyz;
+        Vec3  U        = NVSFeedbackParams.InClipmapLevels[viewSlot].lightUpAndCenterY.xyz;
+        Vec3  D        = NVSFeedbackParams.InClipmapLevels[viewSlot].lightDirAndExtrusion.xyz;
+        Float halfTan  = 0.5 * wExtent * 1.03;
+        Float farZ     = rMaxZ * 1.02;
+
+        // Exact convex hull AABB of perspective frustum apex + 4 planar far-plane corners
+        Vec3 fCenter = lightPos + (D * farZ);
+        Vec3 rSpan   = R * (halfTan * farZ);
+        Vec3 uSpan   = U * (halfTan * farZ);
+        Vec3 c0      = fCenter - rSpan - uSpan;
+        Vec3 c1      = fCenter + rSpan - uSpan;
+        Vec3 c2      = fCenter + rSpan + uSpan;
+        Vec3 c3      = fCenter - rSpan + uSpan;
+
+        outMin = Min(lightPos, Min(Min(c0, c1), Min(c2, c3)));
+        outMax = Max(lightPos, Max(Max(c0, c1), Max(c2, c3)));
+        return true;
+    }
+
+    void EmitCandidateWithTileDedup(
+        UInt tid,
+        UInt disableTileDedup,
+        UInt candFlatPage,
+        UInt candWordIdx,
+        UInt candBitMask)
+    {
+        if (disableTileDedup != 0u) {
+            if (candWordIdx < 2048u) {
+                UInt prevGlobal = 0u;
+                InterlockedOr(NVSFeedbackParams.OutPageBitmask[candWordIdx].word, candBitMask, prevGlobal);
+                if ((prevGlobal & candBitMask) != 0u) {
+                    UInt prevGD = 0u;
+                    InterlockedAdd(gs_TileGlobalDupCount, 1u, prevGD);
+                }
+            }
+        } else {
+            gs_TileHashKeys[tid] = 4294967295u;
+            GroupMemoryBarrierWithGroupSync();
+
+            if (candFlatPage < 65536u && candWordIdx < 2048u) {
+                UInt mixedKey   = candFlatPage ^ (candFlatPage >> 6u) ^ (candFlatPage >> 12u);
+                UInt baseSlot   = (mixedKey * 2654435761u) & 63u;
+                UInt resolved   = 0u;
+                UInt emitGlobal = 0u;
+
+                for (UInt probe = 0u; probe < 8u; probe = probe + 1u) {
+                    if (resolved == 0u) {
+                        UInt slot    = (baseSlot + probe) & 63u;
+                        UInt prevKey = 0u;
+                        InterlockedCompareExchange(gs_TileHashKeys[slot], 4294967295u, candFlatPage, prevKey);
+                        if (prevKey == 4294967295u) {
+                            resolved   = 1u;
+                            emitGlobal = 1u;
+                        } else if (prevKey == candFlatPage) {
+                            resolved   = 1u;
+                            emitGlobal = 0u;
+                            UInt prevDedup = 0u;
+                            InterlockedAdd(gs_TileDedupCount, 1u, prevDedup);
+                        }
+                    }
+                }
+
+                if (resolved == 0u) {
+                    emitGlobal = 1u;
+                }
+
+                if (emitGlobal != 0u) {
+                    UInt prevGlobalMask = 0u;
+                    InterlockedOr(NVSFeedbackParams.OutPageBitmask[candWordIdx].word, candBitMask, prevGlobalMask);
+                    if ((prevGlobalMask & candBitMask) != 0u) {
+                        UInt prevGDup = 0u;
+                        InterlockedAdd(gs_TileGlobalDupCount, 1u, prevGDup);
+                    }
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
+    void InsertGlobalSparseRequest(
+        UInt candViewIdx,
+        UInt candPackedCoord,
+        UInt candPrioAndBucket,
+        UInt candReqFlags,
+        UInt hashCap)
+    {
+        if (candViewIdx >= 4294967294u || candPackedCoord == 4294967295u || hashCap == 0u) {
+            return;
+        }
+        UInt hashMask = hashCap - 1u;
+        UInt h        = (candViewIdx * 2654435761u) ^ (candPackedCoord * 2246822519u);
+        h             = h ^ (h >> 15u);
+        UInt baseIdx  = h & hashMask;
+
+        for (UInt pr = 0u; pr < 64u; pr = pr + 1u) {
+            UInt slot     = (baseIdx + pr) & hashMask;
+            UInt prevView = 0u;
+            InterlockedCompareExchange(NVSFeedbackParams.OutRequestHashTable[slot].viewIndex, 4294967295u, candViewIdx, prevView);
+            if (prevView == 4294967295u) {
+                // Exclusive slot owner: publish packedCoord before SIMT reconvergence so same-warp lanes see it immediately
+                UInt dummyCoord = 0u;
+                InterlockedExchange(NVSFeedbackParams.OutRequestHashTable[slot].packedCoord, candPackedCoord, dummyCoord);
+            }
+            if (prevView == 4294967295u) {
+                UInt prevPB = 0u;
+                InterlockedMax(NVSFeedbackParams.OutRequestHashTable[slot].priorityAndBucket, candPrioAndBucket, prevPB);
+                UInt prevRF = 0u;
+                InterlockedOr(NVSFeedbackParams.OutRequestHashTable[slot].requestFlags, candReqFlags, prevRF);
+                return;
+            }
+            if (prevView == candViewIdx) {
+                UInt curCoord = 4294967295u;
+                for (UInt sp = 0u; sp < 16u; sp = sp + 1u) {
+                    InterlockedOr(NVSFeedbackParams.OutRequestHashTable[slot].packedCoord, 0u, curCoord);
+                    if (curCoord != 4294967295u) {
+                        break;
+                    }
+                }
+                if (curCoord == candPackedCoord) {
+                    UInt prevPB = 0u;
+                    InterlockedMax(NVSFeedbackParams.OutRequestHashTable[slot].priorityAndBucket, candPrioAndBucket, prevPB);
+                    UInt prevRF = 0u;
+                    InterlockedOr(NVSFeedbackParams.OutRequestHashTable[slot].requestFlags, candReqFlags, prevRF);
+                    UInt prevGD = 0u;
+                    InterlockedAdd(gs_TileGlobalDupCount, 1u, prevGD);
+                    return;
+                }
+            }
+        }
+        UInt prevHashOvf = 0u;
+        InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].overflowRequestCount, 1u, prevHashOvf);
+    }
+
+    void EmitSparseCandidatePixel(
+        UInt candViewIdx,
+        UInt candPackedCoord,
+        UInt candPrioAndBucket,
+        UInt candReqFlags,
+        UInt hashCap)
+    {
+        if (candViewIdx >= 4294967294u || candPackedCoord == 4294967295u) {
+            return;
+        }
+        UInt prevCand = 0u;
+        InterlockedAdd(gs_TileStats[7], 1u, prevCand);
+
+        if (NVSFeedbackParams.Config.disableGroupSharedDedup == 0u) {
+            UInt th = (candViewIdx * 2654435761u) ^ (candPackedCoord * 2246822519u);
+            th      = th ^ (th >> 7u);
+            for (UInt tpr = 0u; tpr < 4u; tpr = tpr + 1u) {
+                UInt ts    = (th + tpr) & 127u;
+                UInt prevV = 0u;
+                InterlockedCompareExchange(gs_SparseTileView[ts], 4294967295u, candViewIdx, prevV);
+                if (prevV == 4294967295u) {
+                    UInt dummyC = 0u;
+                    InterlockedExchange(gs_SparseTileCoord[ts], candPackedCoord, dummyC);
+                }
+                if (prevV == 4294967295u) {
+                    UInt dummyM = 0u;
+                    InterlockedMax(gs_SparseTilePrio[ts], candPrioAndBucket, dummyM);
+                    InterlockedOr(gs_SparseTileFlags[ts], candReqFlags, dummyM);
+                    return;
+                }
+                if (prevV == candViewIdx) {
+                    UInt curC = 4294967295u;
+                    for (UInt sp = 0u; sp < 16u; sp = sp + 1u) {
+                        InterlockedOr(gs_SparseTileCoord[ts], 0u, curC);
+                        if (curC != 4294967295u) {
+                            break;
+                        }
+                    }
+                    if (curC == candPackedCoord) {
+                        UInt dummyM = 0u;
+                        InterlockedMax(gs_SparseTilePrio[ts], candPrioAndBucket, dummyM);
+                        InterlockedOr(gs_SparseTileFlags[ts], candReqFlags, dummyM);
+                        InterlockedAdd(gs_TileDedupCount, 1u, dummyM);
+                        return;
+                    }
+                }
+            }
+        }
+        InsertGlobalSparseRequest(candViewIdx, candPackedCoord, candPrioAndBucket, candReqFlags, hashCap);
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt tid          = gtid.x;
+        UInt dispatchMode = NVSFeedbackParams.Config.dispatchMode;
+        UInt linearGid    = gid.x + (gid.y * 65535u);
+        UInt linearTid    = (linearGid << 6u) + tid;
+
+        // =================================================================
+        //  MODE 0: Reset Bitmask / Sparse Hash & Feedback Telemetry on GPU
+        // =================================================================
+        if (dispatchMode == 0u) {
+            UInt multiMode   = NVSFeedbackParams.Config.multiLightViewMode;
+            UInt hashCap     = NVSFeedbackParams.Config.hashAndTileParams.x;
+            UInt maxMacroCnt = NVSFeedbackParams.Config.hashAndTileParams.y;
+
+            if (multiMode != 0u && hashCap > 0u) {
+                if (linearTid < hashCap) {
+                    NVSFeedbackParams.OutRequestHashTable[linearTid].viewIndex         = 4294967295u;
+                    NVSFeedbackParams.OutRequestHashTable[linearTid].packedCoord       = 4294967295u;
+                    NVSFeedbackParams.OutRequestHashTable[linearTid].priorityAndBucket = 0u;
+                    NVSFeedbackParams.OutRequestHashTable[linearTid].requestFlags      = 0u;
+                }
+            }
+
+            if (linearGid > 0u) {
+                return;
+            }
+
+            if (multiMode == 0u) {
+                for (UInt w = tid; w < 2048u; w = w + 64u) {
+                    NVSFeedbackParams.OutPageBitmask[w].word = 0u;
+                }
+            } else {
+                if (tid < 16u) {
+                    NVSFeedbackParams.OutBucketCounters[tid].counter = 0u;
+                }
+                if (tid == 0u && maxMacroCnt > 0u) {
+                    UInt posInf = FloatToOrderedUInt(1.0e30);
+                    UInt negInf = FloatToOrderedUInt(-1.0e30);
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minXBits   = posInf;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minYBits   = posInf;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minZBits   = posInf;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].validCount = 0u;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxXBits   = negInf;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxYBits   = negInf;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxZBits   = negInf;
+                    NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].viewCount  = 0u;
+                }
+            }
+
+            if (tid == 0u) {
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].examinedPixelCount           = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].validDepthPixelCount         = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].backgroundRejectedCount      = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].invalidDepthRejectedCount    = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].frustumRejectedCount         = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].outOfRangeRejectedCount      = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].acceptedSurfacePixelCount    = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].totalPageCandidateCount      = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].tileDeduplicatedCount        = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].globalDuplicateCount         = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].uniquePageRequestCount       = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].compactedRequestCount        = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].overflowRequestCount         = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].level0RequestCount           = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].level1RequestCount           = 0u;
+                NVSFeedbackParams.OutFeedbackTelemetry[0u].level2And3RequestCountPacked = 0u;
+
+                NVSFeedbackParams.OutResidencyTelemetry[0u].requestedCount = 0u;
+            }
+
+            AllMemoryBarrierWithGroupSync();
+            return;
+        }
+
+        // =================================================================
+        //  MODE 3: 32x32 Macro-Tile World AABB Reduction
+        // =================================================================
+        if (dispatchMode == 3u) {
+            UInt vpWidth     = NVSFeedbackParams.Config.viewportWidth;
+            UInt vpHeight    = NVSFeedbackParams.Config.viewportHeight;
+            UInt macroTilesX = (vpWidth + 31u) >> 5u;
+            UInt macroTilesY = (vpHeight + 31u) >> 5u;
+            UInt totalMacros = macroTilesX * macroTilesY;
+            UInt maxMacroCnt = NVSFeedbackParams.Config.hashAndTileParams.y;
+
+            if (linearGid >= totalMacros || linearGid >= maxMacroCnt) {
+                return;
+            }
+
+            UInt posInf = FloatToOrderedUInt(1.0e30);
+            UInt negInf = FloatToOrderedUInt(-1.0e30);
+            if (tid == 0u) {
+                gs_MacroMinX       = posInf;
+                gs_MacroMinY       = posInf;
+                gs_MacroMinZ       = posInf;
+                gs_MacroMaxX       = negInf;
+                gs_MacroMaxY       = negInf;
+                gs_MacroMaxZ       = negInf;
+                gs_MacroValidCount = 0u;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt macroX = linearGid % macroTilesX;
+            UInt macroY = linearGid / macroTilesX;
+            UInt basePX = macroX << 5u;
+            UInt basePY = macroY << 5u;
+
+            Vec3 localMin   = Vec3( 1.0e30,  1.0e30,  1.0e30);
+            Vec3 localMax   = Vec3(-1.0e30, -1.0e30, -1.0e30);
+            UInt localValid = 0u;
+            Float maxDist   = NVSFeedbackParams.Config.maxShadowDistance;
+            Vec3  camPos    = NVSFeedbackParams.Config.cameraWorldPos;
+
+            for (UInt sub = 0u; sub < 16u; sub = sub + 1u) {
+                UInt idx1024 = (sub << 6u) + tid;
+                UInt px      = basePX + (idx1024 & 31u);
+                UInt py      = basePY + (idx1024 >> 5u);
+                if (px < vpWidth && py < vpHeight) {
+                    Vec3 wPos    = Vec3(0.0, 0.0, 0.0);
+                    UInt rejCode = 0u;
+                    if (ReconstructPixelWorldPos(px, py, vpWidth, vpHeight, wPos, rejCode)) {
+                        Bool inGlobalDist = true;
+                        if (maxDist > 0.0) {
+                            Vec3 dCam = wPos - camPos;
+                            if (Dot(dCam, dCam) > (maxDist * maxDist)) {
+                                inGlobalDist = false;
+                            }
+                        }
+                        if (inGlobalDist) {
+                            localMin   = Min(localMin, wPos);
+                            localMax   = Max(localMax, wPos);
+                            localValid = localValid + 1u;
+                        }
+                    }
+                }
+            }
+
+            if (localValid > 0u) {
+                UInt dummy = 0u;
+                InterlockedMin(gs_MacroMinX, FloatToOrderedUInt(localMin.x), dummy);
+                InterlockedMin(gs_MacroMinY, FloatToOrderedUInt(localMin.y), dummy);
+                InterlockedMin(gs_MacroMinZ, FloatToOrderedUInt(localMin.z), dummy);
+                InterlockedMax(gs_MacroMaxX, FloatToOrderedUInt(localMax.x), dummy);
+                InterlockedMax(gs_MacroMaxY, FloatToOrderedUInt(localMax.y), dummy);
+                InterlockedMax(gs_MacroMaxZ, FloatToOrderedUInt(localMax.z), dummy);
+                InterlockedAdd(gs_MacroValidCount, localValid, dummy);
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            if (tid == 0u) {
+                UInt vCnt = gs_MacroValidCount;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].minXBits   = gs_MacroMinX;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].minYBits   = gs_MacroMinY;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].minZBits   = gs_MacroMinZ;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].validCount = vCnt;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].maxXBits   = gs_MacroMaxX;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].maxYBits   = gs_MacroMaxY;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].maxZBits   = gs_MacroMaxZ;
+                NVSFeedbackParams.OutMacroTileBounds[linearGid].viewCount  = 0u;
+
+                if (vCnt > 0u) {
+                    UInt gDummy = 0u;
+                    InterlockedMin(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minXBits, gs_MacroMinX, gDummy);
+                    InterlockedMin(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minYBits, gs_MacroMinY, gDummy);
+                    InterlockedMin(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minZBits, gs_MacroMinZ, gDummy);
+                    InterlockedMax(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxXBits, gs_MacroMaxX, gDummy);
+                    InterlockedMax(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxYBits, gs_MacroMaxY, gDummy);
+                    InterlockedMax(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxZBits, gs_MacroMaxZ, gDummy);
+                    InterlockedAdd(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].validCount, 1u, gDummy);
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 4: Two-Stage Frustum & 32x32 Macro-Tile Light-View Culling
+        // =================================================================
+        if (dispatchMode == 4u) {
+            UInt subMode       = NVSFeedbackParams.Config.cullSubMode;
+            UInt maxMacroCnt   = NVSFeedbackParams.Config.hashAndTileParams.y;
+            UInt maxViewsTile  = NVSFeedbackParams.Config.hashAndTileParams.z;
+            UInt maxVisCap     = NVSFeedbackParams.Config.hashAndTileParams.w;
+            UInt totalViews    = NVSFeedbackParams.Config.activeViewTableCount;
+
+            if (subMode == 0u) {
+                // Stage 4A: Global camera-surface AABB filter across 60,000+ shadow views
+                UInt hasAnySurface = (maxMacroCnt > 0u) ? NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].validCount : 0u;
+                if (hasAnySurface != 0u && linearTid < totalViews) {
+                    Vec3 scrMin = Vec3(
+                        OrderedUIntToFloat(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minXBits),
+                        OrderedUIntToFloat(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minYBits),
+                        OrderedUIntToFloat(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].minZBits));
+                    Vec3 scrMax = Vec3(
+                        OrderedUIntToFloat(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxXBits),
+                        OrderedUIntToFloat(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxYBits),
+                        OrderedUIntToFloat(NVSFeedbackParams.OutMacroTileBounds[maxMacroCnt].maxZBits));
+
+                    Vec3 vMin = Vec3(0.0, 0.0, 0.0);
+                    Vec3 vMax = Vec3(0.0, 0.0, 0.0);
+                    if (ComputeShadowViewWorldAABB(linearTid, vMin, vMax)) {
+                        if (vMax.x >= scrMin.x && vMin.x <= scrMax.x &&
+                            vMax.y >= scrMin.y && vMin.y <= scrMax.y &&
+                            vMax.z >= scrMin.z && vMin.z <= scrMax.z) {
+                            UInt outSlot = 0u;
+                            InterlockedAdd(NVSFeedbackParams.OutBucketCounters[12u].counter, 1u, outSlot);
+                            if (outSlot < maxVisCap) {
+                                NVSFeedbackParams.OutBucketCounters[16u + outSlot].counter = linearTid;
+                            } else {
+                                UInt ovfPrev = 0u;
+                                InterlockedOr(NVSFeedbackParams.OutBucketCounters[13u].counter, 1u, ovfPrev);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Stage 4B: Per-32x32 Macro-Tile Cooperative View Binning (preserving ascending viewSlot order)
+            UInt vpWidth     = NVSFeedbackParams.Config.viewportWidth;
+            UInt vpHeight    = NVSFeedbackParams.Config.viewportHeight;
+            UInt macroTilesX = (vpWidth + 31u) >> 5u;
+            UInt macroTilesY = (vpHeight + 31u) >> 5u;
+            UInt totalMacros = macroTilesX * macroTilesY;
+            if (linearGid >= totalMacros || linearGid >= maxMacroCnt) {
+                return;
+            }
+
+            if (tid == 0u) {
+                UInt validSurf     = NVSFeedbackParams.OutMacroTileBounds[linearGid].validCount;
+                UInt gOvf          = NVSFeedbackParams.OutBucketCounters[13u].counter;
+                UInt gVis          = (gOvf != 0u) ? totalViews : Min(NVSFeedbackParams.OutBucketCounters[12u].counter, maxVisCap);
+                gs_MacroValidCount = validSurf;
+                gs_Stage4GlobalOvf = gOvf;
+                gs_Stage4VisCount  = (validSurf != 0u) ? gVis : 0u;
+                gs_MacroMinX       = NVSFeedbackParams.OutMacroTileBounds[linearGid].minXBits;
+                gs_MacroMinY       = NVSFeedbackParams.OutMacroTileBounds[linearGid].minYBits;
+                gs_MacroMinZ       = NVSFeedbackParams.OutMacroTileBounds[linearGid].minZBits;
+                gs_MacroMaxX       = NVSFeedbackParams.OutMacroTileBounds[linearGid].maxXBits;
+                gs_MacroMaxY       = NVSFeedbackParams.OutMacroTileBounds[linearGid].maxYBits;
+                gs_MacroMaxZ       = NVSFeedbackParams.OutMacroTileBounds[linearGid].maxZBits;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            Vec3 tMin = Vec3(
+                OrderedUIntToFloat(gs_MacroMinX),
+                OrderedUIntToFloat(gs_MacroMinY),
+                OrderedUIntToFloat(gs_MacroMinZ));
+            Vec3 tMax = Vec3(
+                OrderedUIntToFloat(gs_MacroMaxX),
+                OrderedUIntToFloat(gs_MacroMaxY),
+                OrderedUIntToFloat(gs_MacroMaxZ));
+
+            UInt globalOvf = gs_Stage4GlobalOvf;
+            UInt visCount  = gs_Stage4VisCount;
+            UInt tileBase  = linearGid * maxViewsTile;
+            UInt written   = 0u;
+            UInt tileOvf   = 0u;
+
+            for (UInt base = 0u; base < visCount; base = base + 64u) {
+                if (tid == 0u) {
+                    gs_ChunkPassMask0 = 0u;
+                    gs_ChunkPassMask1 = 0u;
+                }
+                GroupMemoryBarrierWithGroupSync();
+
+                UInt idx      = base + tid;
+                UInt viewSlot = 4294967295u;
+                Bool hitTile  = false;
+                if (idx < visCount) {
+                    viewSlot = (globalOvf != 0u) ? idx : NVSFeedbackParams.OutBucketCounters[16u + idx].counter;
+                    Vec3 vMin = Vec3(0.0, 0.0, 0.0);
+                    Vec3 vMax = Vec3(0.0, 0.0, 0.0);
+                    if (ComputeShadowViewWorldAABB(viewSlot, vMin, vMax)) {
+                        hitTile = (vMax.x >= tMin.x && vMin.x <= tMax.x &&
+                                   vMax.y >= tMin.y && vMin.y <= tMax.y &&
+                                   vMax.z >= tMin.z && vMin.z <= tMax.z);
+                    }
+                }
+
+                if (hitTile) {
+                    UInt dummyP = 0u;
+                    if (tid < 32u) {
+                        InterlockedOr(gs_ChunkPassMask0, 1u << tid, dummyP);
+                    } else {
+                        InterlockedOr(gs_ChunkPassMask1, 1u << (tid - 32u), dummyP);
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+
+                UInt m0 = gs_ChunkPassMask0;
+                UInt m1 = gs_ChunkPassMask1;
+                if (hitTile) {
+                    UInt rank = 0u;
+                    if (tid < 32u) {
+                        UInt low0 = (tid == 0u) ? 0u : ((1u << tid) - 1u);
+                        rank = CountBits(m0 & low0);
+                    } else {
+                        UInt b1   = tid - 32u;
+                        UInt low1 = (b1 == 0u) ? 0u : ((1u << b1) - 1u);
+                        rank = CountBits(m0) + CountBits(m1 & low1);
+                    }
+                    UInt dst = written + rank;
+                    if (dst < maxViewsTile) {
+                        NVSFeedbackParams.OutMacroTileViewIndices[tileBase + dst].viewIndex = viewSlot;
+                    } else {
+                        tileOvf = 1u;
+                    }
+                }
+                written = written + CountBits(m0) + CountBits(m1);
+                if (written >= maxViewsTile) {
+                    tileOvf = 1u;
+                }
+            }
+
+            if (tid == 0u) {
+                if (gs_MacroValidCount == 0u) {
+                    NVSFeedbackParams.OutMacroTileBounds[linearGid].viewCount = 0u;
+                } else {
+                    UInt packedCnt = (written > maxViewsTile) ? (maxViewsTile | 0x80000000u) : written;
+                    if (tileOvf != 0u) {
+                        packedCnt = maxViewsTile | 0x80000000u;
+                    }
+                    NVSFeedbackParams.OutMacroTileBounds[linearGid].viewCount = packedCnt;
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 2: Priority-Ordered GPU Request Compaction
+        // =================================================================
+        if (dispatchMode == 2u) {
+            UInt multiMode = NVSFeedbackParams.Config.multiLightViewMode;
+            UInt maxBudget = NVSFeedbackParams.Config.maxRequestBudget;
+            UInt bufCap    = NVSFeedbackParams.Config.compactedBufferCapacity;
+            if (maxBudget > bufCap) {
+                maxBudget = bufCap;
+            }
+
+            if (multiMode == 0u) {
+                if (linearGid > 0u) {
+                    return;
+                }
+
+                UInt baseWord   = tid * 32u;
+                UInt myBitCount = 0u;
+                for (UInt w = 0u; w < 32u; w = w + 1u) {
+                    UInt mask  = NVSFeedbackParams.OutPageBitmask[baseWord + w].word;
+                    myBitCount = myBitCount + CountBits(mask);
+                }
+                gs_ThreadBitCounts[tid] = myBitCount;
+
+                GroupMemoryBarrierWithGroupSync();
+
+                UInt myBaseOffset = 0u;
+                for (UInt i = 0u; i < tid; i = i + 1u) {
+                    myBaseOffset = myBaseOffset + gs_ThreadBitCounts[i];
+                }
+
+                UInt localIdx = 0u;
+                for (UInt w = 0u; w < 32u; w = w + 1u) {
+                    UInt wordIdx = baseWord + w;
+                    UInt mask    = NVSFeedbackParams.OutPageBitmask[wordIdx].word;
+                    while (mask != 0u) {
+                        UInt bitPos = FirstBitLow(mask);
+                        mask        = mask & (mask - 1u);
+                        UInt outIdx = myBaseOffset + localIdx;
+                        localIdx    = localIdx + 1u;
+
+                        if (outIdx < maxBudget) {
+                            UInt level      = wordIdx >> 9u;
+                            UInt reqLightId = (wordIdx >> 7u) & 3u;
+                            UInt localWord  = wordIdx & 127u;
+                            UInt localBit   = (localWord << 5u) | bitPos;
+                            UInt vPageX     = localBit & 63u;
+                            UInt vPageY     = localBit >> 6u;
+                            UInt packedAddr = (vPageX & 255u) |
+                                              ((vPageY & 255u) << 8u) |
+                                              ((level & 3u) << 16u) |
+                                              ((reqLightId & 63u) << 18u) |
+                                              (1u << 24u);
+                            UInt priority   = 4u - level;
+
+                            NVSFeedbackParams.OutCompactedRequests[outIdx].virtualAddressPacked = packedAddr;
+                            NVSFeedbackParams.OutCompactedRequests[outIdx].requestFlags         = 0u;
+                            NVSFeedbackParams.OutCompactedRequests[outIdx].requestPriority      = priority;
+                            NVSFeedbackParams.OutCompactedRequests[outIdx].requestUserData      = outIdx;
+                        }
+                    }
+                }
+
+                if (tid == 0u) {
+                    UInt lvl0Count = 0u;
+                    UInt lvl1Count = 0u;
+                    UInt lvl2Count = 0u;
+                    UInt lvl3Count = 0u;
+                    for (UInt t0 = 0u; t0 < 16u; t0 = t0 + 1u) {
+                        lvl0Count = lvl0Count + gs_ThreadBitCounts[t0];
+                        lvl1Count = lvl1Count + gs_ThreadBitCounts[t0 + 16u];
+                        lvl2Count = lvl2Count + gs_ThreadBitCounts[t0 + 32u];
+                        lvl3Count = lvl3Count + gs_ThreadBitCounts[t0 + 48u];
+                    }
+
+                    UInt totalUnique    = lvl0Count + lvl1Count + lvl2Count + lvl3Count;
+                    UInt compactedCount = (totalUnique < maxBudget) ? totalUnique : maxBudget;
+                    UInt overflowCount  = (totalUnique > maxBudget) ? (totalUnique - maxBudget) : 0u;
+                    UInt packedLvl23    = (lvl2Count & 65535u) | ((lvl3Count & 65535u) << 16u);
+
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].uniquePageRequestCount       = totalUnique;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].compactedRequestCount        = compactedCount;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].overflowRequestCount         = overflowCount;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].level0RequestCount           = lvl0Count;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].level1RequestCount           = lvl1Count;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].level2And3RequestCountPacked = packedLvl23;
+
+                    NVSFeedbackParams.OutResidencyTelemetry[0u].requestedCount = compactedCount;
+                }
+
+                AllMemoryBarrierWithGroupSync();
+                return;
+            }
+
+            // Path B: Multi-Workgroup 4-Bucket Priority Compaction over OutRequestHashTable
+            UInt subMode = NVSFeedbackParams.Config.cullSubMode;
+            UInt hashCap = NVSFeedbackParams.Config.hashAndTileParams.x;
+
+            if (subMode == 0u) {
+                // Histogram pass
+                if (linearTid < hashCap) {
+                    UInt vIdx   = NVSFeedbackParams.OutRequestHashTable[linearTid].viewIndex;
+                    UInt pCoord = NVSFeedbackParams.OutRequestHashTable[linearTid].packedCoord;
+                    if (vIdx < 4294967294u && pCoord != 4294967295u) {
+                        UInt pb      = NVSFeedbackParams.OutRequestHashTable[linearTid].priorityAndBucket;
+                        UInt bucket  = 3u - ((pb >> 16u) & 3u);
+                        UInt mipOrLv = (pb >> 20u) & 15u;
+                        UInt prevB   = 0u;
+                        InterlockedAdd(NVSFeedbackParams.OutBucketCounters[bucket].counter, 1u, prevB);
+
+                        if (mipOrLv == 0u) {
+                            InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].level0RequestCount, 1u, prevB);
+                        } else if (mipOrLv == 1u) {
+                            InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].level1RequestCount, 1u, prevB);
+                        } else if (mipOrLv == 2u) {
+                            InterlockedAdd(NVSFeedbackParams.OutBucketCounters[14u].counter, 1u, prevB);
+                        } else {
+                            InterlockedAdd(NVSFeedbackParams.OutBucketCounters[15u].counter, 1u, prevB);
+                        }
+                    }
+                }
+                return;
+            }
+
+            if (subMode == 1u) {
+                // Prefix sum pass (single thread)
+                if (linearGid == 0u && tid == 0u) {
+                    UInt c0 = NVSFeedbackParams.OutBucketCounters[0u].counter;
+                    UInt c1 = NVSFeedbackParams.OutBucketCounters[1u].counter;
+                    UInt c2 = NVSFeedbackParams.OutBucketCounters[2u].counter;
+                    UInt c3 = NVSFeedbackParams.OutBucketCounters[3u].counter;
+
+                    UInt o0 = 0u;
+                    UInt o1 = o0 + c0;
+                    UInt o2 = o1 + c1;
+                    UInt o3 = o2 + c2;
+                    UInt totalUnique    = o3 + c3;
+                    UInt compactedCount = (totalUnique < maxBudget) ? totalUnique : maxBudget;
+                    UInt overflowCount  = (totalUnique > maxBudget) ? (totalUnique - maxBudget) : 0u;
+                    UInt priorHashOvf   = NVSFeedbackParams.OutFeedbackTelemetry[0u].overflowRequestCount;
+
+                    NVSFeedbackParams.OutBucketCounters[4u].counter  = o0;
+                    NVSFeedbackParams.OutBucketCounters[5u].counter  = o1;
+                    NVSFeedbackParams.OutBucketCounters[6u].counter  = o2;
+                    NVSFeedbackParams.OutBucketCounters[7u].counter  = o3;
+                    NVSFeedbackParams.OutBucketCounters[8u].counter  = o0;
+                    NVSFeedbackParams.OutBucketCounters[9u].counter  = o1;
+                    NVSFeedbackParams.OutBucketCounters[10u].counter = o2;
+                    NVSFeedbackParams.OutBucketCounters[11u].counter = o3;
+
+                    UInt l2Cnt = Min(NVSFeedbackParams.OutBucketCounters[14u].counter, 65535u);
+                    UInt l3Cnt = Min(NVSFeedbackParams.OutBucketCounters[15u].counter, 65535u);
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].uniquePageRequestCount       = totalUnique;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].compactedRequestCount        = compactedCount;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].overflowRequestCount         = priorHashOvf + overflowCount;
+                    NVSFeedbackParams.OutFeedbackTelemetry[0u].level2And3RequestCountPacked = l2Cnt | (l3Cnt << 16u);
+                    NVSFeedbackParams.OutResidencyTelemetry[0u].requestedCount              = compactedCount;
+                }
+                return;
+            }
+
+            // Scatter pass (subMode == 2u)
+            if (linearTid < hashCap) {
+                UInt vIdx   = NVSFeedbackParams.OutRequestHashTable[linearTid].viewIndex;
+                UInt pCoord = NVSFeedbackParams.OutRequestHashTable[linearTid].packedCoord;
+                if (vIdx < 4294967294u && pCoord != 4294967295u) {
+                    UInt pb     = NVSFeedbackParams.OutRequestHashTable[linearTid].priorityAndBucket;
+                    UInt rFlags = NVSFeedbackParams.OutRequestHashTable[linearTid].requestFlags;
+                    UInt bucket = 3u - ((pb >> 16u) & 3u);
+                    UInt prio   = pb & 65535u;
+                    UInt dstIdx = 0u;
+                    InterlockedAdd(NVSFeedbackParams.OutBucketCounters[8u + bucket].counter, 1u, dstIdx);
+                    if (dstIdx < maxBudget) {
+                        NVSFeedbackParams.OutCompactedRequests[dstIdx].virtualAddressPacked = pCoord;
+                        NVSFeedbackParams.OutCompactedRequests[dstIdx].requestFlags         = rFlags;
+                        NVSFeedbackParams.OutCompactedRequests[dstIdx].requestPriority      = prio;
+                        NVSFeedbackParams.OutCompactedRequests[dstIdx].requestUserData      = vIdx;
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1: Screen-Space Depth Feedback & 8x8 Tile Deduplication
+        // =================================================================
+        if (tid < 8u) {
+            gs_TileStats[tid] = 0u;
+        }
+        if (tid == 0u) {
+            gs_TileDedupCount     = 0u;
+            gs_TileGlobalDupCount = 0u;
+        }
+        if (NVSFeedbackParams.Config.multiLightViewMode != 0u) {
+            gs_SparseTileView[tid]        = 4294967295u;
+            gs_SparseTileCoord[tid]       = 4294967295u;
+            gs_SparseTilePrio[tid]        = 0u;
+            gs_SparseTileFlags[tid]       = 0u;
+            gs_SparseTileView[tid + 64u]  = 4294967295u;
+            gs_SparseTileCoord[tid + 64u] = 4294967295u;
+            gs_SparseTilePrio[tid + 64u]  = 0u;
+            gs_SparseTileFlags[tid + 64u] = 0u;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        UInt vpWidth  = NVSFeedbackParams.Config.viewportWidth;
+        UInt vpHeight = NVSFeedbackParams.Config.viewportHeight;
+        UInt tilesX   = (vpWidth + 7u) >> 3u;
+
+        UInt tileX = gid.x;
+        UInt tileY = gid.y;
+        if (tileY == 0u && tileX >= tilesX && tilesX > 0u) {
+            tileY = tileX / tilesX;
+            tileX = tileX % tilesX;
+        }
+
+        UInt localX = tid & 7u;
+        UInt localY = tid >> 3u;
+        UInt px     = (tileX << 3u) + localX;
+        UInt py     = (tileY << 3u) + localY;
+
+        UInt  footprintMode    = NVSFeedbackParams.Config.footprintMode;
+        Float borderMargin     = NVSFeedbackParams.Config.footprintBorderMargin;
+        UInt  disableTileDedup = NVSFeedbackParams.Config.disableGroupSharedDedup;
+        UInt  multiLightMode   = NVSFeedbackParams.Config.multiLightViewMode;
+        UInt  maxPass          = (footprintMode != 0u) ? 9u : 1u;
+
+        UInt worldSurfaceValid = 0u;
+        Vec3 worldPos          = Vec3(0.0, 0.0, 0.0);
+
+        if (px < vpWidth && py < vpHeight) {
+            UInt prevStat = 0u;
+            InterlockedAdd(gs_TileStats[0], 1u, prevStat);
+
+            UInt rejBucket = 0u;
+            if (ReconstructPixelWorldPos(px, py, vpWidth, vpHeight, worldPos, rejBucket)) {
+                InterlockedAdd(gs_TileStats[1], 1u, prevStat);
+                worldSurfaceValid = 1u;
+            } else {
+                InterlockedAdd(gs_TileStats[rejBucket], 1u, prevStat);
+            }
+        }
+
+        // =================================================================
+        //  Path A: Single-Hierarchy Legacy Directional Clipmap Feedback
+        // =================================================================
+        if (multiLightMode == 0u) {
+            UInt  pixelAccepted      = 0u;
+            UInt  selectedLevel      = 0u;
+            Int   selectedWorldPageX = 0;
+            Int   selectedWorldPageY = 0;
+            Int   selectedOriginX    = 0;
+            Int   selectedOriginY    = 0;
+            Float fracX              = 0.5;
+            Float fracY              = 0.5;
+
+            UInt lightId          = NVSFeedbackParams.Config.lightId;
+            UInt activeLevelCount = NVSFeedbackParams.Config.activeLevelCount;
+            UInt pagesPerAxis     = NVSFeedbackParams.Config.pagesPerAxis;
+            Int  halfPages        = Int(pagesPerAxis >> 1u);
+
+            if (worldSurfaceValid != 0u) {
+                UInt  prevStat   = 0u;
+                Vec3  lightRight = NVSFeedbackParams.Config.lightRight;
+                Vec3  lightUp    = NVSFeedbackParams.Config.lightUp;
+                Float rightLenSq = Dot(lightRight, lightRight);
+                Float upLenSq    = Dot(lightUp, lightUp);
+                Float maxDist    = NVSFeedbackParams.Config.maxShadowDistance;
+                UInt  outOfRange = 0u;
+
+                if (activeLevelCount == 0u || activeLevelCount > 4u ||
+                    pagesPerAxis == 0u || pagesPerAxis > 64u ||
+                    lightId >= 4u ||
+                    rightLenSq <= 0.000001 || upLenSq <= 0.000001) {
+                    outOfRange = 1u;
+                } else if (maxDist > 0.0) {
+                    Vec3  camDelta = worldPos - NVSFeedbackParams.Config.cameraWorldPos;
+                    Float distSq   = Dot(camDelta, camDelta);
+                    if (distSq > (maxDist * maxDist)) {
+                        outOfRange = 1u;
+                    }
+                }
+
+                if (outOfRange == 0u) {
+                    Float projX      = Dot(worldPos, lightRight);
+                    Float projY      = Dot(worldPos, lightUp);
+                    Vec4  extents    = NVSFeedbackParams.Config.levelWorldExtents;
+                    Int4  originsX   = NVSFeedbackParams.Config.snappedOriginPageX;
+                    Int4  originsY   = NVSFeedbackParams.Config.snappedOriginPageY;
+                    Int   lim        = Int(pagesPerAxis);
+                    UInt  foundLevel = 0u;
+
+                    for (UInt lvl = 0u; lvl < 4u; lvl = lvl + 1u) {
+                        if (lvl < activeLevelCount && foundLevel == 0u) {
+                            Float extent  = (lvl == 0u) ? extents.x  : ((lvl == 1u) ? extents.y  : ((lvl == 2u) ? extents.z  : extents.w));
+                            Int   originX = (lvl == 0u) ? originsX.x : ((lvl == 1u) ? originsX.y : ((lvl == 2u) ? originsX.z : originsX.w));
+                            Int   originY = (lvl == 0u) ? originsY.x : ((lvl == 1u) ? originsY.y : ((lvl == 2u) ? originsY.z : originsY.w));
+
+                            if (extent > 0.0001) {
+                                Float pageSize   = extent / Float(pagesPerAxis);
+                                Float exactPageX = projX / pageSize;
+                                Float exactPageY = projY / pageSize;
+                                Float flX        = Floor(exactPageX);
+                                Float flY        = Floor(exactPageY);
+                                Int   wPageX     = Int(flX);
+                                Int   wPageY     = Int(flY);
+                                Int   minPageX   = originX - halfPages;
+                                Int   minPageY   = originY - halfPages;
+                                Int   relX       = wPageX - minPageX;
+                                Int   relY       = wPageY - minPageY;
+
+                                if (relX >= 0 && relX < lim && relY >= 0 && relY < lim) {
+                                    foundLevel         = 1u;
+                                    selectedLevel      = lvl;
+                                    selectedWorldPageX = wPageX;
+                                    selectedWorldPageY = wPageY;
+                                    selectedOriginX    = originX;
+                                    selectedOriginY    = originY;
+                                    fracX              = exactPageX - flX;
+                                    fracY              = exactPageY - flY;
+                                }
+                            }
+                        }
+                    }
+
+                    if (foundLevel != 0u) {
+                        pixelAccepted = 1u;
+                        InterlockedAdd(gs_TileStats[6], 1u, prevStat);
+                    } else {
+                        InterlockedAdd(gs_TileStats[5], 1u, prevStat);
+                    }
+                } else {
+                    InterlockedAdd(gs_TileStats[5], 1u, prevStat);
+                }
+            }
+
+            Int limAxis = Int(pagesPerAxis);
+            for (UInt pIdx = 0u; pIdx < maxPass; pIdx = pIdx + 1u) {
+                UInt candFlatPage = 4294967295u;
+                UInt candWordIdx  = 4294967295u;
+                UInt candBitMask  = 0u;
+
+                if (pixelAccepted != 0u) {
+                    Int  dx         = 0;
+                    Int  dy         = 0;
+                    UInt emitSample = 0u;
+
+                    if (pIdx == 0u) {
+                        emitSample = 1u;
+                    } else if (pIdx == 1u) {
+                        if (fracX < borderMargin) { dx = -1; emitSample = 1u; }
+                    } else if (pIdx == 2u) {
+                        if (fracX > (1.0 - borderMargin)) { dx = 1; emitSample = 1u; }
+                    } else if (pIdx == 3u) {
+                        if (fracY < borderMargin) { dy = -1; emitSample = 1u; }
+                    } else if (pIdx == 4u) {
+                        if (fracY > (1.0 - borderMargin)) { dy = 1; emitSample = 1u; }
+                    } else if (pIdx == 5u) {
+                        if (fracX < borderMargin && fracY < borderMargin) { dx = -1; dy = -1; emitSample = 1u; }
+                    } else if (pIdx == 6u) {
+                        if (fracX > (1.0 - borderMargin) && fracY < borderMargin) { dx = 1; dy = -1; emitSample = 1u; }
+                    } else if (pIdx == 7u) {
+                        if (fracX < borderMargin && fracY > (1.0 - borderMargin)) { dx = -1; dy = 1; emitSample = 1u; }
+                    } else if (pIdx == 8u) {
+                        if (fracX > (1.0 - borderMargin) && fracY > (1.0 - borderMargin)) { dx = 1; dy = 1; emitSample = 1u; }
+                    }
+
+                    if (emitSample != 0u) {
+                        Int candWorldX = selectedWorldPageX + dx;
+                        Int candWorldY = selectedWorldPageY + dy;
+                        Int minPageX   = selectedOriginX - halfPages;
+                        Int minPageY   = selectedOriginY - halfPages;
+                        Int relX       = candWorldX - minPageX;
+                        Int relY       = candWorldY - minPageY;
+
+                        if (relX >= 0 && relX < limAxis && relY >= 0 && relY < limAxis) {
+                            Int modX = (candWorldX + halfPages) % limAxis;
+                            if (modX < 0) { modX = modX + limAxis; }
+                            Int modY = (candWorldY + halfPages) % limAxis;
+                            if (modY < 0) { modY = modY + limAxis; }
+                            UInt vPageX   = UInt(modX);
+                            UInt vPageY   = UInt(modY);
+                            UInt localBit = (vPageY << 6u) | vPageX;
+
+                            candFlatPage = (((selectedLevel * 4u) + lightId) << 12u) | localBit;
+                            candWordIdx  = candFlatPage >> 5u;
+                            candBitMask  = 1u << (candFlatPage & 31u);
+
+                            UInt prevCand = 0u;
+                            InterlockedAdd(gs_TileStats[7], 1u, prevCand);
+                        }
+                    }
+                }
+
+                EmitCandidateWithTileDedup(tid, disableTileDedup, candFlatPage, candWordIdx, candBitMask);
+            }
+        }
+        // =================================================================
+        //  Path B: Scalable Multi-Light Sparse Feedback (60,000+ Views, 16K, Mip LOD)
+        // =================================================================
+        else {
+            UInt  hashCap              = NVSFeedbackParams.Config.hashAndTileParams.x;
+            UInt  maxMacroCnt          = NVSFeedbackParams.Config.hashAndTileParams.y;
+            UInt  maxViewsTile         = NVSFeedbackParams.Config.hashAndTileParams.z;
+            UInt  maxVisCap            = NVSFeedbackParams.Config.hashAndTileParams.w;
+            UInt  macroTilesX          = (vpWidth + 31u) >> 5u;
+            UInt  macroIdx             = (tileY >> 2u) * macroTilesX + (tileX >> 2u);
+            UInt  totalViewCount       = NVSFeedbackParams.Config.activeViewTableCount;
+
+            Float maxDist              = NVSFeedbackParams.Config.maxShadowDistance;
+            Vec3  camPos               = NVSFeedbackParams.Config.cameraWorldPos;
+            Vec4  screenScaleCfg       = NVSFeedbackParams.Config.screenPixelWorldScale;
+            UInt  withinGlobalDistance = worldSurfaceValid;
+            Float camDist              = 0.0;
+            Float screenPixelWorld     = 0.0;
+
+            if (withinGlobalDistance != 0u) {
+                Vec3  camDelta = worldPos - camPos;
+                Float distSq   = Dot(camDelta, camDelta);
+                if (maxDist > 0.0 && distSq > (maxDist * maxDist)) {
+                    withinGlobalDistance = 0u;
+                } else {
+                    camDist          = Sqrt(Max(distSq, 0.00000001));
+                    screenPixelWorld = (screenScaleCfg.x * camDist) + screenScaleCfg.y;
+                }
+            }
+
+            UInt useTileList   = 0u;
+            UInt useVisList    = 0u;
+            UInt loopViewCount = totalViewCount;
+            UInt tileListBase  = 0u;
+
+            if (maxMacroCnt > 0u && macroIdx < maxMacroCnt) {
+                UInt rawTileCnt = NVSFeedbackParams.OutMacroTileBounds[macroIdx].viewCount;
+                UInt tileValid  = NVSFeedbackParams.OutMacroTileBounds[macroIdx].validCount;
+                if (tileValid == 0u) {
+                    loopViewCount = 0u;
+                } else if ((rawTileCnt & 0x80000000u) == 0u) {
+                    useTileList   = 1u;
+                    loopViewCount = rawTileCnt;
+                    tileListBase  = macroIdx * maxViewsTile;
+                } else if (NVSFeedbackParams.OutBucketCounters[13u].counter == 0u) {
+                    useVisList    = 1u;
+                    loopViewCount = Min(NVSFeedbackParams.OutBucketCounters[12u].counter, maxVisCap);
+                }
+            }
+
+            UInt anyViewAccepted = 0u;
+
+            if (withinGlobalDistance != 0u) {
+                for (UInt lIdx = 0u; lIdx < loopViewCount; lIdx = lIdx + 1u) {
+                    UInt viewSlot = lIdx;
+                    if (useTileList != 0u) {
+                        viewSlot = NVSFeedbackParams.OutMacroTileViewIndices[tileListBase + lIdx].viewIndex;
+                    } else if (useVisList != 0u) {
+                        viewSlot = NVSFeedbackParams.OutBucketCounters[16u + lIdx].counter;
+                    }
+
+                    if (viewSlot >= totalViewCount) {
+                        continue;
+                    }
+
+                    UInt  vPagesAxis = NVSFeedbackParams.InClipmapLevels[viewSlot].pagesPerAxis;
+                    UInt  cmFlags    = NVSFeedbackParams.InClipmapLevels[viewSlot].flags;
+                    Float vExtent    = NVSFeedbackParams.InClipmapLevels[viewSlot].worldExtent;
+                    Float baseTexel  = NVSFeedbackParams.InClipmapLevels[viewSlot].texelWorldSize;
+                    Float rMinZ      = NVSFeedbackParams.InClipmapLevels[viewSlot].receiverMinZ;
+                    Float rMaxZ      = NVSFeedbackParams.InClipmapLevels[viewSlot].receiverMaxZ;
+
+                    if ((cmFlags & 1u) == 0u || vPagesAxis == 0u || vPagesAxis > 128u || vExtent <= 0.0001) {
+                        continue;
+                    }
+
+                    Bool isPerspective = (cmFlags & 4u) != 0u;
+                    Bool isSpotCone    = (cmFlags & 8u) != 0u;
+                    Bool isPointCube   = (cmFlags & 32u) != 0u;
+                    UInt viewGen       = ExtractViewGeneration(cmFlags);
+
+                    Vec4 rVec = NVSFeedbackParams.InClipmapLevels[viewSlot].lightRightAndCenterX;
+                    Vec4 uVec = NVSFeedbackParams.InClipmapLevels[viewSlot].lightUpAndCenterY;
+                    Vec4 dVec = NVSFeedbackParams.InClipmapLevels[viewSlot].lightDirAndExtrusion;
+                    Vec3 R    = rVec.xyz;
+                    Vec3 U    = uVec.xyz;
+                    Vec3 D    = dVec.xyz;
+
+                    if (isPerspective) {
+                        Vec3  lightPos = NVSFeedbackParams.InClipmapLevels[viewSlot].lightViewToWorldCol3.xyz;
+                        Vec3  rel      = worldPos - lightPos;
+                        Float lx       = Dot(rel, R);
+                        Float ly       = Dot(rel, U);
+                        Float lz       = Dot(rel, D);
+
+                        if (lz >= rMinZ && lz <= rMaxZ && lz > 0.00001) {
+                            Bool coneOk = true;
+                            if (isSpotCone) {
+                                Float dist     = Sqrt(Max(Dot(rel, rel), 0.00000001));
+                                Float cosOuter = NVSFeedbackParams.InClipmapLevels[viewSlot].transitionAndPadding.x;
+                                if ((lz / dist) < (cosOuter - 0.015)) {
+                                    coneOk = false;
+                                }
+                            } else {
+                                // Point cube face: accept dominant hemisphere + small cross-face border margin
+                                Float halfTan = 0.5 * vExtent;
+                                if (Abs(lx) > (halfTan * lz * 1.015) || Abs(ly) > (halfTan * lz * 1.015)) {
+                                    coneOk = false;
+                                }
+                            }
+
+                            if (coneOk) {
+                                UInt  mipCount    = ExtractViewMipCount(cmFlags);
+                                UInt  maxMipIdx   = (mipCount > 0u) ? (mipCount - 1u) : 0u;
+                                UInt  viewMinMip  = Min(ExtractViewMinMip(cmFlags), maxMipIdx);
+                                Float viewLodBias = ExtractViewLodBias(cmFlags);
+                                UInt  desiredMip  = viewMinMip;
+                                Float mipLodFrac  = 0.0;
+
+                                if (mipCount > 1u && screenPixelWorld > 0.0 && baseTexel > 0.00000001) {
+                                    Float mip0TexWorld = lz * baseTexel;
+                                    Float ratio        = screenPixelWorld / Max(mip0TexWorld, 0.0000001);
+                                    Float rawLod       = Log2(Max(ratio, 0.0625)) + screenScaleCfg.z + viewLodBias;
+                                    Float clampedLod   = Clamp(rawLod, Float(viewMinMip), Float(maxMipIdx));
+                                    desiredMip         = Min(Max(UInt(Floor(clampedLod)), viewMinMip), maxMipIdx);
+                                    mipLodFrac         = clampedLod - Float(desiredMip);
+                                }
+
+                                UInt  mipPagesAxis = Max(vPagesAxis >> desiredMip, 1u);
+                                Float mipPageSize  = vExtent / Float(mipPagesAxis);
+                                Int   halfPages    = Int(mipPagesAxis >> 1u);
+                                Int   limAxis      = Int(mipPagesAxis);
+
+                                Float centerShift = (mipPagesAxis == 1u) ? 0.5 : 0.0;
+                                Float exactPageX  = ((lx / lz) / mipPageSize) + centerShift;
+                                Float exactPageY  = ((ly / lz) / mipPageSize) + centerShift;
+                                Float flX         = Floor(exactPageX);
+                                Float flY         = Floor(exactPageY);
+                                Int   wPageX      = Int(flX);
+                                Int   wPageY      = Int(flY);
+
+                                if (!isSpotCone) {
+                                    if (mipPagesAxis == 1u) {
+                                        wPageX = 0;
+                                        wPageY = 0;
+                                    } else {
+                                        wPageX = Clamp(wPageX, -halfPages, halfPages - 1);
+                                        wPageY = Clamp(wPageY, -halfPages, halfPages - 1);
+                                    }
+                                }
+
+                                Int relX = (mipPagesAxis == 1u) ? wPageX : (wPageX + halfPages);
+                                Int relY = (mipPagesAxis == 1u) ? wPageY : (wPageY + halfPages);
+
+                                if (relX >= 0 && relX < limAxis && relY >= 0 && relY < limAxis) {
+                                    anyViewAccepted = 1u;
+
+                                    UInt distBucket = (camDist < 20.0) ? 1u : ((camDist < 75.0) ? 2u : 3u);
+                                    UInt finePrio   = Clamp(UInt(16383.0 / (1.0 + camDist * 0.06)), 256u, 16383u);
+                                    UInt pbWord     = finePrio | (((3u - distBucket) & 3u) << 16u) | ((desiredMip & 15u) << 20u);
+
+                                    Float fracX = Saturate(exactPageX - Float(wPageX));
+                                    Float fracY = Saturate(exactPageY - Float(wPageY));
+
+                                    for (UInt pIdx = 0u; pIdx < maxPass; pIdx = pIdx + 1u) {
+                                        Int  dx         = 0;
+                                        Int  dy         = 0;
+                                        UInt emitSample = 0u;
+                                        if (pIdx == 0u) {
+                                            emitSample = 1u;
+                                        } else if (pIdx == 1u) {
+                                            if (fracX < borderMargin) { dx = -1; emitSample = 1u; }
+                                        } else if (pIdx == 2u) {
+                                            if (fracX > (1.0 - borderMargin)) { dx = 1; emitSample = 1u; }
+                                        } else if (pIdx == 3u) {
+                                            if (fracY < borderMargin) { dy = -1; emitSample = 1u; }
+                                        } else if (pIdx == 4u) {
+                                            if (fracY > (1.0 - borderMargin)) { dy = 1; emitSample = 1u; }
+                                        } else if (pIdx == 5u) {
+                                            if (fracX < borderMargin && fracY < borderMargin) { dx = -1; dy = -1; emitSample = 1u; }
+                                        } else if (pIdx == 6u) {
+                                            if (fracX > (1.0 - borderMargin) && fracY < borderMargin) { dx = 1; dy = -1; emitSample = 1u; }
+                                        } else if (pIdx == 7u) {
+                                            if (fracX < borderMargin && fracY > (1.0 - borderMargin)) { dx = -1; dy = 1; emitSample = 1u; }
+                                        } else if (pIdx == 8u) {
+                                            if (fracX > (1.0 - borderMargin) && fracY > (1.0 - borderMargin)) { dx = 1; dy = 1; emitSample = 1u; }
+                                        }
+
+                                        if (emitSample != 0u) {
+                                            Int candWX = wPageX + dx;
+                                            Int candWY = wPageY + dy;
+                                            Int cRelX  = (mipPagesAxis == 1u) ? candWX : (candWX + halfPages);
+                                            Int cRelY  = (mipPagesAxis == 1u) ? candWY : (candWY + halfPages);
+                                            if (cRelX >= 0 && cRelX < limAxis && cRelY >= 0 && cRelY < limAxis) {
+                                                UInt vx0 = 0u;
+                                                UInt vy0 = 0u;
+                                                if (mipPagesAxis > 1u) {
+                                                    Int modX = (candWX + halfPages) % limAxis;
+                                                    if (modX < 0) { modX = modX + limAxis; }
+                                                    Int modY = (candWY + halfPages) % limAxis;
+                                                    if (modY < 0) { modY = modY + limAxis; }
+                                                    vx0 = UInt(modX);
+                                                    vy0 = UInt(modY);
+                                                }
+                                                UInt pCoord = PackSparseCoord(vx0, vy0, desiredMip, viewGen);
+                                                EmitSparseCandidatePixel(viewSlot, pCoord, pbWord, 4u, hashCap);
+                                            } else if (isPointCube) {
+                                                // Seamless Point Cubemap Cross-Face Border Page Request (supports 1x1 up to 128x128 mips)
+                                                UInt faceIdx  = (cmFlags >> 9u) & 7u;
+                                                UInt cubeBase = (viewSlot >= faceIdx) ? (viewSlot - faceIdx) : viewSlot;
+                                                if ((cubeBase + 6u) <= totalViewCount) {
+                                                    Float nbrTanX = ((Float(candWX) + 0.5) - centerShift) * mipPageSize;
+                                                    Float nbrTanY = ((Float(candWY) + 0.5) - centerShift) * mipPageSize;
+                                                    Vec3  nbrRay  = D + (R * nbrTanX) + (U * nbrTanY);
+                                                    UInt  nbrView = cubeBase;
+                                                    Float bestD   = -1.0e30;
+                                                    for (UInt cf = 0u; cf < 6u; cf = cf + 1u) {
+                                                        Vec3 fD = NVSFeedbackParams.InClipmapLevels[cubeBase + cf].lightDirAndExtrusion.xyz;
+                                                        Float d = Dot(nbrRay, fD);
+                                                        if (d > bestD) { bestD = d; nbrView = cubeBase + cf; }
+                                                    }
+                                                    if (bestD > 0.0001) {
+                                                        UInt nGen = ExtractViewGeneration(NVSFeedbackParams.InClipmapLevels[nbrView].flags);
+                                                        UInt nVX  = 0u;
+                                                        UInt nVY  = 0u;
+                                                        if (mipPagesAxis > 1u) {
+                                                            Vec3  nR  = NVSFeedbackParams.InClipmapLevels[nbrView].lightRightAndCenterX.xyz;
+                                                            Vec3  nU  = NVSFeedbackParams.InClipmapLevels[nbrView].lightUpAndCenterY.xyz;
+                                                            Float nPX = (Dot(nbrRay, nR) / bestD) / mipPageSize;
+                                                            Float nPY = (Dot(nbrRay, nU) / bestD) / mipPageSize;
+                                                            Int   nWX = Clamp(Int(Floor(nPX)), -halfPages, halfPages - 1);
+                                                            Int   nWY = Clamp(Int(Floor(nPY)), -halfPages, halfPages - 1);
+                                                            Int   nMX = (nWX + halfPages) % limAxis;
+                                                            if (nMX < 0) { nMX = nMX + limAxis; }
+                                                            Int   nMY = (nWY + halfPages) % limAxis;
+                                                            if (nMY < 0) { nMY = nMY + limAxis; }
+                                                            nVX = UInt(nMX);
+                                                            nVY = UInt(nMY);
+                                                        }
+                                                        UInt nCoord = PackSparseCoord(nVX, nVY, desiredMip, nGen);
+                                                        EmitSparseCandidatePixel(nbrView, nCoord, pbWord, 4u, hashCap);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Guard mip boundary transitions against depth-buffer vs interpolated worldPos quantization
+                                    if (mipLodFrac > 0.95 && (desiredMip + 1u) < mipCount) {
+                                        UInt nextMip       = desiredMip + 1u;
+                                        UInt nextPagesAxis = Max(vPagesAxis >> nextMip, 1u);
+                                        UInt nextVX        = 0u;
+                                        UInt nextVY        = 0u;
+                                        if (nextPagesAxis > 1u) {
+                                            Float nextPageSize = vExtent / Float(nextPagesAxis);
+                                            Int   nextHalf     = Int(nextPagesAxis >> 1u);
+                                            Int   nextLim      = Int(nextPagesAxis);
+                                            Int   nWX          = Clamp(Int(Floor((lx / lz) / nextPageSize)), -nextHalf, nextHalf - 1);
+                                            Int   nWY          = Clamp(Int(Floor((ly / lz) / nextPageSize)), -nextHalf, nextHalf - 1);
+                                            Int   mX           = (nWX + nextHalf) % nextLim;
+                                            if (mX < 0) { mX = mX + nextLim; }
+                                            Int   mY           = (nWY + nextHalf) % nextLim;
+                                            if (mY < 0) { mY = mY + nextLim; }
+                                            nextVX = UInt(mX);
+                                            nextVY = UInt(mY);
+                                        }
+                                        UInt nextPB    = finePrio | (((3u - distBucket) & 3u) << 16u) | ((nextMip & 15u) << 20u);
+                                        UInt nextCoord = PackSparseCoord(nextVX, nextVY, nextMip, viewGen);
+                                        EmitSparseCandidatePixel(viewSlot, nextCoord, nextPB, 4u, hashCap);
+                                    } else if (mipLodFrac < 0.05 && desiredMip > viewMinMip) {
+                                        // Guard fine-mip boundary against depth-buffer vs interpolated worldPos quantization
+                                        UInt  fineMip       = desiredMip - 1u;
+                                        UInt  finePagesAxis = Max(vPagesAxis >> fineMip, 1u);
+                                        Float finePageSize  = vExtent / Float(finePagesAxis);
+                                        Int   fineHalf      = Int(finePagesAxis >> 1u);
+                                        Int   fineLim       = Int(finePagesAxis);
+                                        Int   fWX           = Int(Floor((lx / lz) / finePageSize));
+                                        Int   fWY           = Int(Floor((ly / lz) / finePageSize));
+                                        if (!isSpotCone) {
+                                            fWX = Clamp(fWX, -fineHalf, fineHalf - 1);
+                                            fWY = Clamp(fWY, -fineHalf, fineHalf - 1);
+                                        }
+                                        Int fRelX = fWX + fineHalf;
+                                        Int fRelY = fWY + fineHalf;
+                                        if (fRelX >= 0 && fRelX < fineLim && fRelY >= 0 && fRelY < fineLim) {
+                                            Int fmX = (fWX + fineHalf) % fineLim;
+                                            if (fmX < 0) { fmX = fmX + fineLim; }
+                                            Int fmY = (fWY + fineHalf) % fineLim;
+                                            if (fmY < 0) { fmY = fmY + fineLim; }
+                                            UInt finePB    = finePrio | (((3u - distBucket) & 3u) << 16u) | ((fineMip & 15u) << 20u);
+                                            UInt fineCoord = PackSparseCoord(UInt(fmX), UInt(fmY), fineMip, viewGen);
+                                            EmitSparseCandidatePixel(viewSlot, fineCoord, finePB, 4u, hashCap);
+                                        }
+                                    }
+
+                                    // Always request Coarse Root Fallback Anchor (Bucket 0 -> inverted 3, NVS_REQ_FLAG_COARSE_ANCHOR = 8)
+                                    if (mipCount > 1u && desiredMip < (mipCount - 1u)) {
+                                        UInt rootMip       = mipCount - 1u;
+                                        UInt rootPagesAxis = Max(vPagesAxis >> rootMip, 1u);
+                                        UInt rootVX        = 0u;
+                                        UInt rootVY        = 0u;
+                                        if (rootPagesAxis > 1u) {
+                                            Float rootPageSize = vExtent / Float(rootPagesAxis);
+                                            Int   rootHalf     = Int(rootPagesAxis >> 1u);
+                                            Int   rootLim      = Int(rootPagesAxis);
+                                            Int   rWX          = Clamp(Int(Floor((lx / lz) / rootPageSize)), -rootHalf, rootHalf - 1);
+                                            Int   rWY          = Clamp(Int(Floor((ly / lz) / rootPageSize)), -rootHalf, rootHalf - 1);
+                                            Int   rmX          = (rWX + rootHalf) % rootLim;
+                                            if (rmX < 0) { rmX = rmX + rootLim; }
+                                            Int   rmY          = (rWY + rootHalf) % rootLim;
+                                            if (rmY < 0) { rmY = rmY + rootLim; }
+                                            rootVX = UInt(rmX);
+                                            rootVY = UInt(rmY);
+                                        }
+                                        UInt rootPrio  = 32768u + finePrio;
+                                        UInt rootPB    = (rootPrio & 65535u) | (3u << 16u) | ((rootMip & 15u) << 20u);
+                                        UInt rootCoord = PackSparseCoord(rootVX, rootVY, rootMip, viewGen);
+                                        EmitSparseCandidatePixel(viewSlot, rootCoord, rootPB, 12u, hashCap);
+                                    }
+                                }
+                            }
+                        }
+                    } else if ((viewSlot & 3u) == 0u) {
+                        // Directional Clipmap 4-Level Block (evaluated deterministically 0 -> 1 -> 2 -> 3 with Receiver-Driven Virtual Mips)
+                        for (UInt cLvl = 0u; cLvl < 4u; cLvl = cLvl + 1u) {
+                            UInt dSlot = viewSlot + cLvl;
+                            if (dSlot >= totalViewCount) {
+                                break;
+                            }
+                            UInt  dPagesAxis = NVSFeedbackParams.InClipmapLevels[dSlot].pagesPerAxis;
+                            UInt  dFlags     = NVSFeedbackParams.InClipmapLevels[dSlot].flags;
+                            Float dExtent    = NVSFeedbackParams.InClipmapLevels[dSlot].worldExtent;
+                            Float dBaseTexel = NVSFeedbackParams.InClipmapLevels[dSlot].texelWorldSize;
+                            if ((dFlags & 1u) == 0u || (dFlags & 4u) != 0u || dPagesAxis == 0u || dPagesAxis > 128u || dExtent <= 0.0001) {
+                                continue;
+                            }
+                            UInt  dViewGen      = ExtractViewGeneration(dFlags);
+                            UInt  dMipCount     = ExtractViewMipCount(dFlags);
+                            UInt  dMaxActiveMip = ComputeOrthoMaxActiveMip(dMipCount);
+                            Vec4  dRVec         = NVSFeedbackParams.InClipmapLevels[dSlot].lightRightAndCenterX;
+                            Vec4  dUVec         = NVSFeedbackParams.InClipmapLevels[dSlot].lightUpAndCenterY;
+                            Vec4  dDVec         = NVSFeedbackParams.InClipmapLevels[dSlot].lightDirAndExtrusion;
+                            Bool  isRadialSel   = (dFlags & 16u) != 0u;
+                            Bool  radialOk      = true;
+                            Float radialNorm    = 0.0;
+                            if (isRadialSel) {
+                                Vec4 camRad = NVSFeedbackParams.InClipmapLevels[dSlot].lightViewToWorldCol3;
+                                if (camRad.w > 0.0001) {
+                                    Vec3  camRel = worldPos - camRad.xyz;
+                                    Float rDist  = Sqrt(Dot(camRel, camRel));
+                                    if (rDist > (camRad.w * 1.02)) {
+                                        radialOk = false;
+                                    } else {
+                                        radialNorm = rDist / Max(camRad.w * 0.98, 0.0001);
+                                    }
+                                }
+                            }
+
+                            UInt  dMinMip     = Min(ExtractViewMinMip(dFlags), dMaxActiveMip);
+                            Float dLodBias    = ExtractViewLodBias(dFlags);
+                            UInt  desiredMip  = dMinMip;
+                            Float mipLodFrac  = 0.0;
+                            if (dMaxActiveMip > dMinMip && screenPixelWorld > 0.0 && dBaseTexel > 0.00000001) {
+                                Float ratio      = screenPixelWorld / Max(dBaseTexel, 0.0000001);
+                                Float rawLod     = Log2(Max(ratio, 0.0625)) + screenScaleCfg.z + dLodBias;
+                                Float clampedLod = Clamp(rawLod, Float(dMinMip), Float(dMaxActiveMip));
+                                desiredMip       = Min(Max(UInt(Floor(clampedLod)), dMinMip), dMaxActiveMip);
+                                mipLodFrac       = clampedLod - Float(desiredMip);
+                            }
+
+                            UInt  mipPagesAxis = Max(dPagesAxis >> desiredMip, 1u);
+                            Float mipPageSize  = dExtent / Float(mipPagesAxis);
+                            Int   origin0X     = NVSFeedbackParams.InClipmapLevels[dSlot].snappedOriginPageX;
+                            Int   origin0Y     = NVSFeedbackParams.InClipmapLevels[dSlot].snappedOriginPageY;
+                            Int   snapMipX     = (mipPagesAxis == 1u) ? 0 : OrthoSnapOriginAtMip(origin0X, desiredMip);
+                            Int   snapMipY     = (mipPagesAxis == 1u) ? 0 : OrthoSnapOriginAtMip(origin0Y, desiredMip);
+                            Int   halfPages    = Int(mipPagesAxis >> 1u);
+                            Int   limAxis      = Int(mipPagesAxis);
+                            Float projX        = Dot(worldPos, dRVec.xyz);
+                            Float projY        = Dot(worldPos, dUVec.xyz);
+                            Float projZ        = Dot(worldPos, dDVec.xyz);
+                            Float centerOffX   = (mipPagesAxis == 1u) ? dRVec.w : 0.0;
+                            Float centerOffY   = (mipPagesAxis == 1u) ? dUVec.w : 0.0;
+                            Float centerShift  = (mipPagesAxis == 1u) ? 0.5 : 0.0;
+                            Float exactPageX   = ((projX - centerOffX) / mipPageSize) + centerShift;
+                            Float exactPageY   = ((projY - centerOffY) / mipPageSize) + centerShift;
+                            Float flX          = Floor(exactPageX);
+                            Float flY          = Floor(exactPageY);
+                            Int   wPageX       = Int(flX);
+                            Int   wPageY       = Int(flY);
+                            Int   relX         = wPageX - (snapMipX - halfPages);
+                            Int   relY         = wPageY - (snapMipY - halfPages);
+
+                            if (radialOk &&
+                                relX >= 0 && relX < limAxis && relY >= 0 && relY < limAxis &&
+                                projZ >= NVSFeedbackParams.InClipmapLevels[dSlot].casterMinZ &&
+                                projZ <= NVSFeedbackParams.InClipmapLevels[dSlot].casterMaxZ) {
+                                anyViewAccepted = 1u;
+
+                                UInt  camDistBonus = Clamp(UInt(1536.0 / (1.0 + camDist * 0.15)), 0u, 1536u);
+                                UInt  dirPrio      = (16384u - (cLvl * 2048u)) + camDistBonus;
+                                UInt  dirBuck      = (cLvl == 0u) ? 0u : ((cLvl == 1u) ? 1u : 2u);
+                                UInt  pbWord       = dirPrio | (((3u - dirBuck) & 3u) << 16u) | ((cLvl & 15u) << 20u);
+                                Float fracX        = exactPageX - flX;
+                                Float fracY        = exactPageY - flY;
+
+                                for (UInt pIdx = 0u; pIdx < maxPass; pIdx = pIdx + 1u) {
+                                    Int  dx         = 0;
+                                    Int  dy         = 0;
+                                    UInt emitSample = 0u;
+                                    if (pIdx == 0u) {
+                                        emitSample = 1u;
+                                    } else if (pIdx == 1u) {
+                                        if (fracX < borderMargin) { dx = -1; emitSample = 1u; }
+                                    } else if (pIdx == 2u) {
+                                        if (fracX > (1.0 - borderMargin)) { dx = 1; emitSample = 1u; }
+                                    } else if (pIdx == 3u) {
+                                        if (fracY < borderMargin) { dy = -1; emitSample = 1u; }
+                                    } else if (pIdx == 4u) {
+                                        if (fracY > (1.0 - borderMargin)) { dy = 1; emitSample = 1u; }
+                                    } else if (pIdx == 5u) {
+                                        if (fracX < borderMargin && fracY < borderMargin) { dx = -1; dy = -1; emitSample = 1u; }
+                                    } else if (pIdx == 6u) {
+                                        if (fracX > (1.0 - borderMargin) && fracY < borderMargin) { dx = 1; dy = -1; emitSample = 1u; }
+                                    } else if (pIdx == 7u) {
+                                        if (fracX < borderMargin && fracY > (1.0 - borderMargin)) { dx = -1; dy = 1; emitSample = 1u; }
+                                    } else if (pIdx == 8u) {
+                                        if (fracX > (1.0 - borderMargin) && fracY > (1.0 - borderMargin)) { dx = 1; dy = 1; emitSample = 1u; }
+                                    }
+
+                                    if (emitSample != 0u) {
+                                        Int candWX = wPageX + dx;
+                                        Int candWY = wPageY + dy;
+                                        Int cRelX  = candWX - (snapMipX - halfPages);
+                                        Int cRelY  = candWY - (snapMipY - halfPages);
+                                        if (cRelX >= 0 && cRelX < limAxis && cRelY >= 0 && cRelY < limAxis) {
+                                            UInt vx0 = 0u;
+                                            UInt vy0 = 0u;
+                                            if (mipPagesAxis > 1u) {
+                                                Int modX = (candWX + halfPages) % limAxis;
+                                                if (modX < 0) { modX = modX + limAxis; }
+                                                Int modY = (candWY + halfPages) % limAxis;
+                                                if (modY < 0) { modY = modY + limAxis; }
+                                                vx0 = UInt(modX);
+                                                vy0 = UInt(modY);
+                                            }
+                                            UInt pCoord = PackSparseCoord(vx0, vy0, desiredMip, dViewGen);
+                                            EmitSparseCandidatePixel(dSlot, pCoord, pbWord, 4u, hashCap);
+                                        }
+                                    }
+                                }
+
+                                // Guard intra-level mip boundary against depth-buffer vs interpolated worldPos quantization
+                                if (mipLodFrac > 0.95 && (desiredMip + 1u) <= dMaxActiveMip) {
+                                    UInt  nextMip       = desiredMip + 1u;
+                                    UInt  nextPagesAxis = Max(dPagesAxis >> nextMip, 1u);
+                                    Float nextPageSize  = dExtent / Float(nextPagesAxis);
+                                    Int   nextSnapX     = OrthoSnapOriginAtMip(origin0X, nextMip);
+                                    Int   nextSnapY     = OrthoSnapOriginAtMip(origin0Y, nextMip);
+                                    Int   nextHalf      = Int(nextPagesAxis >> 1u);
+                                    Int   nextLim       = Int(nextPagesAxis);
+                                    Int   nWX           = Int(Floor(projX / nextPageSize));
+                                    Int   nWY           = Int(Floor(projY / nextPageSize));
+                                    Int   nRelX         = nWX - (nextSnapX - nextHalf);
+                                    Int   nRelY         = nWY - (nextSnapY - nextHalf);
+                                    if (nRelX >= 0 && nRelX < nextLim && nRelY >= 0 && nRelY < nextLim) {
+                                        Int mX = (nWX + nextHalf) % nextLim;
+                                        if (mX < 0) { mX = mX + nextLim; }
+                                        Int mY = (nWY + nextHalf) % nextLim;
+                                        if (mY < 0) { mY = mY + nextLim; }
+                                        UInt nextCoord = PackSparseCoord(UInt(mX), UInt(mY), nextMip, dViewGen);
+                                        EmitSparseCandidatePixel(dSlot, nextCoord, pbWord, 4u, hashCap);
+                                    }
+                                } else if (mipLodFrac < 0.05 && desiredMip > dMinMip) {
+                                    UInt  fineMip       = desiredMip - 1u;
+                                    UInt  finePagesAxis = Max(dPagesAxis >> fineMip, 1u);
+                                    Float finePageSize  = dExtent / Float(finePagesAxis);
+                                    Int   fineSnapX     = OrthoSnapOriginAtMip(origin0X, fineMip);
+                                    Int   fineSnapY     = OrthoSnapOriginAtMip(origin0Y, fineMip);
+                                    Int   fineHalf      = Int(finePagesAxis >> 1u);
+                                    Int   fineLim       = Int(finePagesAxis);
+                                    Int   fWX           = Int(Floor(projX / finePageSize));
+                                    Int   fWY           = Int(Floor(projY / finePageSize));
+                                    Int   fRelX         = fWX - (fineSnapX - fineHalf);
+                                    Int   fRelY         = fWY - (fineSnapY - fineHalf);
+                                    if (fRelX >= 0 && fRelX < fineLim && fRelY >= 0 && fRelY < fineLim) {
+                                        Int fmX = (fWX + fineHalf) % fineLim;
+                                        if (fmX < 0) { fmX = fmX + fineLim; }
+                                        Int fmY = (fWY + fineHalf) % fineLim;
+                                        if (fmY < 0) { fmY = fmY + fineLim; }
+                                        UInt fineCoord = PackSparseCoord(UInt(fmX), UInt(fmY), fineMip, dViewGen);
+                                        EmitSparseCandidatePixel(dSlot, fineCoord, pbWord, 4u, hashCap);
+                                    }
+                                }
+
+                                // Always request 1x1 Coarse Root Fallback Anchor for this clipmap level
+                                if (dMipCount > 1u && desiredMip < (dMipCount - 1u)) {
+                                    UInt rootMip   = dMipCount - 1u;
+                                    UInt rootPrio  = 32768u + dirPrio;
+                                    UInt rootPB    = (rootPrio & 65535u) | (3u << 16u) | ((cLvl & 15u) << 20u);
+                                    UInt rootCoord = PackSparseCoord(0u, 0u, rootMip, dViewGen);
+                                    EmitSparseCandidatePixel(dSlot, rootCoord, rootPB, 12u, hashCap);
+                                }
+
+                                Float halfExt = Max(0.5 * dExtent, 0.0001);
+                                Float dxNorm  = Abs(projX - dRVec.w) / halfExt;
+                                Float dyNorm  = Abs(projY - dUVec.w) / halfExt;
+                                Float maxNorm = Max(dxNorm, dyNorm);
+                                if (isRadialSel) {
+                                    maxNorm = Max(maxNorm, radialNorm);
+                                }
+                                Float startR = Clamp(NVSFeedbackParams.InClipmapLevels[dSlot].transitionAndPadding.x, 0.5, 0.99);
+                                if (maxNorm < startR) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (worldSurfaceValid != 0u) {
+                UInt prevStat = 0u;
+                if (anyViewAccepted != 0u) {
+                    InterlockedAdd(gs_TileStats[6], 1u, prevStat);
+                } else {
+                    InterlockedAdd(gs_TileStats[5], 1u, prevStat);
+                }
+            }
+
+            if (disableTileDedup == 0u) {
+                GroupMemoryBarrierWithGroupSync();
+                UInt tv0 = gs_SparseTileView[tid];
+                UInt tc0 = gs_SparseTileCoord[tid];
+                if (tv0 < 4294967294u && tc0 != 4294967295u) {
+                    InsertGlobalSparseRequest(tv0, tc0, gs_SparseTilePrio[tid], gs_SparseTileFlags[tid], hashCap);
+                }
+                UInt tv1 = gs_SparseTileView[tid + 64u];
+                UInt tc1 = gs_SparseTileCoord[tid + 64u];
+                if (tv1 < 4294967294u && tc1 != 4294967295u) {
+                    InsertGlobalSparseRequest(tv1, tc1, gs_SparseTilePrio[tid + 64u], gs_SparseTileFlags[tid + 64u], hashCap);
+                }
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < 8u) {
+            UInt val = gs_TileStats[tid];
+            if (val > 0u) {
+                UInt prevT = 0u;
+                if (tid == 0u)      { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].examinedPixelCount,        val, prevT); }
+                else if (tid == 1u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].validDepthPixelCount,      val, prevT); }
+                else if (tid == 2u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].backgroundRejectedCount,   val, prevT); }
+                else if (tid == 3u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].invalidDepthRejectedCount, val, prevT); }
+                else if (tid == 4u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].frustumRejectedCount,      val, prevT); }
+                else if (tid == 5u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].outOfRangeRejectedCount,   val, prevT); }
+                else if (tid == 6u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].acceptedSurfacePixelCount, val, prevT); }
+                else if (tid == 7u) { InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].totalPageCandidateCount,   val, prevT); }
+            }
+        }
+
+        if (tid == 0u) {
+            UInt prevD = 0u;
+            if (gs_TileDedupCount > 0u) {
+                InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].tileDeduplicatedCount, gs_TileDedupCount, prevD);
+            }
+            if (gs_TileGlobalDupCount > 0u) {
+                InterlockedAdd(NVSFeedbackParams.OutFeedbackTelemetry[0u].globalDuplicateCount, gs_TileGlobalDupCount, prevD);
+            }
+        }
+    }
+}
