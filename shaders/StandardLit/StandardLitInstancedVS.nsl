@@ -1,13 +1,19 @@
 // =====================================================================
 //  StandardLitInstancedVS.nsl
-//  Northstar Graphics — Built-in GPU-Instanced Standard Lit Vertex Shader
+//  Northstar Graphics — Unified IA + NVG GPU-Instanced Standard Lit VS
 //
-//  Implements ShaderVariant::INSTANCED using Get(INSTANCE_WORLD_MATRIX)
-//  and exact cofactor adjugate normal transformation for non-uniform
-//  and negative-determinant (mirrored) instance transforms.
+//  Implements ShaderVariant::INSTANCED seamlessly across both geometry modes
+//  from a single shared ShaderSet and Material via Universal Reflection:
+//    - STANDARD    : Tier-1 GPU Instancing StructuredBuffer + IA vertex stream
+//    - VIRTUALIZED : Live PagePool cluster decompression + GPUScene transforms
 // =====================================================================
 
 STAGE VERTEX
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl")
+}
 
 INPUT_LAYOUT
 {
@@ -18,6 +24,7 @@ INPUT_LAYOUT
     Get(VERTEX_UV0)
     Get(VERTEX_UV1)
     Get(VERTEX_COLOR)
+    Get(VERTEX_ID)
     Get(INSTANCE_ID)
 }
 
@@ -38,6 +45,7 @@ PROPERTY Transforms
     Buffer Matrices
     {
         Get(VP_MATRIX)
+        Get(GEOMETRY_MODE)
     }
     StructuredBuffer Instances
     {
@@ -51,30 +59,77 @@ SHADER
     {
         STAGE_OUTPUT o;
 
-        Mat4 instWorld = Transforms.Instances[input.INSTANCE_ID].INSTANCE_WORLD_MATRIX;
-        Vec4 wp        = Mul(instWorld, Vec4(input.VERTEX_POSITION, 1.0));
+        UInt geomMode = Transforms.Matrices.GEOMETRY_MODE;
+        Bool useNvg   = (geomMode == 1u) && NVGIsAvailable() && NVGHasActiveCluster(input.INSTANCE_ID);
 
-        Vec3  c0       = Mul(instWorld, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
-        Vec3  c1       = Mul(instWorld, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
-        Vec3  c2       = Mul(instWorld, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
-        Vec3  c1xc2    = Cross(c1, c2);
-        Vec3  c2xc0    = Cross(c2, c0);
-        Vec3  c0xc1    = Cross(c0, c1);
-        Float detSign  = (Dot(c0, c1xc2) < 0.0) ? -1.0 : 1.0;
+        Vec3 worldPos = Vec3(0.0, 0.0, 0.0);
+        Vec3 worldNrm = Vec3(0.0, 1.0, 0.0);
+        Vec3 worldTan = Vec3(1.0, 0.0, 0.0);
+        Vec3 worldBit = Vec3(0.0, 0.0, 1.0);
+        Vec2 uv0      = input.VERTEX_UV0;
+        Vec2 uv1      = input.VERTEX_UV1;
+        Vec4 vertCol  = input.VERTEX_COLOR;
 
-        Vec3 worldNrm  = Normalize((c1xc2 * input.VERTEX_NORMAL.x + c2xc0 * input.VERTEX_NORMAL.y + c0xc1 * input.VERTEX_NORMAL.z) * detSign);
-        Vec3 rawTan    = Mul(instWorld, Vec4(input.VERTEX_TANGENT, 0.0)).xyz;
-        Vec3 worldTan  = Normalize(rawTan - worldNrm * Dot(rawTan, worldNrm));
-        Vec3 worldBit  = Normalize(Mul(instWorld, Vec4(input.VERTEX_BITANGENT, 0.0)).xyz);
+        if (useNvg)
+        {
+            NVGVisibleCluster vc  = NVGLoadVisibleCluster(input.INSTANCE_ID);
+            NVGClusterHeader  hdr = NVGDecodeClusterHeader(vc);
+            if (input.VERTEX_ID < hdr.vertexCount)
+            {
+                NVGDecodedVertex v = NVGDecodeLocalVertex(hdr, input.VERTEX_ID);
+                Mat4 world = NVGGetObjectWorldMatrix(vc.objectSlot);
+                worldPos   = NVGTransformPosition(world, v.position);
+                worldNrm   = NVGTransformNormal(world, v.normal);
+                Vec3 rawT  = NVGTransformDirection(world, v.tangent);
+                worldTan   = Normalize(rawT - worldNrm * Dot(rawT, worldNrm));
+                worldBit   = NVGTransformDirection(world, v.bitangent);
+                uv0        = v.uv0;
+                uv1        = v.uv1;
+                vertCol    = v.color;
+            }
+            else
+            {
+                Mat4 instWorld = Transforms.Instances[0u].INSTANCE_WORLD_MATRIX;
+                worldPos       = NVGTransformPosition(instWorld, input.VERTEX_POSITION);
+                worldNrm       = NVGTransformNormal(instWorld, input.VERTEX_NORMAL);
+                Vec3 rawT      = NVGTransformDirection(instWorld, input.VERTEX_TANGENT);
+                worldTan       = Normalize(rawT - worldNrm * Dot(rawT, worldNrm));
+                worldBit       = NVGTransformDirection(instWorld, input.VERTEX_BITANGENT);
+            }
+        }
+        else
+        {
+            Mat4 instWorld = Transforms.Instances[input.INSTANCE_ID].INSTANCE_WORLD_MATRIX;
+            worldPos       = NVGTransformPosition(instWorld, input.VERTEX_POSITION);
+            worldNrm       = NVGTransformNormal(instWorld, input.VERTEX_NORMAL);
+            Vec3 rawT      = NVGTransformDirection(instWorld, input.VERTEX_TANGENT);
+            worldTan       = Normalize(rawT - worldNrm * Dot(rawT, worldNrm));
+            worldBit       = NVGTransformDirection(instWorld, input.VERTEX_BITANGENT);
+        }
 
-        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, wp);
-        o.WORLD_POSITION = wp.xyz;
+        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, Vec4(worldPos, 1.0));
+        o.WORLD_POSITION = worldPos;
         o.WORLD_NORMAL   = worldNrm;
         o.TANGENT        = worldTan;
         o.BITANGENT      = worldBit;
-        o.UV0            = input.VERTEX_UV0;
-        o.UV1            = input.VERTEX_UV1;
-        o.COLOR          = input.VERTEX_COLOR;
+        o.UV0            = uv0;
+        o.UV1            = uv1;
+
+        if (NVGIsDebugModeActive())
+        {
+            if (useNvg)
+            {
+                o.COLOR = Vec4(NVGApplyDebugColor(vertCol.rgb, input.INSTANCE_ID, worldNrm), 1.0);
+            }
+            else
+            {
+                o.COLOR = Vec4(0.18, 0.85, 0.45, 1.0);
+            }
+        }
+        else
+        {
+            o.COLOR = vertCol;
+        }
 
         return o;
     }

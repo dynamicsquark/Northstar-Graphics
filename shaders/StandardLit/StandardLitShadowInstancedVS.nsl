@@ -1,15 +1,26 @@
 // =====================================================================
 //  StandardLitShadowInstancedVS.nsl
-//  Northstar Graphics — Built-in GPU-Instanced NVS Shadow Caster Vertex Shader
+//  Northstar Graphics — Unified IA + NVG GPU-Instanced NVS Shadow Caster VS
+//
+//  Implements ShaderVariant::INSTANCED for PassType::SHADOW across both
+//  GeometryMode::STANDARD and GeometryMode::VIRTUALIZED from one ShaderSet:
+//    - STANDARD    : Tier-1 GPU Instancing StructuredBuffer + NVS slice & bias
+//    - VIRTUALIZED : Live PagePool cluster decode + NVS shadow page view
 // =====================================================================
 
 STAGE VERTEX
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl")
+}
 
 INPUT_LAYOUT
 {
     Get(VERTEX_POSITION)
     Get(VERTEX_NORMAL)
     Get(VERTEX_UV0)
+    Get(VERTEX_ID)
     Get(INSTANCE_ID)
 }
 
@@ -25,6 +36,7 @@ PROPERTY Transforms
     Buffer Matrices
     {
         Get(VP_MATRIX)
+        Get(GEOMETRY_MODE)
         Get(NVS_PHYSICAL_PAGE_INDEX)
         Get(NVS_DEPTH_BIAS_NDC)
         Get(NVS_NORMAL_BIAS_WORLD)
@@ -41,43 +53,62 @@ SHADER
     {
         STAGE_OUTPUT o;
 
-        Mat4  instWorld  = Transforms.Instances[input.INSTANCE_ID].INSTANCE_WORLD_MATRIX;
-        Mat4  vpMatrix   = Transforms.Matrices.VP_MATRIX;
-        UInt  pageSlice  = Transforms.Matrices.NVS_PHYSICAL_PAGE_INDEX;
-        Float depthBias  = Transforms.Matrices.NVS_DEPTH_BIAS_NDC;
-        Float normalBias = Transforms.Matrices.NVS_NORMAL_BIAS_WORLD;
+        UInt geomMode   = Transforms.Matrices.GEOMETRY_MODE;
+        Bool useNvg     = (geomMode == 1u) && NVGIsAvailable() && NVGHasActiveCluster(input.INSTANCE_ID);
+        Bool nvgHandled = false;
 
-        Vec4 worldPos = Mul(instWorld, Vec4(input.VERTEX_POSITION, 1.0));
-        if (normalBias != 0.0)
-        {
-            Vec3 c0       = Mul(instWorld, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
-            Vec3 c1       = Mul(instWorld, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
-            Vec3 c2       = Mul(instWorld, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
-            Vec3 c1xc2    = Cross(c1, c2);
-            Vec3 nrmWorld = (c1xc2 * input.VERTEX_NORMAL.x) +
-                            (Cross(c2, c0) * input.VERTEX_NORMAL.y) +
-                            (Cross(c0, c1) * input.VERTEX_NORMAL.z);
-            if (Dot(c0, c1xc2) < 0.0)
-            {
-                nrmWorld = -nrmWorld;
-            }
-            Float nLenSq = Dot(nrmWorld, nrmWorld);
-            if (nLenSq > 0.000001)
-            {
-                nrmWorld     = nrmWorld * Rsqrt(nLenSq);
-                worldPos.xyz = worldPos.xyz - nrmWorld * normalBias;
-            }
-        }
-
-        Vec4 clipPos = Mul(vpMatrix, worldPos);
-        if (depthBias != 0.0 && clipPos.w > 0.0)
-        {
-            clipPos.z = clipPos.z + (depthBias * clipPos.w);
-        }
-
-        o.CLIP_POSITION             = clipPos;
+        o.CLIP_POSITION             = Vec4(0.0, 0.0, 0.0, 1.0);
         o.UV0                       = input.VERTEX_UV0;
-        o.RENDER_TARGET_ARRAY_INDEX = pageSlice;
+        o.RENDER_TARGET_ARRAY_INDEX = 0u;
+
+        if (useNvg)
+        {
+            NVGVisibleCluster vc  = NVGLoadVisibleCluster(input.INSTANCE_ID);
+            NVGClusterHeader  hdr = NVGDecodeClusterHeader(vc);
+            if (input.VERTEX_ID < hdr.vertexCount)
+            {
+                NVGDecodedVertex  v        = NVGDecodeLocalVertex(hdr, input.VERTEX_ID);
+                Mat4              world    = NVGGetObjectWorldMatrix(vc.objectSlot);
+                Vec3              worldPos = NVGTransformPosition(world, v.position);
+                Vec3              worldNrm = NVGTransformNormal(world, v.normal);
+                NVGShadowPageView pageView = NVGLoadShadowPageView(vc.shadowPageViewIndex);
+                if (pageView.physicalPageSlice != NVGInvalidIndex())
+                {
+                    o.CLIP_POSITION             = NVGProjectToShadowPage(pageView, worldPos, worldNrm);
+                    o.UV0                       = v.uv0;
+                    o.RENDER_TARGET_ARRAY_INDEX = pageView.physicalPageSlice;
+                    nvgHandled                  = true;
+                }
+            }
+        }
+
+        if (!nvgHandled)
+        {
+            UInt  instIdx    = useNvg ? 0u : input.INSTANCE_ID;
+            Mat4  instWorld  = Transforms.Instances[instIdx].INSTANCE_WORLD_MATRIX;
+            Mat4  vpMatrix   = Transforms.Matrices.VP_MATRIX;
+            UInt  pageSlice  = Transforms.Matrices.NVS_PHYSICAL_PAGE_INDEX;
+            Float depthBias  = Transforms.Matrices.NVS_DEPTH_BIAS_NDC;
+            Float normalBias = Transforms.Matrices.NVS_NORMAL_BIAS_WORLD;
+
+            Vec3 worldPos = NVGTransformPosition(instWorld, input.VERTEX_POSITION);
+            if (normalBias != 0.0)
+            {
+                Vec3 worldNrm = NVGTransformNormal(instWorld, input.VERTEX_NORMAL);
+                worldPos      = worldPos - worldNrm * normalBias;
+            }
+
+            Vec4 clipPos = Mul(vpMatrix, Vec4(worldPos, 1.0));
+            if (depthBias != 0.0 && clipPos.w > 0.0)
+            {
+                clipPos.z = clipPos.z + (depthBias * clipPos.w);
+            }
+
+            o.CLIP_POSITION             = clipPos;
+            o.UV0                       = input.VERTEX_UV0;
+            o.RENDER_TARGET_ARRAY_INDEX = pageSlice;
+        }
+
         return o;
     }
 }

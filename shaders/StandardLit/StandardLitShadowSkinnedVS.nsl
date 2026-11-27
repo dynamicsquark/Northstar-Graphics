@@ -1,9 +1,19 @@
 // =====================================================================
 //  StandardLitShadowSkinnedVS.nsl
-//  Northstar Graphics — Built-in 4-Bone Skinned NVS Shadow Caster Vertex Shader
+//  Northstar Graphics — Unified IA + NVG 4-Bone Skinned NVS Shadow Caster VS
+//
+//  Implements ShaderVariant::SKINNED for PassType::SHADOW across both
+//  GeometryMode::STANDARD and GeometryMode::VIRTUALIZED from one ShaderSet:
+//    - STANDARD    : Hardware IA 4-bone LBS skinning + NVS slice & bias
+//    - VIRTUALIZED : Live PagePool skinned cluster decode + NVS shadow view
 // =====================================================================
 
 STAGE VERTEX
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl")
+}
 
 INPUT_LAYOUT
 {
@@ -16,6 +26,8 @@ INPUT_LAYOUT
     Get(VERTEX_COLOR)
     Get(VERTEX_BONE_INDICES)
     Get(VERTEX_BONE_WEIGHTS)
+    Get(VERTEX_ID)
+    Get(INSTANCE_ID)
 }
 
 OUTPUT_LAYOUT
@@ -31,6 +43,7 @@ PROPERTY Transforms
     {
         Get(WORLD_MATRIX)
         Get(VP_MATRIX)
+        Get(GEOMETRY_MODE)
         Get(NVS_PHYSICAL_PAGE_INDEX)
         Get(NVS_DEPTH_BIAS_NDC)
         Get(NVS_NORMAL_BIAS_WORLD)
@@ -45,10 +58,6 @@ PROPERTY Skeleton
         Get(BONE_COUNT)
         Get(SKINNING_REVISION)
     }
-    StructuredBuffer BonePalette
-    {
-        Get(GLOBAL_BONE_MATRIX)
-    }
 }
 
 SHADER
@@ -57,68 +66,73 @@ SHADER
     {
         STAGE_OUTPUT o;
 
-        Mat4  worldMatrix = Transforms.Matrices.WORLD_MATRIX;
-        Mat4  vpMatrix    = Transforms.Matrices.VP_MATRIX;
-        UInt  pageSlice   = Transforms.Matrices.NVS_PHYSICAL_PAGE_INDEX;
-        Float depthBias   = Transforms.Matrices.NVS_DEPTH_BIAS_NDC;
-        Float normalBias  = Transforms.Matrices.NVS_NORMAL_BIAS_WORLD;
+        UInt geomMode   = Transforms.Matrices.GEOMETRY_MODE;
+        Bool useNvg     = (geomMode == 1u) && NVGIsAvailable() && NVGHasActiveCluster(input.INSTANCE_ID);
+        Bool nvgHandled = false;
 
-        Vec4  rawW = input.VERTEX_BONE_WEIGHTS;
-        Float wSum = rawW.x + rawW.y + rawW.z + rawW.w;
-        Vec4  w    = (wSum > 0.0001) ? (rawW / wSum) : Vec4(1.0, 0.0, 0.0, 0.0);
-
-        UInt  boneOffset = Skeleton.SkinningInfo.BONE_PALETTE_OFFSET;
-        UInt  maxIdx     = Max(Skeleton.SkinningInfo.BONE_COUNT, 1u) - 1u;
-        UInt4 boneIdx    = input.VERTEX_BONE_INDICES;
-
-        Mat4 bone0 = Skeleton.BonePalette[boneOffset + Min(boneIdx.x, maxIdx)].GLOBAL_BONE_MATRIX;
-        Mat4 bone1 = Skeleton.BonePalette[boneOffset + Min(boneIdx.y, maxIdx)].GLOBAL_BONE_MATRIX;
-        Mat4 bone2 = Skeleton.BonePalette[boneOffset + Min(boneIdx.z, maxIdx)].GLOBAL_BONE_MATRIX;
-        Mat4 bone3 = Skeleton.BonePalette[boneOffset + Min(boneIdx.w, maxIdx)].GLOBAL_BONE_MATRIX;
-
-        Vec4 pos4            = Vec4(input.VERTEX_POSITION, 1.0);
-        Vec3 skinnedLocalPos = Mul(bone0, pos4).xyz * w.x +
-                               Mul(bone1, pos4).xyz * w.y +
-                               Mul(bone2, pos4).xyz * w.z +
-                               Mul(bone3, pos4).xyz * w.w;
-
-        Vec4 nrm4            = Vec4(input.VERTEX_NORMAL, 0.0);
-        Vec3 skinnedLocalNrm = Mul(bone0, nrm4).xyz * w.x +
-                               Mul(bone1, nrm4).xyz * w.y +
-                               Mul(bone2, nrm4).xyz * w.z +
-                               Mul(bone3, nrm4).xyz * w.w;
-
-        Vec4 worldPos = Mul(worldMatrix, Vec4(skinnedLocalPos, 1.0));
-        if (normalBias != 0.0)
-        {
-            Vec3 c0       = Mul(worldMatrix, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
-            Vec3 c1       = Mul(worldMatrix, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
-            Vec3 c2       = Mul(worldMatrix, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
-            Vec3 c1xc2    = Cross(c1, c2);
-            Vec3 nrmWorld = (c1xc2 * skinnedLocalNrm.x) +
-                            (Cross(c2, c0) * skinnedLocalNrm.y) +
-                            (Cross(c0, c1) * skinnedLocalNrm.z);
-            if (Dot(c0, c1xc2) < 0.0)
-            {
-                nrmWorld = -nrmWorld;
-            }
-            Float nLenSq = Dot(nrmWorld, nrmWorld);
-            if (nLenSq > 0.000001)
-            {
-                nrmWorld     = nrmWorld * Rsqrt(nLenSq);
-                worldPos.xyz = worldPos.xyz - nrmWorld * normalBias;
-            }
-        }
-
-        Vec4 clipPos = Mul(vpMatrix, worldPos);
-        if (depthBias != 0.0 && clipPos.w > 0.0)
-        {
-            clipPos.z = clipPos.z + (depthBias * clipPos.w);
-        }
-
-        o.CLIP_POSITION             = clipPos;
+        o.CLIP_POSITION             = Vec4(0.0, 0.0, 0.0, 1.0);
         o.UV0                       = input.VERTEX_UV0;
-        o.RENDER_TARGET_ARRAY_INDEX = pageSlice;
+        o.RENDER_TARGET_ARRAY_INDEX = 0u;
+
+        if (useNvg)
+        {
+            NVGVisibleCluster vc  = NVGLoadVisibleCluster(input.INSTANCE_ID);
+            NVGClusterHeader  hdr = NVGDecodeClusterHeader(vc);
+            if (input.VERTEX_ID < hdr.vertexCount)
+            {
+                NVGDecodedVertex v = NVGDecodeLocalVertex(hdr, input.VERTEX_ID);
+                NVGApplyVertexSkinning(vc.bonePaletteOffset, vc.boneCount, v);
+
+                Mat4              world    = NVGGetObjectWorldMatrix(vc.objectSlot);
+                Vec3              worldPos = NVGTransformPosition(world, v.position);
+                Vec3              worldNrm = NVGTransformNormal(world, v.normal);
+                NVGShadowPageView pageView = NVGLoadShadowPageView(vc.shadowPageViewIndex);
+                if (pageView.physicalPageSlice != NVGInvalidIndex())
+                {
+                    o.CLIP_POSITION             = NVGProjectToShadowPage(pageView, worldPos, worldNrm);
+                    o.UV0                       = v.uv0;
+                    o.RENDER_TARGET_ARRAY_INDEX = pageView.physicalPageSlice;
+                    nvgHandled                  = true;
+                }
+            }
+        }
+
+        if (!nvgHandled)
+        {
+            Mat4  worldMatrix = Transforms.Matrices.WORLD_MATRIX;
+            Mat4  vpMatrix    = Transforms.Matrices.VP_MATRIX;
+            UInt  pageSlice   = Transforms.Matrices.NVS_PHYSICAL_PAGE_INDEX;
+            Float depthBias   = Transforms.Matrices.NVS_DEPTH_BIAS_NDC;
+            Float normalBias  = Transforms.Matrices.NVS_NORMAL_BIAS_WORLD;
+
+            Vec3 localPos = input.VERTEX_POSITION;
+            Vec3 localNrm = input.VERTEX_NORMAL;
+            NVGApplyLinearBlendSkinningPosNormal(
+                Skeleton.SkinningInfo.BONE_PALETTE_OFFSET,
+                Skeleton.SkinningInfo.BONE_COUNT,
+                input.VERTEX_BONE_INDICES,
+                input.VERTEX_BONE_WEIGHTS,
+                localPos,
+                localNrm);
+
+            Vec3 worldPos = NVGTransformPosition(worldMatrix, localPos);
+            if (normalBias != 0.0)
+            {
+                Vec3 worldNrm = NVGTransformNormal(worldMatrix, localNrm);
+                worldPos      = worldPos - worldNrm * normalBias;
+            }
+
+            Vec4 clipPos = Mul(vpMatrix, Vec4(worldPos, 1.0));
+            if (depthBias != 0.0 && clipPos.w > 0.0)
+            {
+                clipPos.z = clipPos.z + (depthBias * clipPos.w);
+            }
+
+            o.CLIP_POSITION             = clipPos;
+            o.UV0                       = input.VERTEX_UV0;
+            o.RENDER_TARGET_ARRAY_INDEX = pageSlice;
+        }
+
         return o;
     }
 }

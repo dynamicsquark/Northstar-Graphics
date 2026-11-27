@@ -142,14 +142,11 @@ set(NORTHSTAR_STANDARD_LIT_ENTRIES
     "StandardLitInstancedVS"
     "StandardLitSkinnedVS"
     "StandardLitInstancedSkinnedVS"
-    "StandardLitNVGVS"
     "StandardLitPS"
     "StandardLitShadowVS"
     "StandardLitShadowInstancedVS"
     "StandardLitShadowSkinnedVS"
     "StandardLitShadowInstancedSkinnedVS"
-    "StandardLitNVGShadowVS"
-    "StandardLitShadowPS"
 )
 
 set(_NORTHSTAR_STDLIT_GEN_DIR "${NORTHSTAR_GEN_ROOT_DIR}/shaders/StandardLit")

@@ -1,12 +1,19 @@
 // =====================================================================
 //  StandardLitInstancedSkinnedVS.nsl
-//  Northstar Graphics — Built-in GPU-Instanced 4-Bone Skinned Vertex Shader
+//  Northstar Graphics — Unified IA + NVG GPU-Instanced Skinned Standard Lit VS
 //
-//  Implements ShaderVariant::INSTANCED_SKINNED via per-instance world
-//  matrices, bone palette offsets, and cofactor adjugate normal transforms.
+//  Implements ShaderVariant::INSTANCED_SKINNED seamlessly across both geometry
+//  modes from a single shared ShaderSet and Material via Universal Reflection:
+//    - STANDARD    : Tier-1 GPU Instancing + 4-bone LBS skinning via BonePalette
+//    - VIRTUALIZED : Live PagePool skinned cluster decode + GPUScene transforms
 // =====================================================================
 
 STAGE VERTEX
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl")
+}
 
 INPUT_LAYOUT
 {
@@ -19,6 +26,7 @@ INPUT_LAYOUT
     Get(VERTEX_COLOR)
     Get(VERTEX_BONE_INDICES)
     Get(VERTEX_BONE_WEIGHTS)
+    Get(VERTEX_ID)
     Get(INSTANCE_ID)
 }
 
@@ -39,6 +47,7 @@ PROPERTY Transforms
     Buffer Matrices
     {
         Get(VP_MATRIX)
+        Get(GEOMETRY_MODE)
     }
     StructuredBuffer Instances
     {
@@ -48,75 +57,143 @@ PROPERTY Transforms
     }
 }
 
-PROPERTY Skeleton
-{
-    StructuredBuffer BonePalette
-    {
-        Get(GLOBAL_BONE_MATRIX)
-    }
-}
-
 SHADER
 {
+    void SkinIAVertex(
+        UInt       boneOffset,
+        UInt       boneCount,
+        UInt4      boneIdx,
+        Vec4       rawWeights,
+        inout Vec3 ioPos,
+        inout Vec3 ioNrm,
+        inout Vec3 ioTan,
+        inout Vec3 ioBit)
+    {
+        if (boneCount == 0u)
+        {
+            return;
+        }
+        UInt palCount  = 0u;
+        UInt palStride = 0u;
+        GetDimensions(NVGResources.BonePalette, palCount, palStride);
+        if (palCount == 0u || boneOffset >= palCount)
+        {
+            return;
+        }
+
+        Float wSum   = rawWeights.x + rawWeights.y + rawWeights.z + rawWeights.w;
+        Vec4  w      = (wSum > 0.0001) ? (rawWeights / wSum) : Vec4(1.0, 0.0, 0.0, 0.0);
+        UInt  maxIdx = Min(boneCount - 1u, (palCount - 1u) - boneOffset);
+
+        Mat4 bone0 = NVGResources.BonePalette[boneOffset + Min(boneIdx.x, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone1 = NVGResources.BonePalette[boneOffset + Min(boneIdx.y, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone2 = NVGResources.BonePalette[boneOffset + Min(boneIdx.z, maxIdx)].GLOBAL_BONE_MATRIX;
+        Mat4 bone3 = NVGResources.BonePalette[boneOffset + Min(boneIdx.w, maxIdx)].GLOBAL_BONE_MATRIX;
+
+        Vec4 p4 = Vec4(ioPos, 1.0);
+        Vec4 n4 = Vec4(ioNrm, 0.0);
+        Vec4 t4 = Vec4(ioTan, 0.0);
+        Vec4 b4 = Vec4(ioBit, 0.0);
+
+        ioPos = Mul(bone0, p4).xyz * w.x + Mul(bone1, p4).xyz * w.y + Mul(bone2, p4).xyz * w.z + Mul(bone3, p4).xyz * w.w;
+        ioNrm = Normalize(Mul(bone0, n4).xyz * w.x + Mul(bone1, n4).xyz * w.y + Mul(bone2, n4).xyz * w.z + Mul(bone3, n4).xyz * w.w);
+        ioTan = Normalize(Mul(bone0, t4).xyz * w.x + Mul(bone1, t4).xyz * w.y + Mul(bone2, t4).xyz * w.z + Mul(bone3, t4).xyz * w.w);
+        ioBit = Normalize(Mul(bone0, b4).xyz * w.x + Mul(bone1, b4).xyz * w.y + Mul(bone2, b4).xyz * w.z + Mul(bone3, b4).xyz * w.w);
+    }
+
     STAGE_OUTPUT Main(STAGE_INPUT input)
     {
         STAGE_OUTPUT o;
 
-        Mat4 instWorld = Transforms.Instances[input.INSTANCE_ID].INSTANCE_WORLD_MATRIX;
-        UInt bOff      = Transforms.Instances[input.INSTANCE_ID].INSTANCE_BONE_OFFSET;
-        UInt bCnt      = Transforms.Instances[input.INSTANCE_ID].INSTANCE_BONE_COUNT;
+        UInt geomMode = Transforms.Matrices.GEOMETRY_MODE;
+        Bool useNvg   = (geomMode == 1u) && NVGIsAvailable() && NVGHasActiveCluster(input.INSTANCE_ID);
 
-        Vec3 skinnedPos = input.VERTEX_POSITION;
-        Vec3 skinnedNrm = input.VERTEX_NORMAL;
-        Vec3 skinnedTan = input.VERTEX_TANGENT;
-        Vec3 skinnedBit = input.VERTEX_BITANGENT;
+        Vec3 worldPos = Vec3(0.0, 0.0, 0.0);
+        Vec3 worldNrm = Vec3(0.0, 1.0, 0.0);
+        Vec3 worldTan = Vec3(1.0, 0.0, 0.0);
+        Vec3 worldBit = Vec3(0.0, 0.0, 1.0);
+        Vec2 uv0      = input.VERTEX_UV0;
+        Vec2 uv1      = input.VERTEX_UV1;
+        Vec4 vertCol  = input.VERTEX_COLOR;
 
-        if (bCnt > 0u)
+        if (useNvg)
         {
-            Vec4  rawW = input.VERTEX_BONE_WEIGHTS;
-            Float wSum = rawW.x + rawW.y + rawW.z + rawW.w;
-            Vec4  w    = (wSum > 0.0001) ? (rawW / wSum) : Vec4(1.0, 0.0, 0.0, 0.0);
+            NVGVisibleCluster vc  = NVGLoadVisibleCluster(input.INSTANCE_ID);
+            NVGClusterHeader  hdr = NVGDecodeClusterHeader(vc);
+            if (input.VERTEX_ID < hdr.vertexCount)
+            {
+                NVGDecodedVertex v = NVGDecodeLocalVertex(hdr, input.VERTEX_ID);
+                NVGApplyVertexSkinning(vc.bonePaletteOffset, vc.boneCount, v);
 
-            UInt  maxIdx = bCnt - 1u;
-            UInt4 idx    = input.VERTEX_BONE_INDICES;
-            Mat4  bone0  = Skeleton.BonePalette[bOff + Min(idx.x, maxIdx)].GLOBAL_BONE_MATRIX;
-            Mat4  bone1  = Skeleton.BonePalette[bOff + Min(idx.y, maxIdx)].GLOBAL_BONE_MATRIX;
-            Mat4  bone2  = Skeleton.BonePalette[bOff + Min(idx.z, maxIdx)].GLOBAL_BONE_MATRIX;
-            Mat4  bone3  = Skeleton.BonePalette[bOff + Min(idx.w, maxIdx)].GLOBAL_BONE_MATRIX;
+                Mat4 world = NVGGetObjectWorldMatrix(vc.objectSlot);
+                worldPos   = NVGTransformPosition(world, v.position);
+                worldNrm   = NVGTransformNormal(world, v.normal);
+                Vec3 rawT  = NVGTransformDirection(world, v.tangent);
+                worldTan   = Normalize(rawT - worldNrm * Dot(rawT, worldNrm));
+                worldBit   = NVGTransformDirection(world, v.bitangent);
+                uv0        = v.uv0;
+                uv1        = v.uv1;
+                vertCol    = v.color;
+            }
+            else
+            {
+                Mat4 instWorld = Transforms.Instances[0u].INSTANCE_WORLD_MATRIX;
+                UInt bOff      = Transforms.Instances[0u].INSTANCE_BONE_OFFSET;
+                UInt bCnt      = Transforms.Instances[0u].INSTANCE_BONE_COUNT;
+                Vec3 skPos     = input.VERTEX_POSITION;
+                Vec3 skNrm     = input.VERTEX_NORMAL;
+                Vec3 skTan     = input.VERTEX_TANGENT;
+                Vec3 skBit     = input.VERTEX_BITANGENT;
+                SkinIAVertex(bOff, bCnt, input.VERTEX_BONE_INDICES, input.VERTEX_BONE_WEIGHTS, skPos, skNrm, skTan, skBit);
 
-            Vec4 p4    = Vec4(input.VERTEX_POSITION, 1.0);
-            skinnedPos = Mul(bone0, p4).xyz * w.x + Mul(bone1, p4).xyz * w.y + Mul(bone2, p4).xyz * w.z + Mul(bone3, p4).xyz * w.w;
+                worldPos  = NVGTransformPosition(instWorld, skPos);
+                worldNrm  = NVGTransformNormal(instWorld, skNrm);
+                Vec3 rawT = NVGTransformDirection(instWorld, skTan);
+                worldTan  = Normalize(rawT - worldNrm * Dot(rawT, worldNrm));
+                worldBit  = NVGTransformDirection(instWorld, skBit);
+            }
+        }
+        else
+        {
+            Mat4 instWorld = Transforms.Instances[input.INSTANCE_ID].INSTANCE_WORLD_MATRIX;
+            UInt bOff      = Transforms.Instances[input.INSTANCE_ID].INSTANCE_BONE_OFFSET;
+            UInt bCnt      = Transforms.Instances[input.INSTANCE_ID].INSTANCE_BONE_COUNT;
+            Vec3 skPos     = input.VERTEX_POSITION;
+            Vec3 skNrm     = input.VERTEX_NORMAL;
+            Vec3 skTan     = input.VERTEX_TANGENT;
+            Vec3 skBit     = input.VERTEX_BITANGENT;
+            SkinIAVertex(bOff, bCnt, input.VERTEX_BONE_INDICES, input.VERTEX_BONE_WEIGHTS, skPos, skNrm, skTan, skBit);
 
-            Vec4 n4    = Vec4(input.VERTEX_NORMAL, 0.0);
-            skinnedNrm = Normalize(Mul(bone0, n4).xyz * w.x + Mul(bone1, n4).xyz * w.y + Mul(bone2, n4).xyz * w.z + Mul(bone3, n4).xyz * w.w);
-
-            Vec4 t4    = Vec4(input.VERTEX_TANGENT, 0.0);
-            skinnedTan = Normalize(Mul(bone0, t4).xyz * w.x + Mul(bone1, t4).xyz * w.y + Mul(bone2, t4).xyz * w.z + Mul(bone3, t4).xyz * w.w);
-
-            Vec4 b4    = Vec4(input.VERTEX_BITANGENT, 0.0);
-            skinnedBit = Normalize(Mul(bone0, b4).xyz * w.x + Mul(bone1, b4).xyz * w.y + Mul(bone2, b4).xyz * w.z + Mul(bone3, b4).xyz * w.w);
+            worldPos  = NVGTransformPosition(instWorld, skPos);
+            worldNrm  = NVGTransformNormal(instWorld, skNrm);
+            Vec3 rawT = NVGTransformDirection(instWorld, skTan);
+            worldTan  = Normalize(rawT - worldNrm * Dot(rawT, worldNrm));
+            worldBit  = NVGTransformDirection(instWorld, skBit);
         }
 
-        Vec4  wp       = Mul(instWorld, Vec4(skinnedPos, 1.0));
-        Vec3  c0       = Mul(instWorld, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
-        Vec3  c1       = Mul(instWorld, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
-        Vec3  c2       = Mul(instWorld, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
-        Vec3  c1xc2    = Cross(c1, c2);
-        Float detSign  = (Dot(c0, c1xc2) < 0.0) ? -1.0 : 1.0;
-
-        Vec3 worldNrm  = Normalize((c1xc2 * skinnedNrm.x + Cross(c2, c0) * skinnedNrm.y + Cross(c0, c1) * skinnedNrm.z) * detSign);
-        Vec3 rawTan    = Mul(instWorld, Vec4(skinnedTan, 0.0)).xyz;
-        Vec3 worldTan  = Normalize(rawTan - worldNrm * Dot(rawTan, worldNrm));
-        Vec3 worldBit  = Normalize(Mul(instWorld, Vec4(skinnedBit, 0.0)).xyz);
-
-        o.WORLD_POSITION = wp.xyz;
-        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, wp);
+        o.WORLD_POSITION = worldPos;
+        o.CLIP_POSITION  = Mul(Transforms.Matrices.VP_MATRIX, Vec4(worldPos, 1.0));
         o.WORLD_NORMAL   = worldNrm;
         o.TANGENT        = worldTan;
         o.BITANGENT      = worldBit;
-        o.UV0            = input.VERTEX_UV0;
-        o.UV1            = input.VERTEX_UV1;
-        o.COLOR          = input.VERTEX_COLOR;
+        o.UV0            = uv0;
+        o.UV1            = uv1;
+
+        if (NVGIsDebugModeActive())
+        {
+            if (useNvg)
+            {
+                o.COLOR = Vec4(NVGApplyDebugColor(vertCol.rgb, input.INSTANCE_ID, worldNrm), 1.0);
+            }
+            else
+            {
+                o.COLOR = Vec4(0.18, 0.85, 0.45, 1.0);
+            }
+        }
+        else
+        {
+            o.COLOR = vertCol;
+        }
 
         return o;
     }

@@ -560,45 +560,41 @@ int main(int argc, char** argv)
         }
     });
 
-    // 4. Load StandardLit Shaders (Standard IA for ground + Zero-Decode NVG Vertex-Pulling for Virtualized meshes)
+    // 4. Load Unified IA + NVG Hybrid StandardLit Shaders (one shared 4-variant ShaderSet across STANDARD & VIRTUALIZED meshes)
     const std::filesystem::path shaderDir = RuntimeSession::ResolveExecutableDirectory() / "shaders" / "StandardLit";
-    auto vsStd        = LoadCompiledShader(engine, shaderDir / "StandardLitVS_hlsl12.nsc", "StandardLitVS");
-    auto vsInst       = LoadCompiledShader(engine, shaderDir / "StandardLitInstancedVS_hlsl12.nsc", "StandardLitInstancedVS");
-    auto vsNvg        = LoadCompiledShader(engine, shaderDir / "StandardLitNVGVS_hlsl12.nsc", "StandardLitNVGVS");
-    auto psStd        = LoadCompiledShader(engine, shaderDir / "StandardLitPS_hlsl12.nsc", "StandardLitPS");
-    auto shadowVsStd  = LoadCompiledShader(engine, shaderDir / "StandardLitShadowVS_hlsl12.nsc", "StandardLitShadowVS");
-    auto shadowVsInst = LoadCompiledShader(engine, shaderDir / "StandardLitShadowInstancedVS_hlsl12.nsc", "StandardLitShadowInstancedVS");
-    auto shadowVsNvg  = LoadCompiledShader(engine, shaderDir / "StandardLitNVGShadowVS_hlsl12.nsc", "StandardLitNVGShadowVS");
+    auto vsStd             = LoadCompiledShader(engine, shaderDir / "StandardLitVS_hlsl12.nsc", "StandardLitVS");
+    auto vsInst            = LoadCompiledShader(engine, shaderDir / "StandardLitInstancedVS_hlsl12.nsc", "StandardLitInstancedVS");
+    auto vsSkin            = LoadCompiledShader(engine, shaderDir / "StandardLitSkinnedVS_hlsl12.nsc", "StandardLitSkinnedVS");
+    auto vsInstSkin        = LoadCompiledShader(engine, shaderDir / "StandardLitInstancedSkinnedVS_hlsl12.nsc", "StandardLitInstancedSkinnedVS");
+    auto psStd             = LoadCompiledShader(engine, shaderDir / "StandardLitPS_hlsl12.nsc", "StandardLitPS");
+    auto shadowVsStd       = LoadCompiledShader(engine, shaderDir / "StandardLitShadowVS_hlsl12.nsc", "StandardLitShadowVS");
+    auto shadowVsInst      = LoadCompiledShader(engine, shaderDir / "StandardLitShadowInstancedVS_hlsl12.nsc", "StandardLitShadowInstancedVS");
+    auto shadowVsSkin      = LoadCompiledShader(engine, shaderDir / "StandardLitShadowSkinnedVS_hlsl12.nsc", "StandardLitShadowSkinnedVS");
+    auto shadowVsInstSkin  = LoadCompiledShader(engine, shaderDir / "StandardLitShadowInstancedSkinnedVS_hlsl12.nsc", "StandardLitShadowInstancedSkinnedVS");
 
-    if (!vsStd || !vsInst || !vsNvg || !psStd || !shadowVsStd || !shadowVsInst || !shadowVsNvg)
+    if (!vsStd || !vsInst || !vsSkin || !vsInstSkin || !psStd ||
+        !shadowVsStd || !shadowVsInst || !shadowVsSkin || !shadowVsInstSkin)
     {
         std::cerr << "[Studio] Missing compiled StandardLit shaders in '" << shaderDir.string() << "'.\n";
         return 1;
     }
 
     ShaderSetDesc geomSetDesc{};
-    geomSetDesc.name                  = "StudioStandardGeometrySet";
-    geomSetDesc.vertexShader          = vsStd.get();
-    geomSetDesc.instancedVertexShader = vsInst.get();
-    geomSetDesc.pixelShader           = psStd.get();
+    geomSetDesc.name                         = "StudioUnifiedStandardLitGeometry";
+    geomSetDesc.vertexShader                 = vsStd.get();
+    geomSetDesc.instancedVertexShader        = vsInst.get();
+    geomSetDesc.skinnedVertexShader          = vsSkin.get();
+    geomSetDesc.instancedSkinnedVertexShader = vsInstSkin.get();
+    geomSetDesc.pixelShader                  = psStd.get();
     auto geomShaderSet = MakeUniqueShaderSet(engine, geomSetDesc);
 
     ShaderSetDesc shadowSetDesc{};
-    shadowSetDesc.name                  = "StudioStandardShadowSet";
-    shadowSetDesc.vertexShader          = shadowVsStd.get();
-    shadowSetDesc.instancedVertexShader = shadowVsInst.get();
+    shadowSetDesc.name                         = "StudioUnifiedStandardLitShadow";
+    shadowSetDesc.vertexShader                 = shadowVsStd.get();
+    shadowSetDesc.instancedVertexShader        = shadowVsInst.get();
+    shadowSetDesc.skinnedVertexShader          = shadowVsSkin.get();
+    shadowSetDesc.instancedSkinnedVertexShader = shadowVsInstSkin.get();
     auto shadowShaderSet = MakeUniqueShaderSet(engine, shadowSetDesc);
-
-    ShaderSetDesc nvgGeomSetDesc{};
-    nvgGeomSetDesc.name         = "StudioNVGGeometrySet";
-    nvgGeomSetDesc.vertexShader = vsNvg.get();
-    nvgGeomSetDesc.pixelShader  = psStd.get();
-    auto nvgGeomShaderSet = MakeUniqueShaderSet(engine, nvgGeomSetDesc);
-
-    ShaderSetDesc nvgShadowSetDesc{};
-    nvgShadowSetDesc.name         = "StudioNVGShadowSet";
-    nvgShadowSetDesc.vertexShader = shadowVsNvg.get();
-    auto nvgShadowShaderSet = MakeUniqueShaderSet(engine, nvgShadowSetDesc);
 
     auto whiteTex   = CreateSolidTexture2D(engine, 255, 255, 255, 255, true);
     auto flatNrmTex = CreateSolidTexture2D(engine, 128, 128, 255, 255, false);
@@ -644,12 +640,6 @@ int main(int argc, char** argv)
     auto floorMat = MakeUniqueMaterial(engine, matDesc);
     configureStudioMaterial(*floorMat, floorTex.get(), true, Vec4(1.0f, 1.0f, 1.0f, 1.0f), 0.05f, 0.80f);
 
-    MaterialDesc nvgMatDesc{};
-    nvgMatDesc.geometryShaderSet = nvgGeomShaderSet.get();
-    nvgMatDesc.shadowShaderSet   = nvgShadowShaderSet.get();
-    nvgMatDesc.cullMode          = CullMode::Back;
-    nvgMatDesc.blendMode         = BlendMode::Opaque;
-
     constexpr SIZE_T kMaterialCount = 4;
     std::vector<UniqueMaterial> galleryMaterials;
     const Vec4 palette[kMaterialCount] = {
@@ -660,7 +650,7 @@ int main(int argc, char** argv)
     };
     for (SIZE_T i = 0; i < kMaterialCount; ++i)
     {
-        auto m = MakeUniqueMaterial(engine, nvgMatDesc);
+        auto m = MakeUniqueMaterial(engine, matDesc);
         configureStudioMaterial(*m, whiteTex.get(), false, palette[i], (i < 2) ? 0.88f : 0.12f, 0.16f + 0.18f * static_cast<FLOAT32>(i));
         galleryMaterials.push_back(std::move(m));
     }

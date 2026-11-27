@@ -233,26 +233,27 @@ LIBRARY
             vc.boneCount           = 0u;
             vc.drawBucketIndex     = invalidIdx;
             vc.viewDepthKey        = 0.0;
-            return vc;
         }
+        else
+        {
+            vc.objectSlot          = NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
+            vc.clusterId           = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_ID;
+            vc.physicalPageIndex   = NVGResources.VisibleClusters[visIdx].NVG_VIS_PHYSICAL_PAGE_INDEX;
+            vc.clusterWordOffset   = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_WORD_OFFSET;
+            vc.virtualPageId       = NVGResources.VisibleClusters[visIdx].NVG_VIS_VIRTUAL_PAGE_ID;
 
-        vc.objectSlot          = NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
-        vc.clusterId           = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_ID;
-        vc.physicalPageIndex   = NVGResources.VisibleClusters[visIdx].NVG_VIS_PHYSICAL_PAGE_INDEX;
-        vc.clusterWordOffset   = NVGResources.VisibleClusters[visIdx].NVG_VIS_CLUSTER_WORD_OFFSET;
-        vc.virtualPageId       = NVGResources.VisibleClusters[visIdx].NVG_VIS_VIRTUAL_PAGE_ID;
+            UInt lodAndFlags       = NVGResources.VisibleClusters[visIdx].NVG_VIS_LOD_AND_FLAGS;
+            vc.lodLevel            = lodAndFlags & 255u;
+            vc.flags               = (lodAndFlags >> 8u) & 255u;
+            vc.shadowPageViewIndex = (lodAndFlags >> 16u) & 65535u;
 
-        UInt lodAndFlags       = NVGResources.VisibleClusters[visIdx].NVG_VIS_LOD_AND_FLAGS;
-        vc.lodLevel            = lodAndFlags & 255u;
-        vc.flags               = (lodAndFlags >> 8u) & 255u;
-        vc.shadowPageViewIndex = (lodAndFlags >> 16u) & 65535u;
-
-        vc.geometricError      = NVGResources.VisibleClusters[visIdx].NVG_VIS_GEOMETRIC_ERROR;
-        vc.materialId          = NVGResources.VisibleClusters[visIdx].NVG_VIS_MATERIAL_ID;
-        vc.bonePaletteOffset   = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_OFFSET;
-        vc.boneCount           = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_COUNT;
-        vc.drawBucketIndex     = NVGResources.VisibleClusters[visIdx].NVG_VIS_DRAW_BUCKET_INDEX;
-        vc.viewDepthKey        = NVGResources.VisibleClusters[visIdx].NVG_VIS_VIEW_DEPTH_KEY;
+            vc.geometricError      = NVGResources.VisibleClusters[visIdx].NVG_VIS_GEOMETRIC_ERROR;
+            vc.materialId          = NVGResources.VisibleClusters[visIdx].NVG_VIS_MATERIAL_ID;
+            vc.bonePaletteOffset   = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_OFFSET;
+            vc.boneCount           = NVGResources.VisibleClusters[visIdx].NVG_VIS_BONE_COUNT;
+            vc.drawBucketIndex     = NVGResources.VisibleClusters[visIdx].NVG_VIS_DRAW_BUCKET_INDEX;
+            vc.viewDepthKey        = NVGResources.VisibleClusters[visIdx].NVG_VIS_VIEW_DEPTH_KEY;
+        }
         return vc;
     }
 

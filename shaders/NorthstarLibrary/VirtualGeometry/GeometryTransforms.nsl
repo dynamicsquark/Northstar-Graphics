@@ -56,13 +56,15 @@ LIBRARY
             v.depthBiasNdc      = 0.0;
             v.normalBiasWorld   = 0.0;
             v.texelWorldSize    = 0.0;
-            return v;
         }
-        v.worldToPageClip   = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_VP_MATRIX;
-        v.physicalPageSlice = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_SLICE;
-        v.depthBiasNdc      = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_DEPTH_BIAS;
-        v.normalBiasWorld   = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_NORMAL_BIAS;
-        v.texelWorldSize    = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_TEXEL_SIZE;
+        else
+        {
+            v.worldToPageClip   = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_VP_MATRIX;
+            v.physicalPageSlice = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_SLICE;
+            v.depthBiasNdc      = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_DEPTH_BIAS;
+            v.normalBiasWorld   = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_NORMAL_BIAS;
+            v.texelWorldSize    = NVGResources.ShadowPageViews[shadowPageViewIndex].NVG_SHADOW_PAGE_TEXEL_SIZE;
+        }
         return v;
     }
 
