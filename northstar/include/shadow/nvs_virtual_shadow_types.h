@@ -4550,13 +4550,26 @@ namespace Northstar
         NVS_PATCH_NVG_VISIBLE_CLUSTER_COUNT  = 28u, // UInt (4B)
         NVS_PATCH_NVG_VISIBLE_CLUSTER_OFFSET = 29u, // UInt (4B)
         NVS_PATCH_GPU_SCENE_OBJECT_SLOT      = 30u, // UInt (4B)
+        NVS_PATCH_NVG_DRAW_CONTEXT_ID        = 31u, // UInt (4B)
 
-        NVS_PATCH_INSTANCE_WORLD_MATRIX    = 32u, // Mat4 (64B)
-        NVS_PATCH_INSTANCE_ID              = 33u, // UInt (4B)
-        NVS_PATCH_INSTANCE_CUSTOM_DATA     = 34u, // UInt (4B)
-        NVS_PATCH_INSTANCE_BONE_OFFSET     = 35u, // UInt (4B)
-        NVS_PATCH_INSTANCE_BONE_COUNT      = 36u  // UInt (4B)
+        NVS_PATCH_INSTANCE_WORLD_MATRIX      = 32u, // Mat4 (64B)
+        NVS_PATCH_INSTANCE_ID                = 33u, // UInt (4B)
+        NVS_PATCH_INSTANCE_CUSTOM_DATA       = 34u, // UInt (4B)
+        NVS_PATCH_INSTANCE_BONE_OFFSET       = 35u, // UInt (4B)
+        NVS_PATCH_INSTANCE_BONE_COUNT        = 36u, // UInt (4B)
+        NVS_PATCH_INSTANCE_PREV_WORLD_MATRIX = 37u, // Mat4 (64B)
+
+        NVS_PATCH_PREV_WORLD_MATRIX          = 40u, // Mat4 (64B)
+        NVS_PATCH_PREV_VIEW_MATRIX           = 41u, // Mat4 (64B)
+        NVS_PATCH_PREV_PROJECTION_MATRIX     = 42u, // Mat4 (64B)
+        NVS_PATCH_PREV_VP_MATRIX             = 43u  // Mat4 (64B)
     };
+
+    inline constexpr BOOL IsNVSInstancePatchSemantic(UINT32 semanticId) noexcept
+    {
+        return (semanticId >= NVS_PATCH_INSTANCE_WORLD_MATRIX) &&
+               (semanticId <= NVS_PATCH_INSTANCE_PREV_WORLD_MATRIX);
+    }
 
     struct alignas(16) NVSDrawGroupFieldPatch
     {

@@ -85,6 +85,146 @@ namespace Northstar
         return true;
     }
 
+    BOOL CoreBufferManager::ResizeGPUBufferPreservingData(GPUBuffer* buffer, UINT32 newElementCount)
+    {
+        if (!m_backend || !IsManagedBuffer(buffer) || newElementCount == 0 || buffer->GetStride() == 0)
+        {
+            return false;
+        }
+
+        const UINT64 totalBytes64 = static_cast<UINT64>(newElementCount) * static_cast<UINT64>(buffer->GetStride());
+        if (totalBytes64 == 0 || totalBytes64 > 0x7FFFFFFFULL)
+        {
+            return false;
+        }
+
+        const UINT64 copyBytes = (std::min<UINT64>)(buffer->GetByteSize(), totalBytes64);
+        const NativeHandle oldHandle = buffer->GetNativeHandle();
+
+        GPUBufferDesc newDesc{};
+        newDesc.elementCount = newElementCount;
+        newDesc.stride       = buffer->GetStride();
+        newDesc.usage        = buffer->GetUsage();
+        newDesc.initialData  = nullptr;
+        newDesc.debugName    = buffer->GetDebugName();
+
+        const NativeHandle newHandle = m_backend->CreateGPUBuffer(newDesc);
+        if (newHandle == 0)
+        {
+            return false;
+        }
+
+        if (oldHandle != 0 && copyBytes > 0ull)
+        {
+            if (!m_backend->CopyGPUBufferRegion(newHandle, 0ull, oldHandle, 0ull, copyBytes))
+            {
+                m_backend->DestroyGPUBuffer(newHandle);
+                return false;
+            }
+        }
+
+        if (oldHandle != 0)
+        {
+            m_backend->DestroyGPUBuffer(oldHandle);
+            m_retiredNativeHandles.push_back(oldHandle);
+        }
+
+        buffer->Initialize(newDesc, newHandle);
+        return true;
+    }
+
+    BOOL CoreBufferManager::ResizeGPUBufferWithSpans(
+        GPUBuffer*               buffer,
+        UINT32                   newElementCount,
+        const void*              fillInitialData,
+        const GPUBufferCopySpan* spans,
+        UINT32                   spanCount)
+    {
+        if (!m_backend || !IsManagedBuffer(buffer) || newElementCount == 0 || buffer->GetStride() == 0)
+        {
+            return false;
+        }
+        if (spanCount > 0u && spans == nullptr)
+        {
+            return false;
+        }
+
+        const UINT64 totalBytes64 = static_cast<UINT64>(newElementCount) * static_cast<UINT64>(buffer->GetStride());
+        if (totalBytes64 == 0ull || totalBytes64 > 0x7FFFFFFFULL)
+        {
+            return false;
+        }
+
+        const UINT64 srcTotalBytes  = buffer->GetByteSize();
+        const NativeHandle oldHandle = buffer->GetNativeHandle();
+        for (UINT32 i = 0u; i < spanCount; ++i)
+        {
+            const GPUBufferCopySpan& sp = spans[i];
+            if (sp.byteSize == 0ull) continue;
+            if (oldHandle == 0 ||
+                sp.srcOffset > srcTotalBytes || sp.byteSize > (srcTotalBytes - sp.srcOffset) ||
+                sp.dstOffset > totalBytes64  || sp.byteSize > (totalBytes64 - sp.dstOffset))
+            {
+                return false;
+            }
+        }
+
+        GPUBufferDesc newDesc{};
+        newDesc.elementCount = newElementCount;
+        newDesc.stride       = buffer->GetStride();
+        newDesc.usage        = buffer->GetUsage();
+        newDesc.initialData  = fillInitialData;
+        newDesc.debugName    = buffer->GetDebugName();
+
+        const NativeHandle newHandle = m_backend->CreateGPUBuffer(newDesc);
+        if (newHandle == 0)
+        {
+            return false;
+        }
+
+        for (UINT32 i = 0u; i < spanCount; ++i)
+        {
+            const GPUBufferCopySpan& sp = spans[i];
+            if (sp.byteSize == 0ull) continue;
+            if (!m_backend->CopyGPUBufferRegion(newHandle, sp.dstOffset, oldHandle, sp.srcOffset, sp.byteSize))
+            {
+                m_backend->DestroyGPUBuffer(newHandle);
+                return false;
+            }
+        }
+
+        if (oldHandle != 0)
+        {
+            m_backend->DestroyGPUBuffer(oldHandle);
+            m_retiredNativeHandles.push_back(oldHandle);
+        }
+
+        buffer->Initialize(newDesc, newHandle);
+        return true;
+    }
+
+    BOOL CoreBufferManager::CopyGPUBufferRegion(
+        GPUBuffer*       dstBuffer,
+        UINT64           dstOffset,
+        const GPUBuffer* srcBuffer,
+        UINT64           srcOffset,
+        UINT64           byteSize)
+    {
+        if (!m_backend || !IsManagedBuffer(dstBuffer) || !IsManagedBuffer(srcBuffer) ||
+            !dstBuffer->IsValid() || !srcBuffer->IsValid() || dstBuffer == srcBuffer || byteSize == 0ull)
+        {
+            return false;
+        }
+        const UINT64 dstTotal = dstBuffer->GetByteSize();
+        const UINT64 srcTotal = srcBuffer->GetByteSize();
+        if (dstOffset > dstTotal || byteSize > (dstTotal - dstOffset) ||
+            srcOffset > srcTotal || byteSize > (srcTotal - srcOffset))
+        {
+            return false;
+        }
+        return m_backend->CopyGPUBufferRegion(dstBuffer->GetNativeHandle(), dstOffset, srcBuffer->GetNativeHandle(), srcOffset, byteSize);
+    }
+
     BOOL CoreBufferManager::UpdateGPUBuffer(GPUBuffer* buffer, const void* data, UINT32 byteSize, UINT32 dstOffset)
     {
         if (!m_backend || !IsManagedBuffer(buffer) || !buffer->IsValid() || !data || byteSize == 0)

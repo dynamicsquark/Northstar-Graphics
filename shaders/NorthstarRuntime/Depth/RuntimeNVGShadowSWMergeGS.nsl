@@ -1,0 +1,36 @@
+// =====================================================================
+//  RuntimeNVGShadowSWMergeGS.nsl — NorthstarRuntime Internal Depth GS
+//  Pass-through Geometry Shader fallback for adapters without VS
+//  SV_RenderTargetArrayIndex support (forwards CLIP_POSITION, UV0,
+//  and RENDER_TARGET_ARRAY_INDEX to RuntimeNVGShadowSWMergePS).
+// =====================================================================
+
+STAGE GEOMETRY
+
+INPUT_LAYOUT {
+    Get(CLIP_POSITION)
+    Get(UV0)
+    Get(RENDER_TARGET_ARRAY_INDEX)
+}
+
+OUTPUT_LAYOUT {
+    Add(CLIP_POSITION)
+    Add(UV0)
+    Add(RENDER_TARGET_ARRAY_INDEX)
+}
+
+SHADER {
+    [maxvertexcount(3)]
+    [inputtopology("triangle")]
+    [outputtopology("triangle")]
+    void Main(STAGE_INPUT input[3], inout TriangleStream<STAGE_OUTPUT> stream) {
+        for (UInt i = 0u; i < 3u; i = i + 1u) {
+            STAGE_OUTPUT o;
+            o.CLIP_POSITION             = input[i].CLIP_POSITION;
+            o.UV0                       = input[i].UV0;
+            o.RENDER_TARGET_ARRAY_INDEX = input[i].RENDER_TARGET_ARRAY_INDEX;
+            Append(stream, o);
+        }
+        RestartStrip(stream);
+    }
+}

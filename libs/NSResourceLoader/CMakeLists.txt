@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NSResourceLoader VERSION 0.6.0 LANGUAGES CXX)
+project(NSResourceLoader VERSION 0.7.0 LANGUAGES CXX)
 
 add_library(NSResourceLoader STATIC
     src/ns_resource_loader.cpp

@@ -12,16 +12,18 @@ namespace Northstar
     // ==================== RENDER OBJECT DESC ====================
     struct RenderObjectDesc
     {
-        Mesh*              mesh                  = nullptr;
-        Material*          material              = nullptr;
-        LODGroup*          lodGroup              = nullptr;
-        Mat4               worldMatrix           = Mat4::Identity();
-        AABB               worldAABB             = {};
-        UINT32             layerMask             = 0x00000001u;
-        RenderObjectFlags  flags                 = RenderObjectFlags::VISIBLE        |
-                                                   RenderObjectFlags::FRUSTUM_CULL   |
-                                                   RenderObjectFlags::CAST_SHADOW    |
-                                                   RenderObjectFlags::RECEIVE_SHADOW |
-                                                   RenderObjectFlags::DISTANCE_CULL;
+        Mesh*                 mesh          = nullptr;
+        Material*             material      = nullptr;
+        Material* const*      materials     = nullptr;
+        UINT32                materialCount = 0u;
+        LODGroup*             lodGroup      = nullptr;
+        Mat4                  worldMatrix   = Mat4::Identity();
+        AABB                  worldAABB     = {};
+        UINT32                layerMask     = 0x00000001u;
+        RenderObjectFlags     flags         = RenderObjectFlags::VISIBLE        |
+                                              RenderObjectFlags::FRUSTUM_CULL   |
+                                              RenderObjectFlags::CAST_SHADOW    |
+                                              RenderObjectFlags::RECEIVE_SHADOW |
+                                              RenderObjectFlags::DISTANCE_CULL;
     };
 }

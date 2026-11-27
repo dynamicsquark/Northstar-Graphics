@@ -11,13 +11,13 @@
 //  Assigns valid, collision-free (set, binding) register coordinates
 //  strictly within the target API's real hardware/root-signature budgets:
 //
-//    HLSL12 (D3D12 Root Signature: space0 .. space3):
-//      - Arbitrary number of logical PROPERTY blocks supported.
-//      - CBV:     16 per space (b0..b15; b1 in space3 reserved for graphics
-//                 32-bit root constants -> 63 graphics CBVs / 64 compute CBVs).
-//      - SRV:     32 per space (t0..t31 -> 128 total SRVs across space0..space3).
-//      - Sampler: 16 per space (s0..s15 -> 64 total samplers across space0..space3).
-//      - UAV:     16 per space (u0..u15 -> 64 total UAVs across space0..space3).
+//    HLSL12 (D3D12 Root Signature: space0 .. space15):
+//      - Arbitrary number of logical PROPERTY blocks supported across 16 spaces.
+//      - CBV:     16 per space (b0..b15 -> 256 total CBVs across space0..space15;
+//                 internal 32-bit root constants reside in isolated space16).
+//      - SRV:     32 per space (t0..t31 -> 512 total SRVs across space0..space15).
+//      - Sampler: 16 per space (s0..s15 -> 256 total samplers across space0..space15).
+//      - UAV:     16 per space (u0..u15 -> 256 total UAVs across space0..space15).
 //
 //    HLSL11 (D3D11 SM 5.0: single register space space0):
 //      - Arbitrary number of logical PROPERTY blocks supported, packed into space0.
@@ -32,7 +32,7 @@ namespace NSL
     class BindingResolver
     {
     public:
-        static constexpr uint16_t kMaxSpaces          = 4;   // space0 .. space3
+        static constexpr uint16_t kMaxSpaces          = 16;  // space0 .. space15
         static constexpr uint16_t kMaxCBVBindings     = 16;  // b0 .. b15 per space
         static constexpr uint16_t kMaxSRVBindings     = 32;  // t0 .. t31 per space
         static constexpr uint16_t kMaxUAVBindings     = 16;  // u0 .. u15 per space

@@ -66,9 +66,10 @@ namespace Northstar
             const Vec3& objectWorldPos, 
             const Vec3& objectWorldScale,
             const Vec3& cameraWorldPos, 
-            FLOAT32 cameraFovY) const
+            FLOAT32     cameraFovY,
+            const Quat& objectWorldRot = Quat::Identity()) const
         {
-            Vec3 worldCenter = objectWorldPos + (m_localCenter * objectWorldScale);
+            Vec3 worldCenter = objectWorldPos + (objectWorldRot * (m_localCenter * objectWorldScale));
             
             FLOAT32 maxScale = std::max({
                 std::fabs(objectWorldScale.x),
@@ -99,14 +100,15 @@ namespace Northstar
             const Vec3& objectWorldPos, 
             const Vec3& objectWorldScale,
             const Vec3& cameraWorldPos, 
-            FLOAT32 cameraFovY_or_MaxDistance) const
+            FLOAT32     cameraFovY_or_MaxDistance,
+            const Quat& objectWorldRot = Quat::Identity()) const
         {
             if (m_levels.empty()) return -1;
 
             if (m_useScreenSize)
             {
                 FLOAT32 screenHeight = CalculateScreenRelativeHeight(
-                    objectWorldPos, objectWorldScale, cameraWorldPos, cameraFovY_or_MaxDistance);
+                    objectWorldPos, objectWorldScale, cameraWorldPos, cameraFovY_or_MaxDistance, objectWorldRot);
 
                 for (SIZE_T i = 0; i < m_levels.size(); ++i)
                 {
@@ -118,7 +120,7 @@ namespace Northstar
             }
             else
             {
-                Vec3 worldCenter = objectWorldPos + (m_localCenter * objectWorldScale);
+                Vec3 worldCenter = objectWorldPos + (objectWorldRot * (m_localCenter * objectWorldScale));
                 FLOAT32 distance = (worldCenter - cameraWorldPos).Length();
 
                 for (SIZE_T i = 0; i < m_levels.size(); ++i)

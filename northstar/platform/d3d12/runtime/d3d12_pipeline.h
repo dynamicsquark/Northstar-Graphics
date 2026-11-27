@@ -27,22 +27,31 @@ namespace Northstar
     {
         SIZE_T operator()(const IndirectRootBindingKey& k) const noexcept
         {
+            const UINT8 effSrv = (k.srvCount > 0u) ? k.srvCount : (k.hasPromotedSRV ? 1u : 0u);
             SIZE_T h = std::hash<bool>{}(k.enabled != FALSE);
+            h ^= std::hash<bool>{}(k.extended != FALSE) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<UINT32>{}(k.cbvCount) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= std::hash<bool>{}(k.hasPromotedSRV != FALSE) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<UINT32>{}(effSrv) + 0x9e3779b9 + (h << 6) + (h >> 2);
             if (k.enabled)
             {
-                for (UINT8 i = 0; i < 3; ++i)
+                const UINT8 maxCbv = k.extended ? 8u : 3u;
+                for (UINT8 i = 0; i < k.cbvCount && i < maxCbv; ++i)
                 {
                     h ^= std::hash<UINT16>{}(k.cbvSpace[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
                     h ^= std::hash<UINT16>{}(k.cbvSlot[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
                     h ^= std::hash<int>{}(static_cast<int>(k.cbvStage[i])) + 0x9e3779b9 + (h << 6) + (h >> 2);
                 }
-                if (k.hasPromotedSRV)
+                if (effSrv >= 1u)
                 {
                     h ^= std::hash<UINT16>{}(k.srvSpace) + 0x9e3779b9 + (h << 6) + (h >> 2);
                     h ^= std::hash<UINT16>{}(k.srvSlot) + 0x9e3779b9 + (h << 6) + (h >> 2);
                     h ^= std::hash<int>{}(static_cast<int>(k.srvStage)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                }
+                if (effSrv >= 2u)
+                {
+                    h ^= std::hash<UINT16>{}(k.srv2Space) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                    h ^= std::hash<UINT16>{}(k.srv2Slot) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                    h ^= std::hash<int>{}(static_cast<int>(k.srv2Stage)) + 0x9e3779b9 + (h << 6) + (h >> 2);
                 }
             }
             return h;
@@ -131,6 +140,84 @@ namespace Northstar
         }
     };
 
+    struct GraphicsRootLayoutKey
+    {
+        UINT16                 cbvSrvMask[5]  = { 0x000Fu, 0x000Fu, 0x000Fu, 0x000Fu, 0x000Fu };
+        UINT16                 samplerMask[5] = { 0x000Fu, 0x000Fu, 0x000Fu, 0x000Fu, 0x000Fu };
+        UINT16                 uavMask        = 0x000Fu;
+        IndirectRootBindingKey indirectKey{};
+
+        bool operator==(const GraphicsRootLayoutKey& o) const noexcept
+        {
+            for (UINT32 i = 0; i < 5u; ++i)
+            {
+                if (cbvSrvMask[i] != o.cbvSrvMask[i] || samplerMask[i] != o.samplerMask[i])
+                    return false;
+            }
+            return uavMask == o.uavMask && (indirectKey == o.indirectKey) != FALSE;
+        }
+    };
+
+    struct GraphicsRootLayoutKeyHash
+    {
+        SIZE_T operator()(const GraphicsRootLayoutKey& k) const noexcept
+        {
+            SIZE_T h = std::hash<UINT16>{}(k.uavMask);
+            for (UINT32 i = 0; i < 5u; ++i)
+            {
+                h ^= std::hash<UINT16>{}(k.cbvSrvMask[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<UINT16>{}(k.samplerMask[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            h ^= IndirectRootBindingKeyHash{}(k.indirectKey) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    struct GraphicsRootLayout
+    {
+        ComPtr<ID3D12RootSignature>    rootSignature;
+        ComPtr<ID3D12CommandSignature> indirectCommandSignature;
+        INT16                          cbvSrvParam[5][16]{};
+        INT16                          samplerParam[5][16]{};
+        INT16                          uavParam[16]{};
+        INT16                          rootConstantsParam  = -1;
+        INT16                          indirectCbvParam[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        INT16                          indirectSrvParam    = -1;
+        INT16                          indirectSrv2Param   = -1;
+        BOOL                           isExtendedIndirect  = false;
+        UINT32                         totalParamCount     = 0;
+        UINT32                         totalDwordCost      = 0;
+    };
+
+    struct ComputeRootLayoutKey
+    {
+        UINT16 cbvSrvUavMask = 0x000Fu;
+        UINT16 samplerMask   = 0x000Fu;
+
+        bool operator==(const ComputeRootLayoutKey& o) const noexcept
+        {
+            return cbvSrvUavMask == o.cbvSrvUavMask && samplerMask == o.samplerMask;
+        }
+    };
+
+    struct ComputeRootLayoutKeyHash
+    {
+        SIZE_T operator()(const ComputeRootLayoutKey& k) const noexcept
+        {
+            return (static_cast<SIZE_T>(k.cbvSrvUavMask) << 16) ^ static_cast<SIZE_T>(k.samplerMask);
+        }
+    };
+
+    struct ComputeRootLayout
+    {
+        ComPtr<ID3D12RootSignature> rootSignature;
+        INT16                       spaceParam[16]{};
+        INT16                       samplerParam[16]{};
+        INT16                       rootConstantsParam = -1;
+        UINT32                      totalParamCount    = 0;
+        UINT32                      totalDwordCost     = 0;
+    };
+
     class D3D12Pipeline
     {
     public:
@@ -140,14 +227,32 @@ namespace Northstar
         BOOL Initialize(D3D12DeviceContext& ctx);
         void Shutdown();
 
-        ID3D12RootSignature*    GetRootSignature()               const { return m_rootSignature.Get(); }
-        ID3D12RootSignature*    GetComputeRootSignature()        const { return m_computeRootSignature.Get(); }
-        ID3D12CommandSignature* GetDrawIndirectSignature()           const { return m_drawIndirectSignature.Get(); }
-        ID3D12CommandSignature* GetDrawIndexedIndirectSignature()    const { return m_drawIndexedIndirectSignature.Get(); }
-        ID3D12CommandSignature* GetNVSDrawIndexedIndirectSignature() const { return m_nvsDrawIndexedIndirectSignature.Get(); }
-        ID3D12CommandSignature* GetDispatchIndirectSignature()       const { return m_dispatchIndirectSignature.Get(); }
-        ID3D12RootSignature*    GetOrCreateIndirectRootSignature(ID3D12Device* device, const IndirectRootBindingKey& key);
-        ID3D12CommandSignature* GetOrCreateIndirectCommandSignature(ID3D12Device* device, const IndirectRootBindingKey& key);
+        ID3D12RootSignature*      GetRootSignature()               const { return m_defaultGraphicsLayout.rootSignature.Get(); }
+        ID3D12RootSignature*      GetComputeRootSignature()        const { return m_defaultComputeLayout.rootSignature.Get(); }
+        const GraphicsRootLayout* GetDefaultGraphicsRootLayout()   const { return &m_defaultGraphicsLayout; }
+        const ComputeRootLayout*  GetDefaultComputeRootLayout()    const { return &m_defaultComputeLayout; }
+        ID3D12CommandSignature*   GetDrawIndirectSignature()           const { return m_drawIndirectSignature.Get(); }
+        ID3D12CommandSignature*   GetDrawIndexedIndirectSignature()    const { return m_drawIndexedIndirectSignature.Get(); }
+        ID3D12CommandSignature*   GetNVSDrawIndexedIndirectSignature() const { return m_nvsDrawIndexedIndirectSignature.Get(); }
+        ID3D12CommandSignature*   GetDispatchIndirectSignature()       const { return m_dispatchIndirectSignature.Get(); }
+        const GraphicsRootLayout* GetOrCreateGraphicsRootLayout(
+            ID3D12Device*                 device,
+            const D3D12ResourceManager&   resMgr,
+            NativeHandle                  vsHandle,
+            NativeHandle                  psHandle,
+            NativeHandle                  gsHandle,
+            NativeHandle                  hsHandle,
+            NativeHandle                  dsHandle,
+            const IndirectRootBindingKey& indirectRootKey);
+        const ComputeRootLayout*  GetOrCreateComputeRootLayout(
+            ID3D12Device*               device,
+            const D3D12ResourceManager& resMgr,
+            NativeHandle                csHandle);
+        ID3D12CommandSignature*   GetOrCreateIndirectCommandSignatureForLayout(
+            ID3D12Device*     device,
+            GraphicsRootLayout& layout);
+        ID3D12RootSignature*      GetOrCreateIndirectRootSignature(ID3D12Device* device, const IndirectRootBindingKey& key);
+        ID3D12CommandSignature*   GetOrCreateIndirectCommandSignature(ID3D12Device* device, const IndirectRootBindingKey& key);
         ID3D12CommandSignature* GetCommandSignature(GPUIndirectCommandType type) const
         {
             switch (type)
@@ -181,9 +286,10 @@ namespace Northstar
             DXGI_FORMAT dsvFormat = DXGI_FORMAT_D32_FLOAT);
 
         ID3D12PipelineState* GetOrCreateComputePSO(
-            ID3D12Device* device,
+            ID3D12Device*               device,
             const D3D12ResourceManager& resMgr,
-            NativeHandle csHandle);
+            NativeHandle                csHandle,
+            const BackendCapabilities*  deviceCaps = nullptr);
 
         void   InvalidatePSOsForShader(NativeHandle shaderHandle, UINT64 retireFenceValue = 0);
         UINT32 GetPSOCacheHits() const { return m_psoCacheHits; }
@@ -207,41 +313,16 @@ namespace Northstar
         static_assert(kGraphicsDescriptorsPerSpaceTable == 48, "Graphics RootSignature CBV+SRV space table stride must be 48 descriptors.");
         static_assert(kDescriptorsPerSpaceTable == 64, "Compute RootSignature space table stride must be 64 descriptors (16 CBV + 32 SRV + 16 UAV).");
 
-        static constexpr UINT32 kMaxSpaces                         = 4;   // space0 .. space3
-        static constexpr UINT32 kGraphicsVertexSpaceParamBase      = 0;   // Params  0..3  (space0..3 Vertex CBV+SRV)
-        static constexpr UINT32 kGraphicsPixelSpaceParamBase       = 4;   // Params  4..7  (space0..3 Pixel CBV+SRV)
-        static constexpr UINT32 kGraphicsVertexSamplerParamBase    = 8;   // Params  8..11 (space0..3 Vertex Samplers)
-        static constexpr UINT32 kGraphicsPixelSamplerParamBase     = 12;  // Params 12..15 (space0..3 Pixel Samplers)
-        static constexpr UINT32 kGraphicsSamplerParamBase          = kGraphicsPixelSamplerParamBase;
-        static constexpr UINT32 kGraphicsRootConstantsParamIndex   = 16;  // Param  16     (4 DWORDs at b1, space3, ALL visibility)
-        static constexpr UINT32 kGraphicsGeometrySpaceParamBase    = 17;  // Params 17..20 (space0..3 Geometry CBV+SRV)
-        static constexpr UINT32 kGraphicsHullSpaceParamBase        = 21;  // Params 21..24 (space0..3 Hull CBV+SRV)
-        static constexpr UINT32 kGraphicsDomainSpaceParamBase      = 25;  // Params 25..28 (space0..3 Domain CBV+SRV)
-        static constexpr UINT32 kGraphicsGeometrySamplerParamBase  = 29;  // Params 29..32 (space0..3 Geometry Samplers)
-        static constexpr UINT32 kGraphicsHullSamplerParamBase      = 33;  // Params 33..36 (space0..3 Hull Samplers)
-        static constexpr UINT32 kGraphicsDomainSamplerParamBase    = 37;  // Params 37..40 (space0..3 Domain Samplers)
-        static constexpr UINT32 kGraphicsUAVSpaceParamBase         = 41;  // Params 41..44 (space0..3 Graphics UAVs u0..15, ALL visibility)
-        static constexpr UINT32 kGraphicsBaseRootParamCount        = 45;  // 48 DWORDs
-        static constexpr UINT32 kGraphicsIndirectCBVParamBase      = 45;  // Params 45..47 (Promoted per-draw Root CBVs 0..2)
-        static constexpr UINT32 kGraphicsIndirectCBVParamCount     = 3;
-        static constexpr UINT32 kGraphicsIndirectSRVParamIndex     = 48;  // Param  48     (Promoted per-batch Root SRV 0)
-        static constexpr UINT32 kGraphicsRootParamCount            = 49;  // 56 DWORDs <= 64 DWORD D3D12 limit
-        static constexpr UINT32 kNVSIndirectCommandByteStride      = 96;  // sizeof(NVSIndirectDrawCommand)
-        static constexpr UINT32 kComputeSamplerParamBase           = 4;   // Params  4..7  (space0..3 Samplers)
-        static constexpr UINT32 kComputeRootConstantsParamIndex    = 8;   // Param   8     (4 DWORDs at b0, space4)
-
-        static constexpr UINT32 GetGraphicsStageSamplerParamBase(ShaderStage stage) noexcept
-        {
-            switch (stage)
-            {
-            case ShaderStage::VERTEX:   return kGraphicsVertexSamplerParamBase;
-            case ShaderStage::PIXEL:    return kGraphicsPixelSamplerParamBase;
-            case ShaderStage::GEOMETRY: return kGraphicsGeometrySamplerParamBase;
-            case ShaderStage::HULL:     return kGraphicsHullSamplerParamBase;
-            case ShaderStage::DOMAIN:   return kGraphicsDomainSamplerParamBase;
-            default:                    return kGraphicsPixelSamplerParamBase;
-            }
-        }
+        static constexpr UINT32 kMaxSpaces                         = 16;  // space0 .. space15
+        static constexpr UINT32 kDefaultSpaces                     = 4;   // Fast default layout covers space0 .. space3
+        static constexpr UINT32 kInternalRootConstantsSpace        = 16;  // Isolated from NSL space0..space15
+        static constexpr UINT32 kInternalPlaceholderSpace          = 17;  // Isolated placeholder space for unused indirect root slots
+        static constexpr UINT32 kMaxRootSignatureDwords            = 64;  // D3D12 hardware root signature DWORD ceiling
+        static constexpr UINT32 kMaxRootParameters                 = 64;
+        static constexpr UINT32 kGraphicsIndirectCBVParamCount           = 3;
+        static constexpr UINT32 kExtendedGraphicsIndirectCBVParamCount   = 8;
+        static constexpr UINT32 kNVSIndirectCommandByteStride            = 96;  // sizeof(NVSIndirectDrawCommand)
+        static constexpr UINT32 kNVGExtendedIndirectCommandByteStride    = 144; // 36 DWORDs (VB+IB+8xCBV+2xSRV+DrawIndexed+3xCtx)
 
         static constexpr UINT32 kBackBufferCount          = 3;
         static constexpr UINT32 kMaxFramesInFlight        = 3;
@@ -284,6 +365,8 @@ namespace Northstar
         void                      FlushAllRetiredResources();
 
     private:
+        BOOL BuildGraphicsRootLayout(ID3D12Device* device, const GraphicsRootLayoutKey& key, GraphicsRootLayout& outLayout);
+        BOOL BuildComputeRootLayout(ID3D12Device* device, const ComputeRootLayoutKey& key, ComputeRootLayout& outLayout);
         BOOL CreateRootSignature(ID3D12Device* device);
         BOOL CreateComputeRootSignature(ID3D12Device* device);
         BOOL CreateCommandSignatures(ID3D12Device* device);
@@ -309,21 +392,17 @@ namespace Northstar
         };
 
         ID3D12Device*                    m_device = nullptr;
-        ComPtr<ID3D12RootSignature>      m_rootSignature;
-        ComPtr<ID3D12RootSignature>      m_computeRootSignature;
+        GraphicsRootLayout               m_defaultGraphicsLayout{};
+        ComputeRootLayout                m_defaultComputeLayout{};
         ComPtr<ID3D12CommandSignature>   m_drawIndirectSignature;
         ComPtr<ID3D12CommandSignature>   m_drawIndexedIndirectSignature;
         ComPtr<ID3D12CommandSignature>   m_nvsDrawIndexedIndirectSignature;
         ComPtr<ID3D12CommandSignature>   m_dispatchIndirectSignature;
-        struct IndirectRootSignatureEntry
-        {
-            ComPtr<ID3D12RootSignature>    rootSignature;
-            ComPtr<ID3D12CommandSignature> commandSignature;
-        };
 
-        std::unordered_map<PSOCacheKey, ComPtr<ID3D12PipelineState>, PSOCacheKeyHash>                      m_psoCache;
-        std::unordered_map<NativeHandle, ComPtr<ID3D12PipelineState>>                                      m_computePsoCache;
-        std::unordered_map<IndirectRootBindingKey, IndirectRootSignatureEntry, IndirectRootBindingKeyHash> m_indirectRootObjects;
+        std::unordered_map<PSOCacheKey, ComPtr<ID3D12PipelineState>, PSOCacheKeyHash>                   m_psoCache;
+        std::unordered_map<NativeHandle, ComPtr<ID3D12PipelineState>>                                   m_computePsoCache;
+        std::unordered_map<GraphicsRootLayoutKey, GraphicsRootLayout, GraphicsRootLayoutKeyHash>        m_graphicsRootLayouts;
+        std::unordered_map<ComputeRootLayoutKey, ComputeRootLayout, ComputeRootLayoutKeyHash>           m_computeRootLayouts;
 
         UINT32                      m_activeBB                = 0;
         UINT64                      m_currentRetireFenceValue = 0;

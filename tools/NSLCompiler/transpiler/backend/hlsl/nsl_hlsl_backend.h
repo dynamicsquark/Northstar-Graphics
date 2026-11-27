@@ -117,7 +117,10 @@ namespace NSL
             m_structuredAliasMap;
         // Qualified PROPERTY group names.
         std::unordered_set<std::string> m_groupNames;
-        bool      m_depthOnlyPixel = false;
+        // Double variable names in active scope (global/local) so unsuffixed decimal literals keep 64-bit IEEE-754 precision.
+        std::unordered_set<std::string> m_doubleVarNames;
+        bool      m_depthOnlyPixel      = false;
+        bool      m_preferDoubleLiteral = false;
         TargetAPI m_api = TargetAPI::HLSL11;
     };
 

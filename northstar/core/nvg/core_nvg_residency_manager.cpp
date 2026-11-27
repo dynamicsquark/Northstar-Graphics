@@ -179,12 +179,20 @@ namespace Northstar
         m_virtualPageTableDirty  = false;
         m_readbackPending        = false;
         m_clearRequestsNextFrame = true;
+        m_pendingEvictionRegions.clear();
+        m_pendingEvictedMeshIds.clear();
+        m_asyncStreamer.Initialize(2u, 256u);
         m_initialized            = true;
         return true;
     }
 
     void CoreNVGResidencyManager::Shutdown()
     {
+        m_asyncStreamer.Shutdown();
+        m_completedAsyncPages.clear();
+        m_pendingEvictionRegions.clear();
+        m_pendingEvictedMeshIds.clear();
+
         if (m_bufferManager)
         {
             if (m_physicalPagePoolBuffer) { m_bufferManager->DestroyGPUBuffer(m_physicalPagePoolBuffer); m_physicalPagePoolBuffer = nullptr; }
@@ -244,11 +252,21 @@ namespace Northstar
         UINT32 desiredCap = m_physicalPoolCapacity;
         if (newAutoMode)
         {
-            const UINT32 newBudget = ResolveNVGMemoryBudgetPages(config.memoryBudget);
-            m_autoPoolMode       = true;
-            m_maxPoolBudgetPages = newBudget;
+            const UINT32 newBudget     = ResolveNVGMemoryBudgetPages(config.memoryBudget);
+            const UINT32 minAutoFloor  = (std::min)(newBudget, kNVGDefaultPhysicalPageCapacity);
+            m_autoPoolMode             = true;
+            m_maxPoolBudgetPages       = newBudget;
             const UINT32 maxAllowedNow = (std::max)(newBudget, m_pinnedRootPageCount);
-            if (!m_initialized || m_physicalPoolCapacity <= maxAllowedNow)
+            if (!m_initialized)
+            {
+                return true;
+            }
+            if (m_physicalPoolCapacity < minAutoFloor)
+            {
+                m_adaptiveErrorScale = 1.0f;
+                return GrowPhysicalPoolPreservingResidents(minAutoFloor);
+            }
+            if (m_physicalPoolCapacity <= maxAllowedNow)
             {
                 if (newBudget > m_physicalPoolCapacity)
                 {
@@ -324,7 +342,7 @@ namespace Northstar
                     return false;
                 }
 
-                if (rec.pageSource && rec.pageSource->ReadVirtualPageData(rec.meshId, rp, m_scratchPageBytes.data(), kNVGPageSizeBytes))
+                if (ReadMeshPageSynchronous(rec, rp, m_scratchPageBytes.data()))
                 {
                     m_bufferManager->UpdateGPUBuffer(
                         m_physicalPagePoolBuffer,
@@ -405,31 +423,11 @@ namespace Northstar
         }
 
         const UINT32 oldCapacity = m_physicalPoolCapacity;
-        if (!m_bufferManager->ResizeGPUBuffer(m_physicalPagePoolBuffer, clampedNew * kNVGPageWordCount, nullptr))
+        // GPU-to-GPU CopyBufferRegion preserves all existing [0 .. oldCapacity-1] 32 KiB physical pages
+        // in VRAM with zero CPU page re-reads, zero LZ4 re-decompression, and zero WaitForGPU CPU stall!
+        if (!m_bufferManager->ResizeGPUBufferPreservingData(m_physicalPagePoolBuffer, clampedNew * kNVGPageWordCount))
         {
             return false;
-        }
-
-        // Re-upload all currently occupied physical slots at their identical [0 .. oldCapacity-1] indices
-        // (zero WaitForGPU() CPU stall; old buffer handle retires safely via fence-tracked deferred deletion).
-        for (UINT32 slot = 0u; slot < oldCapacity; ++slot)
-        {
-            const PhysicalPageSlot& ps = m_physicalSlots[slot];
-            if (!ps.occupied || ps.virtualPageIndex >= m_virtualPageHost.size()) continue;
-            const VirtualPageHostMeta& hm = m_virtualPageHost[ps.virtualPageIndex];
-            if (!hm.valid) continue;
-            const auto itMesh = m_registeredMeshes.find(hm.meshId);
-            if (itMesh == m_registeredMeshes.end() || !itMesh->second.pageSource) continue;
-
-            if (itMesh->second.pageSource->ReadVirtualPageData(
-                    hm.meshId, hm.localPageIndex, m_scratchPageBytes.data(), kNVGPageSizeBytes))
-            {
-                m_bufferManager->UpdateGPUBuffer(
-                    m_physicalPagePoolBuffer,
-                    m_scratchPageBytes.data(),
-                    kNVGPageSizeBytes,
-                    slot * kNVGPageSizeBytes);
-            }
         }
 
         m_physicalSlots.resize(clampedNew, PhysicalPageSlot{});
@@ -639,6 +637,140 @@ namespace Northstar
         }
     }
 
+    BOOL CoreNVGResidencyManager::ReadMeshPageSynchronous(
+        const RegisteredMeshRecord& rec,
+        UINT32                      localPageIndex,
+        BYTE*                       outPageBytes) const
+    {
+        if (!outPageBytes) return false;
+        if (rec.streamProvider != nullptr)
+        {
+            return rec.streamProvider->ReadDecompressedPage(localPageIndex, outPageBytes, kNVGPageSizeBytes);
+        }
+        if (rec.pageSource != nullptr)
+        {
+            return rec.pageSource->ReadVirtualPageData(rec.meshId, localPageIndex, outPageBytes, kNVGPageSizeBytes);
+        }
+        return false;
+    }
+
+    BOOL CoreNVGResidencyManager::PlanTransactionalSlotAcquisitions(
+        UINT32               neededCount,
+        UINT64               currentFrameIndex,
+        UINT32               incomingPriority,
+        std::vector<UINT32>& outPlannedSlots) const
+    {
+        outPlannedSlots.clear();
+        if (neededCount == 0u) return true;
+        outPlannedSlots.reserve(neededCount);
+
+        SIZE_T freeRemaining = m_freePhysicalSlots.size();
+        while (outPlannedSlots.size() < neededCount && freeRemaining > 0u)
+        {
+            outPlannedSlots.push_back(m_freePhysicalSlots[--freeRemaining]);
+        }
+        if (outPlannedSlots.size() >= neededCount)
+        {
+            return true;
+        }
+
+        // Dry-run leaf-first cascade simulation without mutating any host or GPU state
+        const UINT64 effectiveProtect = (std::max)(static_cast<UINT64>(m_minInFlightProtect), 4ull);
+        std::vector<UINT8>  simOccupied(m_physicalSlots.size(), 0u);
+        std::vector<UINT32> simChildRefs(m_virtualPageHost.size(), 0u);
+        for (SIZE_T i = 0; i < m_physicalSlots.size(); ++i)
+        {
+            simOccupied[i] = m_physicalSlots[i].occupied ? 1u : 0u;
+        }
+        for (SIZE_T vp = 0; vp < m_virtualPageHost.size(); ++vp)
+        {
+            simChildRefs[vp] = m_virtualPageHost[vp].residentChildRefCount;
+        }
+
+        while (outPlannedSlots.size() < neededCount)
+        {
+            UINT32 bestSlot       = kNVGInvalidIndex;
+            UINT64 oldestUseFrame = UINT64_MAX;
+            UINT32 bestLodLevel   = UINT32_MAX;
+
+            for (UINT32 i = 0u; i < static_cast<UINT32>(m_physicalSlots.size()); ++i)
+            {
+                const PhysicalPageSlot& s = m_physicalSlots[i];
+                if (!simOccupied[i] || s.pinnedRoot) continue;
+                if (s.virtualPageIndex < simChildRefs.size() && simChildRefs[s.virtualPageIndex] > 0u) continue;
+                if (s.uploadedFrame + effectiveProtect >= currentFrameIndex) continue;
+                if (s.lastUsedFrame + effectiveProtect >= currentFrameIndex) continue;
+
+                const UINT32 candLod = (s.virtualPageIndex < m_virtualPageHost.size())
+                    ? m_virtualPageHost[s.virtualPageIndex].lodLevel
+                    : 0u;
+                if (s.lastUsedFrame < oldestUseFrame ||
+                    (s.lastUsedFrame == oldestUseFrame && candLod < bestLodLevel))
+                {
+                    oldestUseFrame = s.lastUsedFrame;
+                    bestLodLevel   = candLod;
+                    bestSlot       = i;
+                }
+            }
+
+            if (bestSlot == kNVGInvalidIndex && incomingPriority > 0u)
+            {
+                UINT32 lowestActivePrio = UINT32_MAX;
+                UINT32 preemptLod       = UINT32_MAX;
+                UINT64 preemptOldestUse = UINT64_MAX;
+                for (UINT32 i = 0u; i < static_cast<UINT32>(m_physicalSlots.size()); ++i)
+                {
+                    const PhysicalPageSlot& s = m_physicalSlots[i];
+                    if (!simOccupied[i] || s.pinnedRoot) continue;
+                    if (s.virtualPageIndex < simChildRefs.size() && simChildRefs[s.virtualPageIndex] > 0u) continue;
+                    if (s.uploadedFrame + effectiveProtect >= currentFrameIndex) continue;
+
+                    const UINT32 signalPrio = (s.lastActivePriority >= 262144u)
+                        ? (s.lastActivePriority - 262144u)
+                        : s.lastActivePriority;
+                    const UINT32 hysteresisMargin = (signalPrio >> 4u) + 32u;
+                    if (incomingPriority != UINT32_MAX && incomingPriority <= s.lastActivePriority + hysteresisMargin)
+                        continue;
+
+                    const UINT32 candLod = (s.virtualPageIndex < m_virtualPageHost.size())
+                        ? m_virtualPageHost[s.virtualPageIndex].lodLevel
+                        : 0u;
+                    if (s.lastActivePriority < lowestActivePrio ||
+                        (s.lastActivePriority == lowestActivePrio &&
+                         (candLod < preemptLod || (candLod == preemptLod && s.lastUsedFrame < preemptOldestUse))))
+                    {
+                        lowestActivePrio = s.lastActivePriority;
+                        preemptLod       = candLod;
+                        preemptOldestUse = s.lastUsedFrame;
+                        bestSlot         = i;
+                    }
+                }
+            }
+
+            if (bestSlot == kNVGInvalidIndex)
+            {
+                outPlannedSlots.clear();
+                return false;
+            }
+
+            simOccupied[bestSlot] = 0u;
+            const UINT32 victimVP = m_physicalSlots[bestSlot].virtualPageIndex;
+            if (victimVP < m_virtualPageHost.size())
+            {
+                for (UINT32 pvp : m_virtualPageHost[victimVP].parentVPs)
+                {
+                    if (pvp < simChildRefs.size() && simChildRefs[pvp] > 0u)
+                    {
+                        --simChildRefs[pvp];
+                    }
+                }
+            }
+            outPlannedSlots.push_back(bestSlot);
+        }
+
+        return true;
+    }
+
     UINT32 CoreNVGResidencyManager::AcquirePhysicalSlot(
         UINT64                                  currentFrameIndex,
         UINT32                                  incomingPriority,
@@ -781,11 +913,12 @@ namespace Northstar
     }
 
     BOOL CoreNVGResidencyManager::RegisterVirtualMesh(
-        UINT32                    meshId,
-        NVGVirtualMeshAsset&&     asset,
-        const INVGPageDataSource* customSource,
-        UINT64                    currentFrameIndex,
-        std::string&              outError)
+        UINT32                                  meshId,
+        NVGVirtualMeshAsset&&                   asset,
+        const INVGPageDataSource*               customSource,
+        UINT64                                  currentFrameIndex,
+        std::string&                            outError,
+        std::shared_ptr<INVGPageStreamProvider> streamProvider)
     {
         outError.clear();
         if (!m_initialized)
@@ -793,7 +926,13 @@ namespace Northstar
             outError = "NVG residency manager is not initialized.";
             return false;
         }
-        if (meshId == 0u || asset.clusters.empty() || asset.bvhNodes.empty() || asset.pages.empty() || asset.rootPageCount == 0u)
+
+        const UINT32 virtualPageCount = streamProvider
+            ? streamProvider->GetVirtualPageCount()
+            : static_cast<UINT32>(asset.pages.size());
+
+        if (meshId == 0u || asset.clusters.empty() || asset.bvhNodes.empty() ||
+            virtualPageCount == 0u || asset.rootPageCount == 0u || asset.rootPageCount > virtualPageCount)
         {
             outError = "Invalid NVG virtual mesh asset (empty clusters, BVH, or root pages).";
             return false;
@@ -806,75 +945,81 @@ namespace Northstar
 
         ReclaimDeferredSlots(currentFrameIndex);
 
+        // Pre-decode & verify all pinned Root Pages BEFORE mutating any residency slots so corrupt root pages
+        // cannot partially evict existing meshes!
+        const UINT32 rootPageCount = asset.rootPageCount;
+        std::vector<BYTE> rootPagesStaging(static_cast<SIZE_T>(rootPageCount) * kNVGPageSizeBytes, static_cast<BYTE>(0));
+        for (UINT32 rp = 0u; rp < rootPageCount; ++rp)
+        {
+            BYTE* dstRoot = rootPagesStaging.data() + static_cast<SIZE_T>(rp) * kNVGPageSizeBytes;
+            BOOL  readOk  = false;
+            if (streamProvider != nullptr)
+            {
+                readOk = streamProvider->ReadDecompressedPage(rp, dstRoot, kNVGPageSizeBytes);
+            }
+            else if (customSource != nullptr)
+            {
+                readOk = customSource->ReadVirtualPageData(meshId, rp, dstRoot, kNVGPageSizeBytes);
+            }
+            else if (rp < asset.pages.size() && asset.pages[rp].words.size() * sizeof(UINT32) == kNVGPageSizeBytes)
+            {
+                std::memcpy(dstRoot, asset.pages[rp].words.data(), kNVGPageSizeBytes);
+                readOk = true;
+            }
+
+            if (!readOk)
+            {
+                outError = "Failed to read or verify pinned root page payload during virtual mesh registration.";
+                return false;
+            }
+        }
+
         // In autonomous elastic pool mode, grow pool proactively if free slots are low for incoming root pages
         if (m_autoPoolMode &&
-            (asset.rootPageCount > static_cast<UINT32>(m_freePhysicalSlots.size()) ||
-             m_residentPageCount + asset.rootPageCount > (m_physicalPoolCapacity * 85u) / 100u) &&
-            m_physicalPoolCapacity < kNVGMaxPhysicalPageCapacity)
+            (rootPageCount > static_cast<UINT32>(m_freePhysicalSlots.size()) ||
+             m_residentPageCount + rootPageCount > (m_physicalPoolCapacity * 85u) / 100u) &&
+            m_physicalPoolCapacity < m_maxPoolBudgetPages)
         {
             const UINT32 targetCap = (std::min)(
-                kNVGMaxPhysicalPageCapacity,
-                NextPow2AtLeast(m_residentPageCount + asset.rootPageCount + 64u, m_physicalPoolCapacity * 2u));
+                m_maxPoolBudgetPages,
+                NextPow2AtLeast(m_residentPageCount + rootPageCount + 64u, m_physicalPoolCapacity * 2u));
             GrowPhysicalPoolPreservingResidents(targetCap);
         }
 
-        // Check physical pool capacity for pinned root pages BEFORE mutating tables
-        // (PropagateResidentAncestorLRU guarantees ancestor.recentFrame >= descendant.recentFrame, so every
-        //  non-root slot outside the protect window peels leaf-first cleanly during sequential AcquirePhysicalSlot).
-        const UINT64 effectiveProtect = (std::max)(static_cast<UINT64>(m_minInFlightProtect), 4ull);
-        UINT32 evictableCount = 0u;
-        for (const PhysicalPageSlot& s : m_physicalSlots)
+        // Dry-run transactional leaf-first cascade check BEFORE mutating any physical slot or metadata table (NVG-040)
+        std::vector<UINT32> plannedRootSlots;
+        if (!PlanTransactionalSlotAcquisitions(rootPageCount, currentFrameIndex, UINT32_MAX, plannedRootSlots))
         {
-            if (!s.occupied || s.pinnedRoot) continue;
-            if (s.uploadedFrame + effectiveProtect < currentFrameIndex)
-            {
-                ++evictableCount;
-            }
-        }
-        const UINT32 availableForRoots = static_cast<UINT32>(m_freePhysicalSlots.size()) + evictableCount;
-        if (asset.rootPageCount > availableForRoots)
-        {
-            outError = "NVG physical page pool exhausted: insufficient capacity to pin root pages for virtual mesh.";
+            outError = "NVG physical page pool exhausted: insufficient evictable leaf capacity to pin root pages.";
             return false;
         }
 
-        const UINT32 nodeCount        = static_cast<UINT32>(asset.bvhNodes.size());
-        const UINT32 clusterCount     = static_cast<UINT32>(asset.clusters.size());
-        const UINT32 groupCount       = static_cast<UINT32>(asset.clusterGroups.size());
-        const UINT32 virtualPageCount = static_cast<UINT32>(asset.pages.size());
-        const UINT32 rootPageCount    = asset.rootPageCount;
+        const UINT32 nodeCount    = static_cast<UINT32>(asset.bvhNodes.size());
+        const UINT32 clusterCount = static_cast<UINT32>(asset.clusters.size());
+        const UINT32 groupCount   = static_cast<UINT32>(asset.clusterGroups.size());
 
         const UINT32 nodeBase        = AllocateContiguousRange(m_freeNodeRanges,        m_bvhNodes.size(),     nodeCount);
         const UINT32 clusterBase     = AllocateContiguousRange(m_freeClusterRanges,     m_clusters.size(),     clusterCount);
         const UINT32 groupBase       = AllocateContiguousRange(m_freeGroupRanges,       m_groups.size(),       groupCount);
         const UINT32 virtualPageBase = AllocateContiguousRange(m_freeVirtualPageRanges, m_virtualPages.size(), virtualPageCount);
 
-        // Allocate physical slots for all root pages first (guaranteed to succeed by check above)
+        // Commit planned root slot acquisitions & record NVS invalidation regions for any evicted victim pages
         std::vector<UINT32> acquiredRootSlots;
         acquiredRootSlots.reserve(rootPageCount);
-        std::vector<UINT32> evictedMeshes;
         UINT32 evictedCnt = 0u;
         for (UINT32 rp = 0u; rp < rootPageCount; ++rp)
         {
-            const UINT32 slot = AcquirePhysicalSlot(currentFrameIndex, UINT32_MAX, evictedMeshes, nullptr, evictedCnt);
-            if (slot == kNVGInvalidIndex)
-            {
-                for (UINT32 s : acquiredRootSlots) m_freePhysicalSlots.push_back(s);
-                if (nodeBase < m_bvhNodes.size())         ReleaseAndTrimRange(m_freeNodeRanges,        m_bvhNodes,     nodeBase,        nodeCount);
-                if (clusterBase < m_clusters.size())      ReleaseAndTrimRange(m_freeClusterRanges,     m_clusters,     clusterBase,     clusterCount);
-                if (groupBase < m_groups.size())          ReleaseAndTrimRange(m_freeGroupRanges,       m_groups,       groupBase,       groupCount);
-                if (virtualPageBase < m_virtualPages.size()) ReleaseAndTrimRange(m_freeVirtualPageRanges, m_virtualPages, virtualPageBase, virtualPageCount);
-                outError = "NVG failed to acquire physical page slot for root page.";
-                return false;
-            }
+            const UINT32 slot = AcquirePhysicalSlot(
+                currentFrameIndex, UINT32_MAX, m_pendingEvictedMeshIds, &m_pendingEvictionRegions, evictedCnt);
             acquiredRootSlots.push_back(slot);
         }
 
-        // Insert record and wire page data source
+        // Insert record and wire stream provider or page data source
         asset.virtualMeshId = meshId;
         RegisteredMeshRecord& rec = m_registeredMeshes[meshId];
         rec.meshId           = meshId;
         rec.asset            = std::move(asset);
+        rec.streamProvider   = std::move(streamProvider);
         rec.nodeBase         = nodeBase;
         rec.nodeCount        = nodeCount;
         rec.clusterBase      = clusterBase;
@@ -885,7 +1030,14 @@ namespace Northstar
         rec.virtualPageCount = virtualPageCount;
         rec.rootPageCount    = rootPageCount;
 
-        if (customSource != nullptr)
+        if (rec.streamProvider != nullptr)
+        {
+            // Release all in-RAM page payloads when backed by async stream provider (zero mandatory streaming RAM!)
+            rec.asset.pages.clear();
+            rec.asset.pages.shrink_to_fit();
+            rec.pageSource = customSource;
+        }
+        else if (customSource != nullptr)
         {
             rec.pageSource = customSource;
         }
@@ -921,7 +1073,8 @@ namespace Northstar
             c.virtualPageId     = virtualPageBase + c.virtualPageId;
             c.selfGroupIndex    = groupBase + c.selfGroupIndex;
             c.parentGroupIndex  = (c.parentGroupIndex == kNVGInvalidIndex) ? kNVGInvalidIndex : (groupBase + c.parentGroupIndex);
-            if (c.refinedByChildGroupCount > 0u && c.refinedByChildGroupStart != kNVGInvalidIndex)
+            if (UnpackNVGRefinedChildGroupCount(c.refinedByChildGroupCount) > 0u &&
+                c.refinedByChildGroupStart != kNVGInvalidIndex)
             {
                 c.refinedByChildGroupStart = groupBase + c.refinedByChildGroupStart;
             }
@@ -945,9 +1098,10 @@ namespace Northstar
             m_groups[groupBase + i] = g;
         }
 
-        // Compute tight per-page local AABB bounds & conservative shadow parent error from member clusters
+        // Compute tight per-page local AABB bounds, LOD level & conservative shadow parent error from member clusters
         std::vector<AABB>    localPageBounds(virtualPageCount, AABB(Vec3(1.0e30f, 1.0e30f, 1.0e30f), Vec3(-1.0e30f, -1.0e30f, -1.0e30f)));
         std::vector<FLOAT32> localPageMaxShErr(virtualPageCount, 0.0f);
+        std::vector<UINT32>  localPageLod(virtualPageCount, 0u);
         std::vector<UINT8>   localPageHasBounds(virtualPageCount, 0u);
         for (UINT32 ci = 0u; ci < clusterCount; ++ci)
         {
@@ -956,6 +1110,7 @@ namespace Northstar
             {
                 localPageBounds[lc.virtualPageId].Expand(lc.aabbMin);
                 localPageBounds[lc.virtualPageId].Expand(lc.aabbMax);
+                localPageLod[lc.virtualPageId]       = (lc.countsAndLod >> 16u) & 0xFFu;
                 localPageHasBounds[lc.virtualPageId] = 1u;
 
                 const FLOAT32 pThin = ((lc.clusterFlags & 2u) != 0u)
@@ -972,29 +1127,29 @@ namespace Northstar
         }
 
         // Write Virtual Page Table entries into [virtualPageBase .. virtualPageBase + virtualPageCount)
-        // and immediately upload pinned Root Pages (0 .. rootPageCount-1)
+        // and immediately upload pre-verified pinned Root Pages (0 .. rootPageCount-1)
         if (static_cast<SIZE_T>(virtualPageBase) + static_cast<SIZE_T>(virtualPageCount) > m_virtualPages.size())
         {
-            m_virtualPages.resize(static_cast<SIZE_T>(virtualPageBase) + static_cast<SIZE_T>(nodeCount == 0u ? virtualPageCount : virtualPageCount));
+            m_virtualPages.resize(static_cast<SIZE_T>(virtualPageBase) + static_cast<SIZE_T>(virtualPageCount));
             m_virtualPageHost.resize(static_cast<SIZE_T>(virtualPageBase) + static_cast<SIZE_T>(virtualPageCount));
         }
         for (UINT32 p = 0u; p < virtualPageCount; ++p)
         {
-            const NVGVirtualPagePayload& page = rec.asset.pages[p];
-            const BOOL isRoot = (p < rootPageCount);
-            const UINT32 gvp  = virtualPageBase + p;
+            const UINT32 pageLod = (p < rec.asset.pages.size()) ? rec.asset.pages[p].lodLevel : localPageLod[p];
+            const BOOL   isRoot  = (p < rootPageCount);
+            const UINT32 gvp     = virtualPageBase + p;
 
             NVGVirtualPageGPUData vpe{};
             vpe.stateAndFlags     = NVG_VPAGE_FLAG_VALID | (isRoot ? (NVG_VPAGE_FLAG_ROOT_PINNED | NVG_VPAGE_FLAG_RESIDENT) : 0u);
             vpe.physicalPageIndex = isRoot ? acquiredRootSlots[p] : kNVGInvalidIndex;
             vpe.pageGeneration    = (m_virtualPages[gvp].pageGeneration == 0u) ? 1u : (m_virtualPages[gvp].pageGeneration + 1u);
-            vpe.meshIdAndLod      = (meshId & 0x00FFFFFFu) | ((page.lodLevel & 0xFFu) << 24u);
+            vpe.meshIdAndLod      = (meshId & 0x00FFFFFFu) | ((pageLod & 0xFFu) << 24u);
             m_virtualPages[gvp]   = vpe;
 
             VirtualPageHostMeta hm{};
             hm.meshId                     = meshId;
             hm.localPageIndex             = p;
-            hm.lodLevel                   = page.lodLevel;
+            hm.lodLevel                   = pageLod;
             hm.residentChildRefCount      = 0u;
             hm.isRootPage                 = isRoot;
             hm.valid                      = true;
@@ -1004,15 +1159,13 @@ namespace Northstar
 
             if (isRoot)
             {
-                const UINT32 slot = acquiredRootSlots[p];
-                if (rec.pageSource->ReadVirtualPageData(meshId, p, m_scratchPageBytes.data(), kNVGPageSizeBytes))
-                {
-                    m_bufferManager->UpdateGPUBuffer(
-                        m_physicalPagePoolBuffer,
-                        m_scratchPageBytes.data(),
-                        kNVGPageSizeBytes,
-                        slot * kNVGPageSizeBytes);
-                }
+                const UINT32 slot    = acquiredRootSlots[p];
+                const BYTE*  srcRoot = rootPagesStaging.data() + static_cast<SIZE_T>(p) * kNVGPageSizeBytes;
+                m_bufferManager->UpdateGPUBuffer(
+                    m_physicalPagePoolBuffer,
+                    srcRoot,
+                    kNVGPageSizeBytes,
+                    slot * kNVGPageSizeBytes);
 
                 m_physicalSlots[slot].occupied         = true;
                 m_physicalSlots[slot].pinnedRoot       = true;
@@ -1153,6 +1306,7 @@ namespace Northstar
         mr.retireFrame      = retireAt;
         m_deferredMetadataRetirements.push_back(mr);
 
+        m_asyncStreamer.CancelMeshJobs(meshId);
         m_defaultMemorySource.UnregisterAsset(meshId);
         m_registeredMeshes.erase(it);
 
@@ -1180,7 +1334,45 @@ namespace Northstar
     {
         auto it = m_registeredMeshes.find(meshId);
         if (it == m_registeredMeshes.end()) return false;
-        return NVGBuilder::Serialize(it->second.asset, outBlob);
+        const RegisteredMeshRecord& rec = it->second;
+        if (!rec.asset.pages.empty())
+        {
+            return NVGBuilder::Serialize(rec.asset, outBlob);
+        }
+        if (!rec.streamProvider || rec.virtualPageCount == 0u)
+        {
+            return false;
+        }
+
+        // Rehydrate page payloads transiently from stream provider when zero-RAM streaming mode cleared rec.asset.pages
+        NVGVirtualMeshAsset tempAsset = rec.asset;
+        tempAsset.pages.resize(rec.virtualPageCount);
+        for (UINT32 p = 0u; p < rec.virtualPageCount; ++p)
+        {
+            NVGVirtualPagePayload& pg = tempAsset.pages[p];
+            pg.localPageIndex = p;
+            pg.isRootPage     = (p < rec.rootPageCount);
+            pg.words.assign(kNVGPageWordCount, 0u);
+            if (!rec.streamProvider->ReadDecompressedPage(p, reinterpret_cast<BYTE*>(pg.words.data()), kNVGPageSizeBytes))
+            {
+                return false;
+            }
+        }
+        for (const NVGClusterMetaGPUData& cm : tempAsset.clusters)
+        {
+            if (cm.virtualPageId >= tempAsset.pages.size()) return false;
+            NVGVirtualPagePayload& pg = tempAsset.pages[cm.virtualPageId];
+            pg.lodLevel = (cm.countsAndLod >> 16u) & 0xFFu;
+            ++pg.clusterCount;
+            const UINT32* h         = pg.words.data() + cm.clusterWordOffsetInPage;
+            const UINT32  vCount    = UnpackNVGClusterVertexCount(h[14]);
+            const UINT32  tCount    = UnpackNVGClusterTriangleCount(h[14]);
+            const UINT32  attrFlags = (h[14] >> 24u) & 0xFFu;
+            const UINT32  vStride   = ((attrFlags & NVG_CLUSTER_ATTR_SKINNING) != 0u) ? kNVGSkinnedVertexWords : kNVGRigidVertexWords;
+            const UINT32  endWord   = cm.clusterWordOffsetInPage + kNVGClusterHeaderWords + vCount * vStride + tCount;
+            if (endWord > pg.usedWords) pg.usedWords = (std::min)(endWord, kNVGPageWordCount);
+        }
+        return NVGBuilder::Serialize(tempAsset, outBlob);
     }
 
     BOOL CoreNVGResidencyManager::SyncDirtyMetadataToGPU()
@@ -1265,11 +1457,122 @@ namespace Northstar
 
         if (!m_initialized) return;
 
+        // Forward any eviction invalidations recorded during out-of-band RegisterVirtualMesh calls (NVG-040)
+        if (!m_pendingEvictedMeshIds.empty())
+        {
+            for (UINT32 mid : m_pendingEvictedMeshIds) AppendUniqueU32(outResidencyChangedMeshIds, mid);
+            m_pendingEvictedMeshIds.clear();
+        }
+        if (!m_pendingEvictionRegions.empty())
+        {
+            if (outChangedRegions)
+            {
+                for (const NVGResidencyChangedRegion& r : m_pendingEvictionRegions)
+                {
+                    RecordChangedRegion(outChangedRegions, r.meshId, r.localBounds, r.maxShadowScaledParentError);
+                }
+            }
+            m_pendingEvictionRegions.clear();
+        }
+
         // 1. Reclaim physical slots retired past the in-flight GPU frame window
         ReclaimDeferredSlots(frameIndex);
 
         // 2. Sync any dirty metadata buffers before GPU dispatch
         SyncDirtyMetadataToGPU();
+
+        UINT32 uploadsThisFrame   = 0u;
+        UINT32 evictionsThisFrame = 0u;
+        UINT32 blockedThisFrame   = 0u;
+
+        // 2.5. Drain ready 32 KiB pages decompressed asynchronously by background worker threads (0 ms render-thread I/O or LZ4!)
+        const UINT32 asyncDrainCap = (m_configuredMaxUploads == kNVGAutoUploadRate) ? 256u : m_configuredMaxUploads;
+        m_asyncStreamer.DrainCompletedPages(m_completedAsyncPages, asyncDrainCap);
+        if (!m_completedAsyncPages.empty())
+        {
+            std::sort(m_completedAsyncPages.begin(), m_completedAsyncPages.end(),
+                [](const NVGCompletedStreamPage& a, const NVGCompletedStreamPage& b) {
+                    if (a.priority != b.priority) return a.priority > b.priority;
+                    if (a.lodLevel != b.lodLevel) return a.lodLevel > b.lodLevel;
+                    return a.globalVP < b.globalVP;
+                });
+
+            if (m_autoPoolMode && m_physicalPoolCapacity < m_maxPoolBudgetPages)
+            {
+                const UINT32 activeDemand = m_residentPageCount + static_cast<UINT32>(m_completedAsyncPages.size());
+                if (activeDemand > (m_physicalPoolCapacity * 85u) / 100u ||
+                    m_freePhysicalSlots.size() < m_completedAsyncPages.size())
+                {
+                    const UINT32 desiredPool = (std::min)(
+                        m_maxPoolBudgetPages,
+                        NextPow2AtLeast(activeDemand + 64u, m_physicalPoolCapacity * 2u));
+                    GrowPhysicalPoolPreservingResidents(desiredPool);
+                }
+            }
+
+            for (NVGCompletedStreamPage& done : m_completedAsyncPages)
+            {
+                if (done.succeeded && done.pageBytes.size() == kNVGPageSizeBytes &&
+                    done.globalVP < m_virtualPages.size() && m_virtualPageHost[done.globalVP].valid &&
+                    m_virtualPages[done.globalVP].pageGeneration == done.expectedGen &&
+                    (m_virtualPages[done.globalVP].stateAndFlags & NVG_VPAGE_FLAG_RESIDENT) == 0u)
+                {
+                    const VirtualPageHostMeta& hm = m_virtualPageHost[done.globalVP];
+                    BOOL parentsReady = true;
+                    for (UINT32 pvp : hm.parentVPs)
+                    {
+                        if (pvp < m_virtualPages.size() &&
+                            (m_virtualPages[pvp].stateAndFlags & NVG_VPAGE_FLAG_RESIDENT) == 0u)
+                        {
+                            parentsReady = false;
+                            break;
+                        }
+                    }
+
+                    if (parentsReady)
+                    {
+                        const UINT32 slot = AcquirePhysicalSlot(
+                            frameIndex, done.priority, outResidencyChangedMeshIds, outChangedRegions, evictionsThisFrame);
+                        if (slot != kNVGInvalidIndex)
+                        {
+                            m_bufferManager->UpdateGPUBuffer(
+                                m_physicalPagePoolBuffer,
+                                done.pageBytes.data(),
+                                kNVGPageSizeBytes,
+                                slot * kNVGPageSizeBytes);
+
+                            m_physicalSlots[slot].occupied           = true;
+                            m_physicalSlots[slot].pinnedRoot         = hm.isRootPage;
+                            m_physicalSlots[slot].virtualPageIndex   = done.globalVP;
+                            m_physicalSlots[slot].meshId             = hm.meshId;
+                            m_physicalSlots[slot].lastUsedFrame      = frameIndex;
+                            m_physicalSlots[slot].uploadedFrame      = frameIndex;
+                            m_physicalSlots[slot].lastActivePriority = done.priority;
+
+                            m_virtualPages[done.globalVP].stateAndFlags     = NVG_VPAGE_FLAG_VALID | NVG_VPAGE_FLAG_RESIDENT | (hm.isRootPage ? NVG_VPAGE_FLAG_ROOT_PINNED : 0u);
+                            m_virtualPages[done.globalVP].physicalPageIndex = slot;
+                            m_virtualPages[done.globalVP].pageGeneration++;
+                            UploadVirtualPageEntry(done.globalVP);
+
+                            IncrementParentRefCounts(done.globalVP);
+                            PropagateResidentAncestorLRU(done.globalVP, frameIndex, done.priority);
+                            RecordChangedRegion(outChangedRegions, hm.meshId, hm.pageLocalBounds, hm.maxShadowScaledParentError);
+
+                            ++m_residentPageCount;
+                            ++uploadsThisFrame;
+                            ++m_residencyRevision;
+                            AppendUniqueU32(outResidencyChangedMeshIds, hm.meshId);
+                        }
+                        else
+                        {
+                            ++blockedThisFrame;
+                        }
+                    }
+                }
+                m_asyncStreamer.RecyclePageBuffer(std::move(done.pageBytes));
+            }
+            m_completedAsyncPages.clear();
+        }
 
         // 3. Poll async non-blocking readback of GPU page requests from prior completed frame
         const UINT32 totalVP = static_cast<UINT32>(m_virtualPages.size());
@@ -1428,16 +1731,33 @@ namespace Northstar
                     }
                 }
 
-                UINT32 uploadsThisFrame   = 0u;
-                UINT32 evictionsThisFrame = 0u;
-                UINT32 blockedThisFrame   = 0u;
-
                 for (const PageReq& req : missingReqs)
                 {
                     if (uploadsThisFrame >= effectiveMaxUploads) break;
 
                     const VirtualPageHostMeta& hm = m_virtualPageHost[req.globalVP];
                     if (!hm.valid) continue;
+
+                    auto itMesh = m_registeredMeshes.find(hm.meshId);
+                    if (itMesh == m_registeredMeshes.end()) continue;
+
+                    // Async stream provider path: dispatch disk I/O + LZ4 + CRC32C to background worker threads!
+                    // Enqueue ancestors & leaves immediately so multi-level DAG chains stream in parallel.
+                    if (itMesh->second.streamProvider != nullptr)
+                    {
+                        NVGAsyncStreamJob job{};
+                        job.meshId         = hm.meshId;
+                        job.globalVP       = req.globalVP;
+                        job.localPageIndex = hm.localPageIndex;
+                        job.expectedGen    = m_virtualPages[req.globalVP].pageGeneration;
+                        job.priority       = req.priority;
+                        job.lodLevel       = req.lodLevel;
+                        job.provider       = itMesh->second.streamProvider;
+                        m_asyncStreamer.EnqueueOrUpdateJob(job);
+                        continue;
+                    }
+
+                    if (!itMesh->second.pageSource) continue;
 
                     // Prefix-closed residency invariant: only upload a child once all its parent pages are resident
                     BOOL parentsReady = true;
@@ -1451,9 +1771,6 @@ namespace Northstar
                         }
                     }
                     if (!parentsReady) continue;
-
-                    auto itMesh = m_registeredMeshes.find(hm.meshId);
-                    if (itMesh == m_registeredMeshes.end() || !itMesh->second.pageSource) continue;
 
                     const UINT32 slot = AcquirePhysicalSlot(
                         frameIndex, req.priority, outResidencyChangedMeshIds, outChangedRegions, evictionsThisFrame);
@@ -1524,12 +1841,13 @@ namespace Northstar
                     }
                 }
 
-                ioStats.pagesUploadedThisFrame = uploadsThisFrame;
-                ioStats.pagesEvictedThisFrame  = evictionsThisFrame;
-                ioStats.evictionBlockedCount   = blockedThisFrame;
-                ioStats.streamingUploadedBytes = uploadsThisFrame * kNVGPageSizeBytes;
             }
         }
+
+        ioStats.pagesUploadedThisFrame += uploadsThisFrame;
+        ioStats.pagesEvictedThisFrame  += evictionsThisFrame;
+        ioStats.evictionBlockedCount   += blockedThisFrame;
+        ioStats.streamingUploadedBytes += uploadsThisFrame * kNVGPageSizeBytes;
 
         // Update residency & budget telemetry
         ioStats.registeredVirtualMeshCount  = static_cast<UINT32>(m_registeredMeshes.size());

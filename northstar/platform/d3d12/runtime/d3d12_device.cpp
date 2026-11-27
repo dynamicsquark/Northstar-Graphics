@@ -75,21 +75,8 @@ namespace Northstar
             m_device.As(&m_infoQueue);
         }
 
-        // Query D3D12_FEATURE_D3D12_OPTIONS for VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation
-        m_supportsVPAndRTArrayIndexWithoutGS = false;
-        if (m_device)
-        {
-            D3D12_FEATURE_DATA_D3D12_OPTIONS d3d12Options{};
-            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &d3d12Options, sizeof(d3d12Options))))
-            {
-                m_supportsVPAndRTArrayIndexWithoutGS =
-                    (d3d12Options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation != FALSE);
-            }
-            if (!m_supportsVPAndRTArrayIndexWithoutGS)
-            {
-                std::cout << "[NorthstarD3D12] Note: VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation is FALSE on this adapter; layered depth passes will use the Geometry Shader fallback path.\n";
-            }
-        }
+        // Query D3D12 hardware capabilities (Feature Level, Shader Model 6.6, WaveOps, Int64 Atomics, Typed UAV Loads)
+        QueryDeviceCapabilities();
 
         // 4. Create Command Queue
         D3D12_COMMAND_QUEUE_DESC queueDesc{};
@@ -221,20 +208,41 @@ namespace Northstar
             }
         }
 
-        if (bestAdapter && SUCCEEDED(D3D12CreateDevice(bestAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device))))
+        auto createHighestFeatureLevelDevice = [&](IUnknown* adapterPtr, ComPtr<ID3D12Device>& outDev, D3D_FEATURE_LEVEL& outLevel) -> BOOL
+        {
+            static constexpr D3D_FEATURE_LEVEL kLevels[] = {
+                D3D_FEATURE_LEVEL_12_2,
+                D3D_FEATURE_LEVEL_12_1,
+                D3D_FEATURE_LEVEL_12_0,
+                D3D_FEATURE_LEVEL_11_1,
+                D3D_FEATURE_LEVEL_11_0
+            };
+            for (D3D_FEATURE_LEVEL fl : kLevels)
+            {
+                if (SUCCEEDED(D3D12CreateDevice(adapterPtr, fl, IID_PPV_ARGS(&outDev))) && outDev)
+                {
+                    outLevel = fl;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if (bestAdapter && createHighestFeatureLevelDevice(bestAdapter.Get(), m_device, m_activeFeatureLevel))
         {
             m_adapter = bestAdapter;
             m_adapterDescription = bestDesc.Description;
             m_dedicatedVramMB = bestDesc.DedicatedVideoMemory / (1024 * 1024);
             std::wcout << L"[NorthstarD3D12] Selected GPU: " << m_adapterDescription
-                       << L" (" << m_dedicatedVramMB << L" MB VRAM)\n";
+                       << L" (" << m_dedicatedVramMB << L" MB VRAM, FL=0x"
+                       << std::hex << static_cast<UINT32>(m_activeFeatureLevel) << std::dec << L")\n";
             return true;
         }
 
         // Software WARP fallback if hardware adapter is not available
         ComPtr<IDXGIAdapter> warpAdapter;
         m_factory->EnumWarpAdapter(IID_PPV_ARGS(&warpAdapter));
-        if (SUCCEEDED(D3D12CreateDevice(warpAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device))))
+        if (warpAdapter && createHighestFeatureLevelDevice(warpAdapter.Get(), m_device, m_activeFeatureLevel))
         {
             m_adapterDescription = L"Microsoft WARP (Software)";
             m_dedicatedVramMB = 0;
@@ -243,6 +251,118 @@ namespace Northstar
         }
 
         return false;
+    }
+
+    void D3D12DeviceContext::QueryDeviceCapabilities()
+    {
+        m_capabilities                       = BackendCapabilities{};
+        m_capabilities.maxFeatureLevel       = static_cast<UINT32>(m_activeFeatureLevel);
+        m_supportsVPAndRTArrayIndexWithoutGS = false;
+        if (!m_device) return;
+
+        // 1. Check highest supported D3D_FEATURE_LEVEL via D3D12_FEATURE_FEATURE_LEVELS
+        {
+            static constexpr D3D_FEATURE_LEVEL kQueryLevels[] = {
+                D3D_FEATURE_LEVEL_12_2,
+                D3D_FEATURE_LEVEL_12_1,
+                D3D_FEATURE_LEVEL_12_0,
+                D3D_FEATURE_LEVEL_11_1,
+                D3D_FEATURE_LEVEL_11_0
+            };
+            D3D12_FEATURE_DATA_FEATURE_LEVELS flData{};
+            flData.NumFeatureLevels        = _countof(kQueryLevels);
+            flData.pFeatureLevelsRequested = kQueryLevels;
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &flData, sizeof(flData))))
+            {
+                m_capabilities.maxFeatureLevel = static_cast<UINT32>(flData.MaxSupportedFeatureLevel);
+            }
+        }
+
+        // 2. D3D12_OPTIONS (VP/RTArrayIndex without GS)
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS d3d12Options{};
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &d3d12Options, sizeof(d3d12Options))))
+            {
+                m_supportsVPAndRTArrayIndexWithoutGS =
+                    (d3d12Options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation != FALSE);
+                m_capabilities.supportsVPAndRTArrayIndexWithoutGS = m_supportsVPAndRTArrayIndexWithoutGS;
+            }
+            if (!m_supportsVPAndRTArrayIndexWithoutGS)
+            {
+                std::cout << "[NorthstarD3D12] Note: VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation is FALSE on this adapter; layered depth passes will use the Geometry Shader fallback path.\n";
+            }
+        }
+
+        // 3. D3D12_FEATURE_SHADER_MODEL (probe 6.6 -> 6.5 -> 6.2 -> 6.0 -> 5.1)
+        {
+            static constexpr D3D_SHADER_MODEL kShaderModels[] = {
+                static_cast<D3D_SHADER_MODEL>(0x66), // D3D_SHADER_MODEL_6_6
+                static_cast<D3D_SHADER_MODEL>(0x65), // D3D_SHADER_MODEL_6_5
+                static_cast<D3D_SHADER_MODEL>(0x62), // D3D_SHADER_MODEL_6_2
+                static_cast<D3D_SHADER_MODEL>(0x60), // D3D_SHADER_MODEL_6_0
+                D3D_SHADER_MODEL_5_1
+            };
+            for (D3D_SHADER_MODEL sm : kShaderModels)
+            {
+                D3D12_FEATURE_DATA_SHADER_MODEL smData{};
+                smData.HighestShaderModel = sm;
+                if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &smData, sizeof(smData))))
+                {
+                    m_capabilities.maxShaderModel = static_cast<UINT32>(smData.HighestShaderModel);
+                    break;
+                }
+            }
+        }
+
+        // 4. D3D12_OPTIONS1 (Wave intrinsics + 64-bit integer shader ops)
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt1{};
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt1, sizeof(opt1))))
+            {
+                m_capabilities.supportsWaveOps         = (opt1.WaveOps != FALSE);
+                m_capabilities.minWaveLaneCount        = opt1.WaveLaneCountMin;
+                m_capabilities.maxWaveLaneCount        = opt1.WaveLaneCountMax;
+                m_capabilities.supportsInt64ShaderOps  = (opt1.Int64ShaderOps != FALSE);
+            }
+        }
+
+        // 5. D3D12_OPTIONS9 (64-bit atomics on typed resources and groupshared memory)
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS9 opt9{};
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &opt9, sizeof(opt9))))
+            {
+                m_capabilities.supportsAtomicInt64OnTypedResource = (opt9.AtomicInt64OnTypedResourceSupported != FALSE);
+                m_capabilities.supportsAtomicInt64OnGroupShared   = (opt9.AtomicInt64OnGroupSharedSupported != FALSE);
+            }
+        }
+
+        // 6. D3D12_OPTIONS11 (64-bit atomics on descriptor-heap buffers/resources)
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS11 opt11{};
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &opt11, sizeof(opt11))))
+            {
+                m_capabilities.supportsAtomicInt64OnDescriptorHeap = (opt11.AtomicInt64OnDescriptorHeapResourceSupported != FALSE);
+            }
+        }
+
+        // 7. Typed UAV Load support for R32_UINT and R32G32_UINT
+        {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT fmtR32{};
+            fmtR32.Format = DXGI_FORMAT_R32_UINT;
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fmtR32, sizeof(fmtR32))))
+            {
+                m_capabilities.supportsTypedUAVLoadR32Uint =
+                    ((fmtR32.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0);
+            }
+
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT fmtRG32{};
+            fmtRG32.Format = DXGI_FORMAT_R32G32_UINT;
+            if (SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fmtRG32, sizeof(fmtRG32))))
+            {
+                m_capabilities.supportsTypedUAVLoadRG32Uint =
+                    ((fmtRG32.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0);
+            }
+        }
     }
 
     BOOL D3D12DeviceContext::WaitForFenceValue(ID3D12Fence* fence, HANDLE evt, UINT64 targetValue)
@@ -425,6 +545,8 @@ namespace Northstar
         m_debugLayerActive = false;
         m_gbvActive        = false;
         m_supportsVPAndRTArrayIndexWithoutGS = false;
+        m_activeFeatureLevel                 = D3D_FEATURE_LEVEL_11_0;
+        m_capabilities                       = BackendCapabilities{};
         m_deviceRemoved                      = false;
         m_deviceRemovedReason                = S_OK;
     }

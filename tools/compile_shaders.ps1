@@ -2,6 +2,9 @@
 #  compile_shaders.ps1
 #  Compiles NorthstarRuntime and StandardLit .nsl shaders directly into
 #  build output directories (never writes .nsc artifacts into shaders/).
+#  RuntimeNVGMicropolyRaster.nsl is compiled from a single authoritative
+#  NSL source into Atomic64 (NVG_RASTER_ATOMIC64=1) and Atomic32
+#  (NVG_RASTER_ATOMIC64=0) .nsc binaries.
 # =====================================================================
 
 param(
@@ -39,6 +42,28 @@ function Compile-ShaderDirectory([string]$srcDir, [string]$relOutDir) {
             New-Item -ItemType Directory -Path $outDir -Force | Out-Null
         }
         foreach ($file in $nslFiles) {
+            if ($file.Name -eq "RuntimeNVGMicropolyRaster.nsl") {
+                $staleA64Hlsl11 = Join-Path $outDir "RuntimeNVGMicropolyRasterAtomic64_hlsl11.nsc"
+                if (Test-Path $staleA64Hlsl11) {
+                    Remove-Item -Path $staleA64Hlsl11 -Force
+                }
+                $specializations = @(
+                    @{ OutBase = "RuntimeNVGMicropolyRasterAtomic64"; Define = "NVG_RASTER_ATOMIC64=1"; Targets = @("hlsl12") },
+                    @{ OutBase = "RuntimeNVGMicropolyRasterAtomic32"; Define = "NVG_RASTER_ATOMIC64=0"; Targets = @("hlsl11", "hlsl12") }
+                )
+                foreach ($spec in $specializations) {
+                    foreach ($api in $spec.Targets) {
+                        $outNsc = Join-Path $outDir "$($spec.OutBase)_${api}.nsc"
+                        & $compiler --input $file.FullName --target $api --output $outNsc -I $includeDir -D $spec.Define
+                        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outNsc)) {
+                            Write-Error "Failed to compile $($file.FullName) [$($spec.Define)] ($api)"
+                            exit 1
+                        }
+                        Write-Host "[OK] [$cfg] $($file.Name) [$($spec.Define)] ($api) -> $outNsc" -ForegroundColor Green
+                    }
+                }
+                continue
+            }
             foreach ($api in @("hlsl11", "hlsl12")) {
                 $outNsc = Join-Path $outDir "$($file.BaseName)_${api}.nsc"
                 & $compiler --input $file.FullName --target $api --output $outNsc -I $includeDir

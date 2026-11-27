@@ -29,9 +29,14 @@ set(NORTHSTAR_RUNTIME_SHADER_ENTRIES
     "Compute/RuntimeNVGCompactionAndDecode"
     "Compute/RuntimeNVGIndirectDraw"
     "Compute/RuntimeNVGShadowCull"
+    "Compute/RuntimeNVGShadowMicropolyRaster"
+    "Compute/RuntimeNVGDepthExport"
     "Compute/RuntimeReflectionMaterialize"
     "Depth/RuntimeLayeredDepthClearVS"
     "Depth/RuntimeLayeredDepthPassGS"
+    "Depth/RuntimeNVGShadowSWMergeVS"
+    "Depth/RuntimeNVGShadowSWMergeGS"
+    "Depth/RuntimeNVGShadowSWMergePS"
 )
 
 set(_NORTHSTAR_RUNTIME_GEN_DIR "${NORTHSTAR_GEN_ROOT_DIR}/NorthstarRuntime")
@@ -71,6 +76,60 @@ foreach(_RT_ENTRY ${NORTHSTAR_RUNTIME_SHADER_ENTRIES})
 
     list(APPEND _NORTHSTAR_RUNTIME_GEN_OUTPUTS "${_RT_GEN_NSC11}" "${_RT_GEN_NSC12}")
 endforeach()
+
+# Unified Universal Camera Micropolygon Rasterizer specializations from ONE authoritative NSL source:
+#   - NVG_RASTER_ATOMIC64=1 -> RuntimeNVGMicropolyRasterAtomic64_hlsl12.nsc (SM 6.6 DXIL single-pass 64-bit InterlockedMax ONLY; never HLSL11/SM 5.0)
+#   - NVG_RASTER_ATOMIC64=0 -> RuntimeNVGMicropolyRasterAtomic32_{hlsl11,hlsl12}.nsc (universal two-pass 2x32-bit InterlockedMax)
+set(_NVG_RASTER_UNIFIED_NSL "${NORTHSTAR_SHADERS_SRC_DIR}/NorthstarRuntime/Compute/RuntimeNVGMicropolyRaster.nsl")
+set(_NVG_A64_NSC12 "${_NORTHSTAR_RUNTIME_GEN_DIR}/Compute/RuntimeNVGMicropolyRasterAtomic64_hlsl12.nsc")
+add_custom_command(
+    OUTPUT
+        "${_NVG_A64_NSC12}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "${_NORTHSTAR_RUNTIME_GEN_DIR}/Compute"
+    COMMAND $<TARGET_FILE:NSLCompiler>
+        --input "${_NVG_RASTER_UNIFIED_NSL}"
+        --target hlsl12
+        --output "${_NVG_A64_NSC12}"
+        -I "${NORTHSTAR_SHADERS_SRC_DIR}"
+        -D "NVG_RASTER_ATOMIC64=1"
+    DEPENDS
+        "${_NVG_RASTER_UNIFIED_NSL}"
+        ${_NORTHSTAR_LIBRARY_NSL_FILES}
+        NSLCompiler
+    COMMENT "Compiling unified RuntimeNVGMicropolyRaster.nsl (NVG_RASTER_ATOMIC64=1, hlsl12) -> RuntimeNVGMicropolyRasterAtomic64_hlsl12.nsc"
+    VERBATIM
+)
+list(APPEND _NORTHSTAR_RUNTIME_GEN_OUTPUTS "${_NVG_A64_NSC12}")
+
+set(_NVG_A32_NSC11 "${_NORTHSTAR_RUNTIME_GEN_DIR}/Compute/RuntimeNVGMicropolyRasterAtomic32_hlsl11.nsc")
+set(_NVG_A32_NSC12 "${_NORTHSTAR_RUNTIME_GEN_DIR}/Compute/RuntimeNVGMicropolyRasterAtomic32_hlsl12.nsc")
+add_custom_command(
+    OUTPUT
+        "${_NVG_A32_NSC11}"
+        "${_NVG_A32_NSC12}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "${_NORTHSTAR_RUNTIME_GEN_DIR}/Compute"
+    COMMAND $<TARGET_FILE:NSLCompiler>
+        --input "${_NVG_RASTER_UNIFIED_NSL}"
+        --target hlsl11
+        --output "${_NVG_A32_NSC11}"
+        -I "${NORTHSTAR_SHADERS_SRC_DIR}"
+        -D "NVG_RASTER_ATOMIC64=0"
+    COMMAND $<TARGET_FILE:NSLCompiler>
+        --input "${_NVG_RASTER_UNIFIED_NSL}"
+        --target hlsl12
+        --output "${_NVG_A32_NSC12}"
+        -I "${NORTHSTAR_SHADERS_SRC_DIR}"
+        -D "NVG_RASTER_ATOMIC64=0"
+    DEPENDS
+        "${_NVG_RASTER_UNIFIED_NSL}"
+        ${_NORTHSTAR_LIBRARY_NSL_FILES}
+        NSLCompiler
+    COMMENT "Compiling unified RuntimeNVGMicropolyRaster.nsl (NVG_RASTER_ATOMIC64=0) -> RuntimeNVGMicropolyRasterAtomic32.nsc"
+    VERBATIM
+)
+list(APPEND _NORTHSTAR_RUNTIME_GEN_OUTPUTS "${_NVG_A32_NSC11}" "${_NVG_A32_NSC12}")
 
 add_custom_target(NorthstarRuntimeShaders ALL
     DEPENDS ${_NORTHSTAR_RUNTIME_GEN_OUTPUTS}
@@ -150,7 +209,11 @@ add_library(NorthstarCore SHARED
     core/runtime/core_nvs_shadow_rasterizer.cpp
     core/runtime/core_nvs_feedback_manager.cpp
     core/runtime/internal_resource_manager.cpp
+    core/nvg/nvg_codec_lz4.cpp
+    core/nvg/nvg_qem_simplifier.cpp
     core/nvg/nvg_builder.cpp
+    core/nvg/nvg_async_stream_io.cpp
+    core/nvg/nvg_sw_raster_ref.cpp
     core/nvg/core_nvg_residency_manager.cpp
     core/nvg/core_nvg_manager.cpp
     core/shader_loader/shader_loader.cpp
@@ -228,6 +291,42 @@ target_compile_features(NorthstarD3D12 PUBLIC cxx_std_20)
 set_target_properties(NorthstarD3D12 PROPERTIES FOLDER "Engine")
 northstar_configure_target_outputs(NorthstarD3D12 TRUE)
 northstar_apply_strict_warnings(NorthstarD3D12)
+
+if(WIN32)
+    set(_NS_DXC_DLL "")
+    set(_NS_DXIL_DLL "")
+    set(_NS_WINSDK_HINTS "")
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        list(APPEND _NS_WINSDK_HINTS
+            "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+        )
+    endif()
+    file(GLOB _NS_WINSDK_BINS "C:/Program Files (x86)/Windows Kits/10/bin/10.0.*/x64")
+    if(_NS_WINSDK_BINS)
+        list(SORT _NS_WINSDK_BINS ORDER DESCENDING)
+        list(APPEND _NS_WINSDK_HINTS ${_NS_WINSDK_BINS})
+    endif()
+    foreach(_SDK_BIN ${_NS_WINSDK_HINTS})
+        if(EXISTS "${_SDK_BIN}/dxcompiler.dll" AND EXISTS "${_SDK_BIN}/dxil.dll")
+            set(_NS_DXC_DLL "${_SDK_BIN}/dxcompiler.dll")
+            set(_NS_DXIL_DLL "${_SDK_BIN}/dxil.dll")
+            break()
+        endif()
+    endforeach()
+    if(_NS_DXC_DLL AND _NS_DXIL_DLL)
+        add_custom_command(TARGET NorthstarD3D12 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_NS_DXIL_DLL}"
+                "$<TARGET_FILE_DIR:NorthstarD3D12>/dxil.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_NS_DXC_DLL}"
+                "$<TARGET_FILE_DIR:NorthstarD3D12>/dxcompiler.dll"
+            COMMENT "Deploying DXC SM 6.6 runtime libraries (dxil.dll, dxcompiler.dll)"
+            VERBATIM
+        )
+        install(FILES "${_NS_DXIL_DLL}" "${_NS_DXC_DLL}" DESTINATION bin)
+    endif()
+endif()
 
 # -------------------- 5. NorthstarD3D11 Shared Library (Stub) --------------------
 add_library(NorthstarD3D11 SHARED

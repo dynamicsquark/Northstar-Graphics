@@ -22,11 +22,16 @@ namespace Northstar
         BOOL          HasIndices()           const { return !m_indices.empty(); }
         BOOL          HasCPUData()           const { return !m_vertices.empty(); }
 
-        //==================== VIRTUAL GEOMETRY (NVG) ====================
+        //==================== VIRTUAL GEOMETRY (NVG) & SUBMESHES ====================
         GeometryMode       GetGeometryMode()        const { return m_geometryMode; }
         BOOL               IsVirtualized()          const { return m_geometryMode == GeometryMode::VIRTUALIZED && m_nvgInfo.valid; }
         UINT32             GetVirtualMeshId()       const { return m_nvgInfo.virtualMeshId; }
         const NVGMeshInfo& GetVirtualMeshInfo()     const { return m_nvgInfo; }
+
+        UINT32                                  GetSubmeshCount()       const { return static_cast<UINT32>(m_submeshes.size()); }
+        const std::vector<NVGSubmeshRange>&     GetSubmeshes()          const { return m_submeshes; }
+        const NVGSubmeshRange&                  GetSubmesh(UINT32 idx)  const { return m_submeshes[idx]; }
+        const std::shared_ptr<INVGPageStreamProvider>& GetPageStreamProvider() const { return m_pageStreamProvider; }
 
         //==================== GPU HANDLES ====================
         NativeHandle GetVertexBufferHandle() const { return m_vertexBuffer; }
@@ -119,6 +124,22 @@ namespace Northstar
             ++m_stateRevision;
         }
 
+        void SetSubmeshes(const NVGSubmeshRange* ranges, UINT32 count)
+        {
+            m_submeshes.clear();
+            if (ranges && count > 0u)
+            {
+                m_submeshes.assign(ranges, ranges + count);
+            }
+            ++m_stateRevision;
+        }
+
+        void SetPageStreamProvider(std::shared_ptr<INVGPageStreamProvider> provider)
+        {
+            m_pageStreamProvider = std::move(provider);
+            ++m_stateRevision;
+        }
+
         void ClearCPUData()
         {
             m_vertices.clear();
@@ -128,6 +149,7 @@ namespace Northstar
         //==================== CPU DATA ====================
         std::vector<Vertex>      m_vertices;
         std::vector<UINT32>      m_indices;
+        std::vector<NVGSubmeshRange> m_submeshes;
         UINT32                   m_vertexBufferOffset = 0;
         UINT32                   m_indexBufferOffset  = 0;
 
@@ -140,7 +162,8 @@ namespace Northstar
         UINT32                   m_stateRevision  = 1;
 
         //==================== NVG METADATA ====================
-        GeometryMode             m_geometryMode   = GeometryMode::STANDARD;
-        NVGMeshInfo              m_nvgInfo        = {};
+        GeometryMode                            m_geometryMode       = GeometryMode::STANDARD;
+        NVGMeshInfo                             m_nvgInfo            = {};
+        std::shared_ptr<INVGPageStreamProvider> m_pageStreamProvider = nullptr;
     };
 }

@@ -3,6 +3,7 @@
 #include "../../include/nvg/nvg_types.h"
 #include "../runtime/core_buffer_manager.h"
 #include "nvg_builder.h"
+#include "nvg_async_stream_io.h"
 
 #include <string>
 #include <unordered_map>
@@ -38,11 +39,12 @@ namespace Northstar
         // Registers a built/deserialized virtual mesh asset under Mesh::GetGPUSceneMeshId().
         // Immediately allocates & uploads pinned Root Pages without CPU fence stalls.
         BOOL RegisterVirtualMesh(
-            UINT32                    meshId,
-            NVGVirtualMeshAsset&&     asset,
-            const INVGPageDataSource* customSource,
-            UINT64                    currentFrameIndex,
-            std::string&              outError);
+            UINT32                                  meshId,
+            NVGVirtualMeshAsset&&                   asset,
+            const INVGPageDataSource*               customSource,
+            UINT64                                  currentFrameIndex,
+            std::string&                            outError,
+            std::shared_ptr<INVGPageStreamProvider> streamProvider = nullptr);
 
         // Invalidates virtual mesh metadata & places its physical pages into fence-safe deferred retirement.
         void UnregisterVirtualMesh(UINT32 meshId, UINT64 currentFrameIndex);
@@ -108,18 +110,19 @@ namespace Northstar
     private:
         struct RegisteredMeshRecord
         {
-            UINT32                    meshId             = 0u;
-            NVGVirtualMeshAsset       asset;
-            const INVGPageDataSource* pageSource         = nullptr; // Points to custom source or &m_defaultMemorySource
-            UINT32                    nodeBase           = 0u;
-            UINT32                    nodeCount          = 0u;
-            UINT32                    clusterBase        = 0u;
-            UINT32                    clusterCount       = 0u;
-            UINT32                    groupBase          = 0u;
-            UINT32                    groupCount         = 0u;
-            UINT32                    virtualPageBase    = 0u;
-            UINT32                    virtualPageCount   = 0u;
-            UINT32                    rootPageCount      = 0u;
+            UINT32                                  meshId             = 0u;
+            NVGVirtualMeshAsset                     asset;
+            const INVGPageDataSource*               pageSource         = nullptr; // Points to custom source or &m_defaultMemorySource
+            std::shared_ptr<INVGPageStreamProvider> streamProvider     = nullptr; // Optional async disk/LZ4 stream provider (0 streaming RAM)
+            UINT32                                  nodeBase           = 0u;
+            UINT32                                  nodeCount          = 0u;
+            UINT32                                  clusterBase        = 0u;
+            UINT32                                  clusterCount       = 0u;
+            UINT32                                  groupBase          = 0u;
+            UINT32                                  groupCount         = 0u;
+            UINT32                                  virtualPageBase    = 0u;
+            UINT32                                  virtualPageCount   = 0u;
+            UINT32                                  rootPageCount      = 0u;
         };
 
         struct PhysicalPageSlot
@@ -179,6 +182,17 @@ namespace Northstar
             UINT32         requiredElements,
             GPUBufferUsage usage);
 
+        BOOL PlanTransactionalSlotAcquisitions(
+            UINT32               neededCount,
+            UINT64               currentFrameIndex,
+            UINT32               incomingPriority,
+            std::vector<UINT32>& outPlannedSlots) const;
+
+        BOOL ReadMeshPageSynchronous(
+            const RegisteredMeshRecord& rec,
+            UINT32                      localPageIndex,
+            BYTE*                       outPageBytes) const;
+
         UINT32 AcquirePhysicalSlot(
             UINT64                                  currentFrameIndex,
             UINT32                                  incomingPriority,
@@ -231,6 +245,10 @@ namespace Northstar
 
         std::unordered_map<UINT32, RegisteredMeshRecord> m_registeredMeshes;
         NVGMemoryPageDataSource                          m_defaultMemorySource;
+        NVGAsyncPageStreamer                             m_asyncStreamer;
+        std::vector<NVGCompletedStreamPage>              m_completedAsyncPages;
+        std::vector<NVGResidencyChangedRegion>           m_pendingEvictionRegions;
+        std::vector<UINT32>                              m_pendingEvictedMeshIds;
 
         // Physical VRAM page pool allocator & fence-safe metadata free-range allocators
         std::vector<PhysicalPageSlot>           m_physicalSlots;

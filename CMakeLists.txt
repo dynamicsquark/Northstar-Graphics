@@ -8,7 +8,7 @@ if(POLICY CMP0141)
     set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
 endif()
 
-project(NorthstarGraphics VERSION 0.6.0 LANGUAGES CXX)
+project(NorthstarGraphics VERSION 0.7.0 LANGUAGES CXX)
 
 if(MSVC AND NOT POLICY CMP0141)
     string(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")

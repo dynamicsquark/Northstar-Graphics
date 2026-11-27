@@ -148,7 +148,7 @@ namespace Northstar
         outView.deltaTime            = stats.deltaTimeSeconds;
         outView.elapsedTime          = static_cast<FLOAT32>(stats.elapsedTimeSeconds);
         outView.hasAuthoritativeTime = true;
-        BuildCameraData(camera, defaultRenderTarget, outView.camera);
+        BuildCameraData(camera, defaultRenderTarget, outView.frameIndex, outView.camera);
         outView.renderTarget      = outView.camera.renderTarget;
         outView.sceneDepthTexture = outView.camera.renderTarget.depthStencilTexture;
         if (scene)
@@ -289,7 +289,64 @@ namespace Northstar
             if (!obj) continue;
 
             Material* mat = obj->GetMaterial();
-            const BOOL isVirtualizedObj = (obj->GetMesh() != nullptr && obj->GetMesh()->IsVirtualized());
+            const Mesh* objMesh = obj->GetMesh();
+            const BOOL isVirtualizedObj = (objMesh != nullptr && objMesh->IsVirtualized());
+            const BOOL hasMultiSubmeshes = (objMesh != nullptr && !isVirtualizedObj && objMesh->GetSubmeshCount() > 0u);
+            if (hasMultiSubmeshes)
+            {
+                const UINT32 subCnt = objMesh->GetSubmeshCount();
+                BOOL anyOpaqueSub = false;
+                BOOL anyTransSub  = false;
+                for (UINT32 si = 0u; si < subCnt; ++si)
+                {
+                    Material* slotMat = obj->GetMaterial(objMesh->GetSubmesh(si).materialSlot);
+                    if (!slotMat) continue;
+                    if (slotMat->HasComputeKernels())
+                    {
+                        for (ComputeKernel* k : slotMat->GetComputeKernels())
+                        {
+                            if (!k || !k->IsValid() || isRegisteredInScene(k)) continue;
+                            BOOL alreadyQueued = false;
+                            for (const ComputeKernel* existing : prePassKernels)
+                            {
+                                if (existing == k) { alreadyQueued = true; break; }
+                            }
+                            if (!alreadyQueued && canExecuteInThisView(k, k->GetExecutionScope()))
+                            {
+                                prePassKernels.push_back(k);
+                            }
+                        }
+                    }
+                    if (slotMat->IsTransparent()) anyTransSub = true;
+                    else                          anyOpaqueSub = true;
+                }
+                if (anyOpaqueSub) opaqueObjects.push_back(obj);
+                if (anyTransSub)  transparentObjects.push_back(obj);
+                continue;
+            }
+            if (isVirtualizedObj)
+            {
+                const UINT32 matSlotCnt = (std::max)(1u, obj->GetMaterialSlotCount());
+                for (UINT32 ms = 0u; ms < matSlotCnt; ++ms)
+                {
+                    Material* slotMat = obj->GetMaterial(ms);
+                    if (!slotMat || !slotMat->HasComputeKernels()) continue;
+                    for (ComputeKernel* k : slotMat->GetComputeKernels())
+                    {
+                        if (!k || !k->IsValid() || isRegisteredInScene(k)) continue;
+                        BOOL alreadyQueued = false;
+                        for (const ComputeKernel* existing : prePassKernels)
+                        {
+                            if (existing == k) { alreadyQueued = true; break; }
+                        }
+                        if (!alreadyQueued && canExecuteInThisView(k, k->GetExecutionScope()))
+                        {
+                            prePassKernels.push_back(k);
+                        }
+                    }
+                }
+                continue; // Handled fully on GPU by Northstar Virtual Geometry (NVG) — 0 CPU draw calls
+            }
             if (mat)
             {
                 if (mat->HasComputeKernels())
@@ -309,10 +366,6 @@ namespace Northstar
                             prePassKernels.push_back(k);
                         }
                     }
-                }
-                if (isVirtualizedObj)
-                {
-                    continue; // Handled fully on GPU by Northstar Virtual Geometry (NVG) — 0 CPU draw calls
                 }
                 if (mat->IsTransparent())
                 {
@@ -376,13 +429,18 @@ namespace Northstar
             for (RenderObject* obj : opaqueObjects)
             {
                 if (!obj) continue;
-                const Material* mat = obj->GetMaterial();
-                if (mat && checkedPrepassMats.insert(mat).second &&
-                    DoesOpaqueMaterialRequireDepthPrepass(mat, activeDepthTex))
+                const UINT32 matSlotCnt = (std::max)(1u, obj->GetMaterialSlotCount());
+                for (UINT32 ms = 0u; ms < matSlotCnt; ++ms)
                 {
-                    opaqueMaterialRequiresPrepass = true;
-                    break;
+                    const Material* slotMat = obj->GetMaterial(ms);
+                    if (slotMat && checkedPrepassMats.insert(slotMat).second &&
+                        DoesOpaqueMaterialRequireDepthPrepass(slotMat, activeDepthTex))
+                    {
+                        opaqueMaterialRequiresPrepass = true;
+                        break;
+                    }
                 }
+                if (opaqueMaterialRequiresPrepass) break;
             }
             if (!opaqueMaterialRequiresPrepass && gpuSceneSt.virtualActiveObjectCount > 0u)
             {
@@ -391,13 +449,18 @@ namespace Northstar
                     if (!obj || !obj->HasFlag(RenderObjectFlags::VISIBLE)) continue;
                     const Mesh* m = obj->GetMesh();
                     if (!m || !m->IsVirtualized()) continue;
-                    const Material* mat = obj->GetMaterial();
-                    if (mat && checkedPrepassMats.insert(mat).second &&
-                        DoesOpaqueMaterialRequireDepthPrepass(mat, activeDepthTex))
+                    const UINT32 matSlotCnt = (std::max)(1u, obj->GetMaterialSlotCount());
+                    for (UINT32 ms = 0u; ms < matSlotCnt; ++ms)
                     {
-                        opaqueMaterialRequiresPrepass = true;
-                        break;
+                        const Material* slotMat = obj->GetMaterial(ms);
+                        if (slotMat && checkedPrepassMats.insert(slotMat).second &&
+                            DoesOpaqueMaterialRequireDepthPrepass(slotMat, activeDepthTex))
+                        {
+                            opaqueMaterialRequiresPrepass = true;
+                            break;
+                        }
                     }
+                    if (opaqueMaterialRequiresPrepass) break;
                 }
             }
         }
@@ -412,15 +475,33 @@ namespace Northstar
         const BOOL useInterleavedPasses = depthPrepassActive || !postOpaqueKernels.empty();
 
         auto accumulateCmds = [&](const std::vector<DrawCommand>& cmds, BOOL isGeometryPass) {
+            NativeHandle prevVS = 0;
+            NativeHandle prevPS = 0;
+            BOOL hasPrevProg    = false;
             for (SIZE_T i = 0; i < cmds.size(); ++i)
             {
                 stats.drawCalls++;
+                const UINT32 cmdTris = ((cmds[i].indexCount > 0) ? (cmds[i].indexCount / 3) : (cmds[i].vertexCount / 3)) * cmds[i].instanceCount;
+                if (!hasPrevProg || cmds[i].vertexShader != prevVS || cmds[i].pixelShader != prevPS)
+                {
+                    if (hasPrevProg)
+                    {
+                        stats.shaderSetSwitches++;
+                    }
+                    prevVS      = cmds[i].vertexShader;
+                    prevPS      = cmds[i].pixelShader;
+                    hasPrevProg = true;
+                }
                 if (isGeometryPass)
                 {
                     stats.geometryDrawCalls++;
+                    stats.vertexCount += cmds[i].vertexCount * cmds[i].instanceCount;
+                    stats.triangleCount += cmdTris;
                 }
-                stats.vertexCount += cmds[i].vertexCount * cmds[i].instanceCount;
-                stats.triangleCount += ((cmds[i].indexCount > 0) ? (cmds[i].indexCount / 3) : (cmds[i].vertexCount / 3)) * cmds[i].instanceCount;
+                else
+                {
+                    stats.depthPrepassTriangles += cmdTris;
+                }
             }
         };
 
@@ -429,6 +510,8 @@ namespace Northstar
         stats.geometryDrawCalls = 0;
         stats.triangleCount = 0;
         stats.vertexCount = 0;
+        stats.depthPrepassTriangles = 0;
+        stats.shaderSetSwitches = 0;
 
         if (!outView.geometryPass.opaqueCommands.empty())
         {
@@ -450,6 +533,23 @@ namespace Northstar
                 {
                     if (!obj) continue;
                     Material* mat = obj->GetMaterial();
+                    const Mesh* m = obj->GetMesh();
+                    if (m && m->GetSubmeshCount() > 0u)
+                    {
+                        BOOL anyDepthSub = false;
+                        for (UINT32 si = 0u; si < m->GetSubmeshCount(); ++si)
+                        {
+                            const Material* sm = obj->GetMaterial(m->GetSubmesh(si).materialSlot);
+                            if (sm && !sm->IsTransparent() && sm->GetDepthState().test && sm->GetDepthState().write)
+                            {
+                                anyDepthSub = true;
+                                break;
+                            }
+                        }
+                        if (!anyDepthSub) continue;
+                        depthOpaqueObjects.push_back(obj);
+                        continue;
+                    }
                     if (mat && (!mat->GetDepthState().test || !mat->GetDepthState().write))
                         continue;
                     depthOpaqueObjects.push_back(obj);
@@ -555,42 +655,54 @@ namespace Northstar
         {
             if (!transObj) continue;
             Mesh* effMesh = ResolveEffectiveMesh(transObj, outView.camera);
-            Material* transMat = transObj->GetMaterial();
-            if (!effMesh || !transMat) continue;
+            if (!effMesh) continue;
 
-            const BOOL isSkinnedObj = transObj->HasFlag(RenderObjectFlags::SKINNED) || transObj->HasSkinningMatrices();
-            if (!transObj->HasSkinningMatrices())
+            const UINT32 subCount = effMesh->GetSubmeshCount();
+            const UINT32 passLoops = (subCount > 0u) ? subCount : 1u;
+            for (UINT32 si = 0u; si < passLoops; ++si)
             {
-                ShaderSet* ss   = transMat->GetEffectiveShaderSet(PassType::GEOMETRY, isSkinnedObj);
-                Shader* checkVS = ss ? ss->GetVertexShader(isSkinnedObj ? ShaderVariant::SKINNED : ShaderVariant::STANDARD) : nullptr;
-                if (checkVS && checkVS->IsValid() && CoreResourceBindingResolver::DoesShaderRequireEngineSkinning(checkVS->GetReflection()))
+                const UINT32 subArg = (subCount > 0u) ? si : 0xFFFFFFFFu;
+                Material* transMat  = (subCount > 0u)
+                    ? transObj->GetMaterial(effMesh->GetSubmesh(si).materialSlot)
+                    : transObj->GetMaterial();
+                if (!transMat || !transMat->IsTransparent()) continue;
+
+                const BOOL isSkinnedObj = transObj->HasFlag(RenderObjectFlags::SKINNED) || transObj->HasSkinningMatrices();
+                if (!transObj->HasSkinningMatrices())
                 {
-                    stats.skippedMissingSkinningObjects++;
-                    continue;
+                    ShaderSet* ss   = transMat->GetEffectiveShaderSet(PassType::GEOMETRY, isSkinnedObj);
+                    Shader* checkVS = ss ? ss->GetVertexShader(isSkinnedObj ? ShaderVariant::SKINNED : ShaderVariant::STANDARD) : nullptr;
+                    if (checkVS && checkVS->IsValid() && CoreResourceBindingResolver::DoesShaderRequireEngineSkinning(checkVS->GetReflection()))
+                    {
+                        stats.skippedMissingSkinningObjects++;
+                        continue;
+                    }
                 }
+
+                DrawCommand transCmd{};
+                if (!BuildDrawCommand(transObj, PassType::GEOMETRY, outView, cameraPos, transCmd, ShaderVariant::COUNT, nullptr, &outView.prePassComputeDispatches, scene, subArg))
+                    continue;
+
+                const UINT32 boneOff    = transObj->GetSkinningPaletteOffset(scene);
+                const UINT32 boneCnt    = transObj->GetSkinningMatrixCount();
+                const UINT32 packedSkin = (boneCnt > 0u) ? PackGPUSceneSkinnedBoneRange(boneOff, boneCnt) : 0u;
+                transCmd.instanceSkinning.clear();
+                transCmd.instanceSkinning.push_back({ boneOff, boneCnt, transObj->GetSkinningRevision() });
+                transCmd.bufferCategory = BufferCategory::DYNAMIC_OBJECT;
+                transCmd.instanceCount  = 1u;
+                transCmd.startInstance  = 0u;
+                transCmd.instances.clear();
+                transCmd.instancePrevWorldMatrices.clear();
+
+                InstanceData inst{};
+                inst.worldMatrix = transObj->GetWorldMatrix();
+                inst.instanceId  = 0u;
+                inst.customData  = packedSkin;
+                transCmd.instances.push_back(inst);
+                transCmd.instancePrevWorldMatrices.push_back(transCmd.prevWorldMatrix);
+
+                outView.geometryPass.transparentCommands.push_back(std::move(transCmd));
             }
-
-            DrawCommand transCmd{};
-            if (!BuildDrawCommand(transObj, PassType::GEOMETRY, outView, cameraPos, transCmd, ShaderVariant::COUNT, nullptr, &outView.prePassComputeDispatches, scene))
-                continue;
-
-            const UINT32 boneOff    = transObj->GetSkinningPaletteOffset(scene);
-            const UINT32 boneCnt    = transObj->GetSkinningMatrixCount();
-            const UINT32 packedSkin = (boneCnt > 0u) ? PackGPUSceneSkinnedBoneRange(boneOff, boneCnt) : 0u;
-            transCmd.instanceSkinning.clear();
-            transCmd.instanceSkinning.push_back({ boneOff, boneCnt, transObj->GetSkinningRevision() });
-            transCmd.bufferCategory = BufferCategory::DYNAMIC_OBJECT;
-            transCmd.instanceCount  = 1u;
-            transCmd.startInstance  = 0u;
-            transCmd.instances.clear();
-
-            InstanceData inst{};
-            inst.worldMatrix = transObj->GetWorldMatrix();
-            inst.instanceId  = 0u;
-            inst.customData  = packedSkin;
-            transCmd.instances.push_back(inst);
-
-            outView.geometryPass.transparentCommands.push_back(std::move(transCmd));
         }
         const auto tTransCmdEnd = std::chrono::high_resolution_clock::now();
         stats.drawCmdGenCpuMs += std::chrono::duration<float, std::milli>(tTransCmdEnd - tTransCmdStart).count();
@@ -682,7 +794,7 @@ namespace Northstar
                                                           FrameView& ioView,
                                                           const FrameNVSSamplingContext* nvsContext)
     {
-        BuildCameraData(camera, defaultRenderTarget, ioView.camera);
+        BuildCameraData(camera, defaultRenderTarget, ioView.frameIndex, ioView.camera);
         ioView.renderTarget      = ioView.camera.renderTarget;
         ioView.sceneDepthTexture = ioView.camera.renderTarget.depthStencilTexture;
         if (scene)
@@ -713,13 +825,40 @@ namespace Northstar
         }
     }
 
-    void CoreRenderPipeline::BuildCameraData(Camera* camera, const NativeRenderTarget& defaultRenderTarget, FrameCameraData& outCamera)
+    void CoreRenderPipeline::BuildCameraData(Camera* camera, const NativeRenderTarget& defaultRenderTarget, UINT64 frameIndex, FrameCameraData& outCamera)
     {
         if (camera)
         {
-            outCamera.viewMatrix           = camera->GetViewMatrix();
-            outCamera.projectionMatrix     = camera->GetProjectionMatrix();
-            outCamera.viewProjectionMatrix = camera->GetViewProjectionMatrix();
+            outCamera.viewMatrix              = camera->GetViewMatrix();
+            outCamera.projectionMatrix        = camera->GetProjectionMatrix();
+            outCamera.viewProjectionMatrix    = camera->GetViewProjectionMatrix();
+            outCamera.invViewProjectionMatrix = outCamera.viewProjectionMatrix.Inverted();
+
+            CameraHistoryEntry& hist = m_cameraHistory[camera];
+            if (!hist.initialized)
+            {
+                hist.prevView    = outCamera.viewMatrix;
+                hist.prevProj    = outCamera.projectionMatrix;
+                hist.prevVP      = outCamera.viewProjectionMatrix;
+                hist.lastView    = outCamera.viewMatrix;
+                hist.lastProj    = outCamera.projectionMatrix;
+                hist.lastVP      = outCamera.viewProjectionMatrix;
+                hist.lastFrame   = frameIndex;
+                hist.initialized = true;
+            }
+            else if (hist.lastFrame != frameIndex)
+            {
+                hist.prevView  = hist.lastView;
+                hist.prevProj  = hist.lastProj;
+                hist.prevVP    = hist.lastVP;
+                hist.lastView  = outCamera.viewMatrix;
+                hist.lastProj  = outCamera.projectionMatrix;
+                hist.lastVP    = outCamera.viewProjectionMatrix;
+                hist.lastFrame = frameIndex;
+            }
+            outCamera.prevViewMatrix           = hist.prevView;
+            outCamera.prevProjectionMatrix     = hist.prevProj;
+            outCamera.prevViewProjectionMatrix = hist.prevVP;
             outCamera.position             = camera->GetPosition();
             outCamera.rotation             = camera->GetRotation();
             outCamera.direction            = camera->GetDirection();
@@ -755,9 +894,13 @@ namespace Northstar
         }
         else
         {
-            outCamera.viewMatrix           = Mat4::Identity();
-            outCamera.projectionMatrix     = Mat4::Identity();
-            outCamera.viewProjectionMatrix = Mat4::Identity();
+            outCamera.viewMatrix              = Mat4::Identity();
+            outCamera.projectionMatrix        = Mat4::Identity();
+            outCamera.viewProjectionMatrix    = Mat4::Identity();
+            outCamera.invViewProjectionMatrix = Mat4::Identity();
+            outCamera.prevViewMatrix          = Mat4::Identity();
+            outCamera.prevProjectionMatrix    = Mat4::Identity();
+            outCamera.prevViewProjectionMatrix= Mat4::Identity();
             outCamera.position             = Vec3(0.0f, 0.0f, 0.0f);
             outCamera.rotation             = Quat();
             outCamera.direction            = Vec3(0.0f, 0.0f, 1.0f);
@@ -802,6 +945,7 @@ namespace Northstar
         outLd.shadowNormalBias     = light->GetShadowNormalBias();
         outLd.shadowNearPlane      = light->GetShadowNearPlane();
         outLd.shadowMaxDistance    = light->GetShadowMaxDistance();
+        outLd.cullingMask          = light->GetCullingMask();
 
         const BOOL wantsShadow = light->HasFlag(LightFlags::ENABLED) && light->HasFlag(LightFlags::CAST_SHADOW);
         outLd.castsShadow      = 0u;
@@ -928,6 +1072,10 @@ namespace Northstar
         {
             return frame.nvsShadowMapTexture;
         }
+        if (propName == "NVG_VISIBILITY_BUFFER")
+        {
+            return frame.nvgVisibilityTexture;
+        }
         return 0;
     }
 
@@ -1039,6 +1187,13 @@ namespace Northstar
                         const std::string& pName = f.propertyName.empty() ? f.name : f.propertyName;
                         if (pName == "INSTANCE_WORLD_MATRIX" && maxWrite >= sizeof(Mat4))
                             std::memcpy(elemPtr + f.offset, &instData.worldMatrix, sizeof(Mat4));
+                        else if (pName == "INSTANCE_PREV_WORLD_MATRIX" && maxWrite >= sizeof(Mat4))
+                        {
+                            const Mat4& prevW = (i < cmd.instancePrevWorldMatrices.size())
+                                ? cmd.instancePrevWorldMatrices[i]
+                                : instData.worldMatrix;
+                            std::memcpy(elemPtr + f.offset, &prevW, sizeof(Mat4));
+                        }
                         else if (pName == "INSTANCE_ID_VALUE" && maxWrite >= sizeof(UINT32))
                             std::memcpy(elemPtr + f.offset, &instData.instanceId, sizeof(UINT32));
                         else if (pName == "INSTANCE_CUSTOM_DATA" && maxWrite >= sizeof(UINT32))
@@ -1168,23 +1323,30 @@ namespace Northstar
         ShaderVariant overrideVertexVariant,
         const InternalResourceManager* internalResources,
         std::vector<ComputeDispatchCommand>* outPreDrawDispatches,
-        const Scene* scene)
+        const Scene* scene,
+        UINT32 submeshIndex)
     {
         if (!obj) return false;
 
         Mesh* mesh = ResolveEffectiveMesh(obj, frameView.camera);
         if (!mesh) return false;
 
-        Material* mat = obj->GetMaterial();
+        const BOOL useSubmeshRange = (submeshIndex < mesh->GetSubmeshCount());
+        Material* mat = useSubmeshRange
+            ? obj->GetMaterial(mesh->GetSubmesh(submeshIndex).materialSlot)
+            : obj->GetMaterial();
 
         // Geometry
         outCmd.vertexBuffer = mesh->GetVertexBufferHandle();
         outCmd.indexBuffer  = mesh->GetIndexBufferHandle();
         outCmd.vertexCount  = mesh->GetVertexCount();
-        outCmd.indexCount   = mesh->GetIndexCount();
+        outCmd.indexCount   = useSubmeshRange ? mesh->GetSubmesh(submeshIndex).indexCount : mesh->GetIndexCount();
+        outCmd.startIndex   = useSubmeshRange ? mesh->GetSubmesh(submeshIndex).startIndex : 0u;
+        outCmd.baseVertex   = 0u;
         outCmd.cpuVertices  = mesh->GetVertices();
         outCmd.cpuIndices   = mesh->GetIndices();
-        outCmd.worldMatrix  = obj->GetWorldMatrix();
+        outCmd.worldMatrix     = obj->GetWorldMatrix();
+        outCmd.prevWorldMatrix = obj->GetPrevWorldMatrix(scene);
 
         const BOOL isSkinned = obj->HasFlag(RenderObjectFlags::SKINNED) || obj->HasSkinningMatrices();
         const BOOL isDepthPrepass = (internalResources != nullptr);
@@ -1316,6 +1478,7 @@ namespace Northstar
             resolveCtx.material             = mat;
             resolveCtx.passType             = isDepthPrepass ? PassType::DEPTH : pass;
             resolveCtx.worldMatrix          = outCmd.worldMatrix;
+            resolveCtx.prevWorldMatrix      = outCmd.prevWorldMatrix;
             resolveCtx.gpuSceneObjectSlot   = (!isInstancedVariant && obj) ? obj->GetGPUSceneHandle(scene).slotIndex : kInvalidGPUSceneSlot;
             resolveCtx.geometryMode         = static_cast<UINT32>(GeometryMode::STANDARD);
             resolveCtx.nvgDrawBucketId      = kNVGInvalidIndex;
@@ -1710,6 +1873,11 @@ namespace Northstar
                                     {
                                         tb.nullViewType = TextureType::TEXTURE_2D_ARRAY;
                                         tb.nullFormat   = TextureFormat::R32_FLOAT;
+                                    }
+                                    else if (nscTex.propertyName == "NVG_VISIBILITY_BUFFER")
+                                    {
+                                        tb.nullViewType = TextureType::TEXTURE_2D;
+                                        tb.nullFormat   = TextureFormat::RG32_UINT;
                                     }
                                     else
                                     {
@@ -2243,7 +2411,8 @@ namespace Northstar
             {
                 fovYRad = 2.0f * std::atan(1.0f / std::fabs(cameraData.projectionMatrix.m[5]));
             }
-            const INT32 lodIdx = lodGroup->GetCurrentLODIndex(objPos, objScale, cameraData.position, fovYRad);
+            const Quat objRot   = obj->GetWorldMatrix().GetRotation();
+            const INT32 lodIdx  = lodGroup->GetCurrentLODIndex(objPos, objScale, cameraData.position, fovYRad, objRot);
             if (lodIdx < 0)
             {
                 return nullptr;
@@ -2266,13 +2435,14 @@ namespace Northstar
     {
         struct BatchKey
         {
-            Mesh*     mesh      = nullptr;
-            Material* material  = nullptr;
-            BOOL      isSkinned = false;
+            Mesh*     mesh         = nullptr;
+            Material* material     = nullptr;
+            UINT32    submeshIndex = 0xFFFFFFFFu;
+            BOOL      isSkinned    = false;
 
             BOOL operator==(const BatchKey& o) const
             {
-                return mesh == o.mesh && material == o.material && isSkinned == o.isSkinned;
+                return mesh == o.mesh && material == o.material && submeshIndex == o.submeshIndex && isSkinned == o.isSkinned;
             }
         };
 
@@ -2280,27 +2450,52 @@ namespace Northstar
         {
             SIZE_T operator()(const BatchKey& k) const
             {
-                return std::hash<void*>{}(k.mesh) ^ (std::hash<void*>{}(k.material) << 1) ^ (static_cast<SIZE_T>(k.isSkinned) << 2);
+                return std::hash<void*>{}(k.mesh) ^
+                       (std::hash<void*>{}(k.material) << 1) ^
+                       (static_cast<SIZE_T>(k.submeshIndex) << 3) ^
+                       (static_cast<SIZE_T>(k.isSkinned) << 2);
             }
         };
 
         std::unordered_map<BatchKey, std::vector<RenderObject*>, BatchKeyHash> groups;
         std::vector<BatchKey> keyOrder;
 
+        const BOOL isDepthPrepassFilter = (internalResources != nullptr);
         for (RenderObject* obj : objects)
         {
             if (!obj) continue;
             Mesh* mesh = ResolveEffectiveMesh(obj, frameView.camera);
-            Material* mat = obj->GetMaterial();
-            if (!mesh || !mat) continue;
+            if (!mesh) continue;
 
             const BOOL objSkinned = obj->HasFlag(RenderObjectFlags::SKINNED) || obj->HasSkinningMatrices();
-            BatchKey key{ mesh, mat, objSkinned };
-            if (groups.find(key) == groups.end())
+            const UINT32 subCnt   = mesh->GetSubmeshCount();
+            if (subCnt > 0u)
             {
-                keyOrder.push_back(key);
+                for (UINT32 si = 0u; si < subCnt; ++si)
+                {
+                    Material* slotMat = obj->GetMaterial(mesh->GetSubmesh(si).materialSlot);
+                    if (!slotMat || slotMat->IsTransparent()) continue;
+                    if (isDepthPrepassFilter && (!slotMat->GetDepthState().test || !slotMat->GetDepthState().write))
+                        continue;
+                    BatchKey key{ mesh, slotMat, si, objSkinned };
+                    if (groups.find(key) == groups.end())
+                    {
+                        keyOrder.push_back(key);
+                    }
+                    groups[key].push_back(obj);
+                }
             }
-            groups[key].push_back(obj);
+            else
+            {
+                Material* mat = obj->GetMaterial();
+                if (!mat) continue;
+                BatchKey key{ mesh, mat, 0xFFFFFFFFu, objSkinned };
+                if (groups.find(key) == groups.end())
+                {
+                    keyOrder.push_back(key);
+                }
+                groups[key].push_back(obj);
+            }
         }
 
         for (const BatchKey& key : keyOrder)
@@ -2341,13 +2536,16 @@ namespace Northstar
                     continue;
 
                 DrawCommand baseCmd{};
-                if (!BuildDrawCommand(repObj, pass, frameView, cameraPos, baseCmd, instVariant, internalResources, outPreDrawDispatches, scene))
+                if (!BuildDrawCommand(repObj, pass, frameView, cameraPos, baseCmd, instVariant, internalResources, outPreDrawDispatches, scene, key.submeshIndex))
                     continue;
 
+                const BOOL useSub = (key.submeshIndex < key.mesh->GetSubmeshCount());
                 baseCmd.vertexBuffer = key.mesh->GetVertexBufferHandle();
                 baseCmd.indexBuffer  = key.mesh->GetIndexBufferHandle();
                 baseCmd.vertexCount  = key.mesh->GetVertexCount();
-                baseCmd.indexCount   = key.mesh->GetIndexCount();
+                baseCmd.indexCount   = useSub ? key.mesh->GetSubmesh(key.submeshIndex).indexCount : key.mesh->GetIndexCount();
+                baseCmd.startIndex   = useSub ? key.mesh->GetSubmesh(key.submeshIndex).startIndex : 0u;
+                baseCmd.baseVertex   = 0u;
                 baseCmd.cpuVertices  = key.mesh->GetVertices();
                 baseCmd.cpuIndices   = key.mesh->GetIndices();
 
@@ -2359,6 +2557,7 @@ namespace Northstar
                 baseCmd.bufferCategory = BufferCategory::INSTANCE;
                 baseCmd.startInstance  = 0;
                 baseCmd.instances.clear();
+                baseCmd.instancePrevWorldMatrices.clear();
                 baseCmd.instanceSkinning.clear();
 
                 UINT32 validIdx = 0u;
@@ -2378,6 +2577,7 @@ namespace Northstar
                     inst.instanceId  = validIdx++;
                     inst.customData  = (boneCnt > 0u) ? PackGPUSceneSkinnedBoneRange(boneOff, boneCnt) : 0u;
                     baseCmd.instances.push_back(inst);
+                    baseCmd.instancePrevWorldMatrices.push_back(group[i]->GetPrevWorldMatrix(scene));
 
                     InstanceSkinningData skinInst{};
                     skinInst.bonePaletteOffset = boneOff;
@@ -2414,13 +2614,16 @@ namespace Northstar
                     }
                 }
                 DrawCommand singleCmd{};
-                if (!BuildDrawCommand(obj, pass, frameView, cameraPos, singleCmd, ShaderVariant::COUNT, internalResources, outPreDrawDispatches, scene))
+                if (!BuildDrawCommand(obj, pass, frameView, cameraPos, singleCmd, ShaderVariant::COUNT, internalResources, outPreDrawDispatches, scene, key.submeshIndex))
                     continue;
 
+                    const BOOL useSub = (key.submeshIndex < key.mesh->GetSubmeshCount());
                     singleCmd.vertexBuffer = key.mesh->GetVertexBufferHandle();
                     singleCmd.indexBuffer  = key.mesh->GetIndexBufferHandle();
                     singleCmd.vertexCount  = key.mesh->GetVertexCount();
-                    singleCmd.indexCount   = key.mesh->GetIndexCount();
+                    singleCmd.indexCount   = useSub ? key.mesh->GetSubmesh(key.submeshIndex).indexCount : key.mesh->GetIndexCount();
+                    singleCmd.startIndex   = useSub ? key.mesh->GetSubmesh(key.submeshIndex).startIndex : 0u;
+                    singleCmd.baseVertex   = 0u;
                     singleCmd.cpuVertices  = key.mesh->GetVertices();
                     singleCmd.cpuIndices   = key.mesh->GetIndices();
 
@@ -2429,6 +2632,8 @@ namespace Northstar
                     const UINT32 packedSkin = (boneCnt > 0u) ? PackGPUSceneSkinnedBoneRange(boneOff, boneCnt) : 0u;
                     singleCmd.instanceSkinning.clear();
                     singleCmd.instanceSkinning.push_back({ boneOff, boneCnt, obj->GetSkinningRevision() });
+                    singleCmd.instancePrevWorldMatrices.clear();
+                    singleCmd.instancePrevWorldMatrices.push_back(singleCmd.prevWorldMatrix);
 
                     const BOOL isStatic = obj->HasFlag(RenderObjectFlags::STATIC);
                     if (isStatic)

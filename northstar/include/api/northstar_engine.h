@@ -83,8 +83,10 @@ namespace Northstar
         [[nodiscard]] virtual Mesh*            CreateMesh(const MeshDesc& desc)                                              = 0;
         virtual void                           DestroyMesh(Mesh* mesh)                                                       = 0;
         virtual BOOL                           SerializeVirtualMesh(const Mesh* mesh, std::vector<BYTE>& outBinaryBlob) const = 0;
+        virtual BOOL                           SerializeVirtualMeshToBuffer(const Mesh* mesh, BYTE** outBuffer, SIZE_T* outByteSize) const = 0;
+        virtual void                           FreeSerializedBuffer(BYTE* buffer) const                                      = 0;
 
-        virtual void                           SetNVGConfig(const NVGConfig& config)                                         = 0;
+        virtual BOOL                           SetNVGConfig(const NVGConfig& config)                                         = 0;
         [[nodiscard]] virtual const NVGConfig& GetNVGConfig() const                                                          = 0;
         [[nodiscard]] virtual const NVGStats&  GetNVGStats() const                                                           = 0;
         [[nodiscard]] virtual NVGCompatibilityStatus CheckMaterialNVGCompatibility(

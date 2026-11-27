@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(QuarkDynSDK VERSION 0.6.0 LANGUAGES CXX)
+project(QuarkDynSDK VERSION 0.7.0 LANGUAGES CXX)
 
 add_library(QuarkDynMath STATIC
     math/src/vec2.cpp

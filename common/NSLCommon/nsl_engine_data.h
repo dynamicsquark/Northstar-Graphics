@@ -50,25 +50,30 @@ namespace NSL
     inline constexpr EngineProperty ENGINE_PROPERTIES[] =
     {
         // ==================== Camera (Buffer) ====================
-        { "CAMERA_POSITION",       DataTypeID::VEC3,  12, ResourceKind::BUFFER },
-        { "CAMERA_DIRECTION",      DataTypeID::VEC3,  12, ResourceKind::BUFFER },
-        { "VIEW_MATRIX",           DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "PROJECTION_MATRIX",     DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "VP_MATRIX",             DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "INV_VIEW_MATRIX",       DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "INV_PROJECTION_MATRIX", DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "NEAR_PLANE",            DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
-        { "FAR_PLANE",             DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
-        { "CAMERA_FOV",            DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
-        { "CAMERA_ASPECT",         DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
+        { "CAMERA_POSITION",        DataTypeID::VEC3,  12, ResourceKind::BUFFER },
+        { "CAMERA_DIRECTION",       DataTypeID::VEC3,  12, ResourceKind::BUFFER },
+        { "VIEW_MATRIX",            DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "PROJECTION_MATRIX",      DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "VP_MATRIX",              DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "INV_VIEW_MATRIX",        DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "INV_PROJECTION_MATRIX",  DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "INV_VP_MATRIX",          DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "PREV_VIEW_MATRIX",       DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "PREV_PROJECTION_MATRIX", DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "PREV_VP_MATRIX",         DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "NEAR_PLANE",             DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
+        { "FAR_PLANE",              DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
+        { "CAMERA_FOV",             DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
+        { "CAMERA_ASPECT",          DataTypeID::FLOAT,  4, ResourceKind::BUFFER },
 
         // ==================== Transform (Buffer) ====================
-        { "WORLD_MATRIX",          DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "NORMAL_MATRIX",         DataTypeID::MAT3,  36, ResourceKind::BUFFER },
-        { "MVP_MATRIX",            DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "INV_WORLD_MATRIX",      DataTypeID::MAT4,  64, ResourceKind::BUFFER },
-        { "GPU_SCENE_OBJECT_SLOT", DataTypeID::UINT,   4, ResourceKind::BUFFER },
-        { "GEOMETRY_MODE",         DataTypeID::UINT,   4, ResourceKind::BUFFER },
+        { "WORLD_MATRIX",           DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "PREV_WORLD_MATRIX",      DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "NORMAL_MATRIX",          DataTypeID::MAT3,  36, ResourceKind::BUFFER },
+        { "MVP_MATRIX",             DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "INV_WORLD_MATRIX",       DataTypeID::MAT4,  64, ResourceKind::BUFFER },
+        { "GPU_SCENE_OBJECT_SLOT",  DataTypeID::UINT,   4, ResourceKind::BUFFER },
+        { "GEOMETRY_MODE",          DataTypeID::UINT,   4, ResourceKind::BUFFER },
 
         // ==================== Ambient Lighting (Buffer) ====================
         { "AMBIENT_COLOR",         DataTypeID::VEC3,  12, ResourceKind::BUFFER },
@@ -108,13 +113,14 @@ namespace NSL
         { "BONE_COUNT",            DataTypeID::UINT,   4, ResourceKind::BUFFER },
         { "SKINNING_REVISION",     DataTypeID::UINT,   4, ResourceKind::BUFFER },
 
-        { "GLOBAL_BONE_MATRIX",    DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
-        { "BONE_MATRIX",           DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
-        { "INSTANCE_WORLD_MATRIX", DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
-        { "INSTANCE_ID_VALUE",     DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
-        { "INSTANCE_CUSTOM_DATA",  DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
-        { "INSTANCE_BONE_OFFSET",  DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
-        { "INSTANCE_BONE_COUNT",   DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
+        { "GLOBAL_BONE_MATRIX",         DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
+        { "BONE_MATRIX",                DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
+        { "INSTANCE_WORLD_MATRIX",      DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
+        { "INSTANCE_PREV_WORLD_MATRIX", DataTypeID::MAT4,  64, ResourceKind::STRUCTURED_BUFFER },
+        { "INSTANCE_ID_VALUE",          DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
+        { "INSTANCE_CUSTOM_DATA",       DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
+        { "INSTANCE_BONE_OFFSET",       DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
+        { "INSTANCE_BONE_COUNT",        DataTypeID::UINT,   4, ResourceKind::STRUCTURED_BUFFER },
 
         // ==================== NVS Shadow Rasterization Page Context (Buffer) ====================
         { "NVS_PHYSICAL_PAGE_INDEX",  DataTypeID::UINT,  4, ResourceKind::BUFFER },
@@ -189,12 +195,16 @@ namespace NSL
 
         // ==================== NVG Virtual Geometry Draw & Telemetry Metadata (Buffer) ====================
         { "NVG_DRAW_BUCKET_ID",             DataTypeID::UINT,  4, ResourceKind::BUFFER },
+        { "NVG_DRAW_CONTEXT_ID",            DataTypeID::UINT,  4, ResourceKind::BUFFER },
         { "NVG_VISIBLE_CLUSTER_COUNT",      DataTypeID::UINT,  4, ResourceKind::BUFFER },
         { "NVG_VISIBLE_CLUSTER_OFFSET",     DataTypeID::UINT,  4, ResourceKind::BUFFER },
         { "NVG_DEBUG_MODE",                 DataTypeID::UINT,  4, ResourceKind::BUFFER },
         { "NVG_MAX_SCREEN_ERROR_PX",        DataTypeID::FLOAT, 4, ResourceKind::BUFFER },
         { "NVG_PHYSICAL_POOL_CAPACITY",     DataTypeID::UINT,  4, ResourceKind::BUFFER },
         { "NVG_PAGE_WORD_COUNT",            DataTypeID::UINT,  4, ResourceKind::BUFFER },
+
+        // ==================== NVG Engine-Owned Visibility Buffer (Texture2D<uint2>) ====================
+        { "NVG_VISIBILITY_BUFFER",          DataTypeID::TEXTURE_2D, 0, ResourceKind::TEXTURE_2D },
 
         // ==================== NVG Physical Geometry Page Pool (StructuredBuffer, 4B) ====================
         { "NVG_PAGE_POOL_WORD",             DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
@@ -219,7 +229,7 @@ namespace NSL
         { "NVG_VIS_DRAW_BUCKET_INDEX",      DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
         { "NVG_VIS_VIEW_DEPTH_KEY",         DataTypeID::FLOAT, 4, ResourceKind::STRUCTURED_BUFFER },
 
-        // ==================== NVG GPUScene Object Records (StructuredBuffer, 160B Zero-Copy) ====================
+        // ==================== NVG GPUScene Object Records (StructuredBuffer, 240B Zero-Copy) ====================
         { "NVG_OBJ_SLOT_INDEX",             DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
         { "NVG_OBJ_GENERATION",             DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
         { "NVG_OBJ_FLAGS",                  DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
@@ -238,6 +248,11 @@ namespace NSL
         { "NVG_OBJ_LOD_MATERIAL_FLAGS",     DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
         { "NVG_OBJ_BOUNDING_SPHERE",        DataTypeID::VEC4, 16, ResourceKind::STRUCTURED_BUFFER },
         { "NVG_OBJ_WORLD_MATRIX",           DataTypeID::MAT4, 64, ResourceKind::STRUCTURED_BUFFER },
+        { "NVG_OBJ_PREV_WORLD_MATRIX",      DataTypeID::MAT4, 64, ResourceKind::STRUCTURED_BUFFER },
+        { "NVG_OBJ_LAYER_MASK",             DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
+        { "NVG_OBJ_MATERIAL_TABLE_OFFSET",  DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
+        { "NVG_OBJ_MATERIAL_SLOT_COUNT",    DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
+        { "NVG_OBJ_SKIN_BOUNDS_OFFSET",     DataTypeID::UINT,  4, ResourceKind::STRUCTURED_BUFFER },
 
         // ==================== NVG NVS Shadow Page Views (StructuredBuffer, 80B) ====================
         { "NVG_SHADOW_PAGE_VP_MATRIX",      DataTypeID::MAT4, 64, ResourceKind::STRUCTURED_BUFFER },

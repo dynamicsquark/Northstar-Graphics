@@ -29,6 +29,7 @@
 #include "../nvg/core_nvg_manager.h"
 #include <chrono>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -93,6 +94,7 @@ namespace Northstar
         const CoreNVSFeedbackManager&  GetNVSFeedbackManager()         const { return m_nvsFeedbackManager; }
         CoreNVGManager&                GetNVGManager()                       { return m_nvgManager; }
         const CoreNVGManager&          GetNVGManager()                 const { return m_nvgManager; }
+        NorthstarBackend*              GetBackend()                    const noexcept { return m_backend; }
         CoreBufferManager&             GetBufferManager()                    { return m_bufferManager; }
         CoreComputeManager&            GetComputeManager()                   { return m_computeManager; }
         CoreRenderPipeline&            GetRenderPipeline()                   { return m_renderPipeline; }
@@ -134,8 +136,10 @@ namespace Northstar
         Mesh*         CreateMesh(const MeshDesc& desc) override;
         void          DestroyMesh(Mesh* mesh) override;
         BOOL          SerializeVirtualMesh(const Mesh* mesh, std::vector<BYTE>& outBlob) const override;
+        BOOL          SerializeVirtualMeshToBuffer(const Mesh* mesh, BYTE** outBuffer, SIZE_T* outByteSize) const override;
+        void          FreeSerializedBuffer(BYTE* buffer) const override;
 
-        void             SetNVGConfig(const NVGConfig& config) override;
+        BOOL             SetNVGConfig(const NVGConfig& config) override;
         const NVGConfig& GetNVGConfig() const override;
         const NVGStats&  GetNVGStats() const override;
         NVGCompatibilityStatus CheckMaterialNVGCompatibility(
@@ -250,6 +254,7 @@ namespace Northstar
             FLOAT32               shadowMaxDistance     = 0.0f;
             FLOAT32               shadowBias            = 0.0f;
             FLOAT32               shadowNormalBias      = 0.0f;
+            UINT32                cullingMask           = 0xFFFFFFFFu;
             UINT32                depthMode             = 0u;
             BOOL                  rasterReadsDepthBias  = false;
             BOOL                  rasterReadsNormalBias = false;
@@ -276,6 +281,10 @@ namespace Northstar
             }
         };
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
         struct NVSDirectionalLightCameraState
         {
             const Scene*             scenePtr                = nullptr;
@@ -293,6 +302,7 @@ namespace Northstar
             FLOAT32                  shadowMaxDistance       = 0.0f;
             FLOAT32                  shadowBias              = 0.0f;
             FLOAT32                  shadowNormalBias        = 0.0f;
+            UINT32                   cullingMask             = 0xFFFFFFFFu;
             UINT32                   depthMode               = 0u;
             BOOL                     rasterAppliedDepthBias  = false;
             BOOL                     rasterAppliedNormalBias = false;
@@ -322,12 +332,16 @@ namespace Northstar
             FLOAT32                shadowMaxDistance       = 0.0f;
             FLOAT32                shadowBias              = 0.0f;
             FLOAT32                shadowNormalBias        = 0.0f;
+            UINT32                 cullingMask             = 0xFFFFFFFFu;
             UINT32                 depthMode               = 0u;
             BOOL                   initialized             = false;
             BOOL                   enableVirtualMipChain   = true;
             BOOL                   rasterAppliedDepthBias  = false;
             BOOL                   rasterAppliedNormalBias = false;
         };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
         struct CameraNVSProductionState
         {
@@ -388,7 +402,10 @@ namespace Northstar
         std::unordered_map<Camera*, CameraNVSProductionState> m_cameraNVSProductionStates;
         std::unordered_map<Scene*, std::unordered_map<const Material*, MaterialShadowStateSnapshot>> m_sceneMaterialShadowStates;
         BOOL                                           m_initialized                = false;
+        std::thread::id                                m_ownerThreadId{};
         std::string                                    m_lastError;
+
+        void AssertOwnerThread() const noexcept;
 
         BOOL EnsureInternalNVSSamplers();
         void DestroyInternalNVSSamplers();

@@ -1,0 +1,124 @@
+// =====================================================================
+//  GeometryVisibility.nsl — Northstar NSL Standard Library: Visibility Buffer
+//
+//  Provides Universal Reflection access and bit-exact decoding helpers for
+//  Northstar's engine-owned 64-bit Visibility Buffer (Get(NVG_VISIBILITY_BUFFER),
+//  exposed as Texture2D<uint2> where .x = ((visClusterIdx + 1) << 8) | triIdx
+//  and .y = monotonic 32-bit IEEE-754 depthKey32).
+// =====================================================================
+
+LIBRARY_DECLARATION
+{
+    Add("NorthstarLibrary/VirtualGeometry/GeometryCluster.nsl")
+}
+
+PROPERTY NVGVisibilityResources
+{
+    Texture2D VisibilityBuffer
+    {
+        Get(NVG_VISIBILITY_BUFFER)
+    }
+}
+
+LIBRARY
+{
+    struct NVGVisibilityHit
+    {
+        Bool  isValid;
+        UInt  visibleClusterIndex;
+        UInt  triangleIndex;
+        UInt  depthKey;
+        Float deviceZ;
+    };
+
+    Bool NVGIsVisibilityBufferAvailable()
+    {
+        UInt w = 0u;
+        UInt h = 0u;
+        GetDimensions(NVGVisibilityResources.VisibilityBuffer.NVG_VISIBILITY_BUFFER, w, h);
+        return (w > 0u) && (h > 0u);
+    }
+
+    NVGVisibilityHit NVGUnpackVisibilityRaw(UInt2 rawVis, Bool isReversedZ)
+    {
+        NVGVisibilityHit hit;
+        if (rawVis.x == 0u)
+        {
+            hit.isValid             = false;
+            hit.visibleClusterIndex = NVGInvalidIndex();
+            hit.triangleIndex       = 0u;
+            hit.depthKey            = 0u;
+            hit.deviceZ             = isReversedZ ? 0.0 : 1.0;
+            return hit;
+        }
+
+        hit.isValid             = true;
+        hit.triangleIndex       = rawVis.x & 255u;
+        hit.visibleClusterIndex = (rawVis.x >> 8u) - 1u;
+        hit.depthKey            = rawVis.y;
+        hit.deviceZ             = isReversedZ ? AsFloat(rawVis.y) : AsFloat(~rawVis.y);
+        return hit;
+    }
+
+    NVGVisibilityHit NVGLoadVisibilityPixel(Int2 pixelCoord, Bool isReversedZ)
+    {
+        UInt w = 0u;
+        UInt h = 0u;
+        GetDimensions(NVGVisibilityResources.VisibilityBuffer.NVG_VISIBILITY_BUFFER, w, h);
+        if (w == 0u || h == 0u ||
+            pixelCoord.x < 0 || pixelCoord.y < 0 ||
+            UInt(pixelCoord.x) >= w || UInt(pixelCoord.y) >= h)
+        {
+            return NVGUnpackVisibilityRaw(UInt2(0u, 0u), isReversedZ);
+        }
+        UInt2 rawVis = Load(NVGVisibilityResources.VisibilityBuffer.NVG_VISIBILITY_BUFFER, Int3(pixelCoord.x, pixelCoord.y, 0));
+        return NVGUnpackVisibilityRaw(rawVis, isReversedZ);
+    }
+
+    NVGVisibleCluster NVGLoadVisibleClusterAbsolute(UInt absoluteVisIndex)
+    {
+        UInt invalidIdx = NVGInvalidIndex();
+        UInt visCount   = 0u;
+        UInt visStride  = 0u;
+        GetDimensions(NVGResources.VisibleClusters, visCount, visStride);
+
+        NVGVisibleCluster vc;
+        if (absoluteVisIndex >= visCount)
+        {
+            vc.objectSlot          = invalidIdx;
+            vc.clusterId           = invalidIdx;
+            vc.physicalPageIndex   = invalidIdx;
+            vc.clusterWordOffset   = 0u;
+            vc.virtualPageId       = invalidIdx;
+            vc.lodLevel            = 0u;
+            vc.flags               = 0u;
+            vc.shadowPageViewIndex = 0u;
+            vc.geometricError      = 0.0;
+            vc.materialId          = 0u;
+            vc.bonePaletteOffset   = 0u;
+            vc.boneCount           = 0u;
+            vc.drawBucketIndex     = invalidIdx;
+            vc.viewDepthKey        = 0.0;
+            return vc;
+        }
+
+        vc.objectSlot          = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_OBJECT_SLOT;
+        vc.clusterId           = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_CLUSTER_ID;
+        vc.physicalPageIndex   = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_PHYSICAL_PAGE_INDEX;
+        vc.clusterWordOffset   = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_CLUSTER_WORD_OFFSET;
+        vc.virtualPageId       = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_VIRTUAL_PAGE_ID;
+
+        UInt lodAndFlags       = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_LOD_AND_FLAGS;
+        vc.lodLevel            = lodAndFlags & 255u;
+        vc.flags               = (lodAndFlags >> 8u) & 255u;
+        vc.shadowPageViewIndex = (lodAndFlags >> 16u) & 65535u;
+
+        vc.geometricError      = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_GEOMETRIC_ERROR;
+        vc.materialId          = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_MATERIAL_ID;
+        vc.bonePaletteOffset   = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_BONE_OFFSET;
+        vc.boneCount           = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_BONE_COUNT;
+        vc.drawBucketIndex     = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_DRAW_BUCKET_INDEX;
+        vc.viewDepthKey        = NVGResources.VisibleClusters[absoluteVisIndex].NVG_VIS_VIEW_DEPTH_KEY;
+        return vc;
+    }
+}

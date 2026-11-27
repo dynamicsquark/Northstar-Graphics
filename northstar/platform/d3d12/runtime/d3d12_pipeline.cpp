@@ -70,13 +70,14 @@ namespace Northstar
 
         m_psoCache.clear();
         m_computePsoCache.clear();
-        m_indirectRootObjects.clear();
+        m_graphicsRootLayouts.clear();
+        m_computeRootLayouts.clear();
         m_dispatchIndirectSignature.Reset();
         m_nvsDrawIndexedIndirectSignature.Reset();
         m_drawIndexedIndirectSignature.Reset();
         m_drawIndirectSignature.Reset();
-        m_computeRootSignature.Reset();
-        m_rootSignature.Reset();
+        m_defaultComputeLayout  = ComputeRootLayout{};
+        m_defaultGraphicsLayout = GraphicsRootLayout{};
         m_device = nullptr;
     }
 
@@ -135,179 +136,9 @@ namespace Northstar
         m_retiredPSOs.clear();
     }
 
-    BOOL D3D12Pipeline::CreateRootSignature(ID3D12Device* device)
+    namespace
     {
-        if (!device) return false;
-
-        // Base Graphics Root Signature (45 parameters = 48 DWORDs, zero space4 graphics slots):
-        //   Params  0..3  : Vertex   space0..3 CBV+SRV Descriptor Tables (48 desc: 16 CBV + 32 SRV)
-        //   Params  4..7  : Pixel    space0..3 CBV+SRV Descriptor Tables (48 desc: 16 CBV + 32 SRV)
-        //   Params  8..11 : Vertex   space0..3 Sampler Descriptor Tables (16 samplers, VISIBILITY_VERTEX)
-        //   Params 12..15 : Pixel    space0..3 Sampler Descriptor Tables (16 samplers, VISIBILITY_PIXEL)
-        //   Param  16     : 4x 32-bit Root Constants at (b1, space3, VISIBILITY_ALL)
-        //   Params 17..20 : Geometry space0..3 CBV+SRV Descriptor Tables (48 desc, VISIBILITY_GEOMETRY)
-        //   Params 21..24 : Hull     space0..3 CBV+SRV Descriptor Tables (48 desc, VISIBILITY_HULL)
-        //   Params 25..28 : Domain   space0..3 CBV+SRV Descriptor Tables (48 desc, VISIBILITY_DOMAIN)
-        //   Params 29..32 : Geometry space0..3 Sampler Descriptor Tables (16 samplers, VISIBILITY_GEOMETRY)
-        //   Params 33..36 : Hull     space0..3 Sampler Descriptor Tables (16 samplers, VISIBILITY_HULL)
-        //   Params 37..40 : Domain   space0..3 Sampler Descriptor Tables (16 samplers, VISIBILITY_DOMAIN)
-        //   Params 41..44 : Graphics space0..3 UAV Descriptor Tables (16 UAVs u0..15, VISIBILITY_ALL)
-        D3D12_DESCRIPTOR_RANGE vtxRanges[kMaxSpaces][2]{};
-        D3D12_DESCRIPTOR_RANGE pixRanges[kMaxSpaces][2]{};
-        D3D12_DESCRIPTOR_RANGE geoRanges[kMaxSpaces][2]{};
-        D3D12_DESCRIPTOR_RANGE hullRanges[kMaxSpaces][2]{};
-        D3D12_DESCRIPTOR_RANGE domRanges[kMaxSpaces][2]{};
-        D3D12_DESCRIPTOR_RANGE space3Ranges[3]{};
-        D3D12_DESCRIPTOR_RANGE samplerRanges[kMaxSpaces]{};
-        D3D12_DESCRIPTOR_RANGE uavRanges[kMaxSpaces]{};
-        D3D12_ROOT_PARAMETER   rootParams[kGraphicsBaseRootParamCount]{};
-
-        // Shared Space 3 Descriptor Ranges (b0 at offset 0, b2..b15 at offset 2, t0..t31 at offset 16; skips b1, space3)
-        space3Ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-        space3Ranges[0].NumDescriptors                    = 1;
-        space3Ranges[0].BaseShaderRegister                = 0;
-        space3Ranges[0].RegisterSpace                     = 3;
-        space3Ranges[0].OffsetInDescriptorsFromTableStart = 0;
-
-        space3Ranges[1].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-        space3Ranges[1].NumDescriptors                    = kCBVPerSpace - 2;
-        space3Ranges[1].BaseShaderRegister                = 2;
-        space3Ranges[1].RegisterSpace                     = 3;
-        space3Ranges[1].OffsetInDescriptorsFromTableStart = 2;
-
-        space3Ranges[2].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        space3Ranges[2].NumDescriptors                    = kSRVPerSpace;
-        space3Ranges[2].BaseShaderRegister                = 0;
-        space3Ranges[2].RegisterSpace                     = 3;
-        space3Ranges[2].OffsetInDescriptorsFromTableStart = kCBVPerSpace;
-
-        auto configureSpaceTableParam = [&](UINT32 paramIdx, UINT32 s, D3D12_DESCRIPTOR_RANGE (&ranges)[kMaxSpaces][2], D3D12_SHADER_VISIBILITY visibility)
-        {
-            if (s == 3)
-            {
-                rootParams[paramIdx].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                rootParams[paramIdx].DescriptorTable.NumDescriptorRanges = 3;
-                rootParams[paramIdx].DescriptorTable.pDescriptorRanges   = space3Ranges;
-                rootParams[paramIdx].ShaderVisibility                    = visibility;
-            }
-            else
-            {
-                ranges[s][0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-                ranges[s][0].NumDescriptors                    = kCBVPerSpace;
-                ranges[s][0].BaseShaderRegister                = 0;
-                ranges[s][0].RegisterSpace                     = s;
-                ranges[s][0].OffsetInDescriptorsFromTableStart = 0;
-
-                ranges[s][1].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                ranges[s][1].NumDescriptors                    = kSRVPerSpace;
-                ranges[s][1].BaseShaderRegister                = 0;
-                ranges[s][1].RegisterSpace                     = s;
-                ranges[s][1].OffsetInDescriptorsFromTableStart = kCBVPerSpace;
-
-                rootParams[paramIdx].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                rootParams[paramIdx].DescriptorTable.NumDescriptorRanges = 2;
-                rootParams[paramIdx].DescriptorTable.pDescriptorRanges   = ranges[s];
-                rootParams[paramIdx].ShaderVisibility                    = visibility;
-            }
-        };
-
-        for (UINT32 s = 0; s < kMaxSpaces; ++s)
-        {
-            samplerRanges[s].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-            samplerRanges[s].NumDescriptors                    = 16;
-            samplerRanges[s].BaseShaderRegister                = 0;
-            samplerRanges[s].RegisterSpace                     = s;
-            samplerRanges[s].OffsetInDescriptorsFromTableStart = 0;
-
-            uavRanges[s].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-            uavRanges[s].NumDescriptors                    = kUAVPerSpace;
-            uavRanges[s].BaseShaderRegister                = 0;
-            uavRanges[s].RegisterSpace                     = s;
-            uavRanges[s].OffsetInDescriptorsFromTableStart = 0;
-        }
-
-        auto configureSamplerStageParams = [&](UINT32 paramBase, D3D12_SHADER_VISIBILITY visibility)
-        {
-            for (UINT32 s = 0; s < kMaxSpaces; ++s)
-            {
-                rootParams[paramBase + s].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                rootParams[paramBase + s].DescriptorTable.NumDescriptorRanges = 1;
-                rootParams[paramBase + s].DescriptorTable.pDescriptorRanges   = &samplerRanges[s];
-                rootParams[paramBase + s].ShaderVisibility                    = visibility;
-            }
-        };
-
-        for (UINT32 s = 0; s < kMaxSpaces; ++s)
-        {
-            configureSpaceTableParam(kGraphicsVertexSpaceParamBase + s,   s, vtxRanges,  D3D12_SHADER_VISIBILITY_VERTEX);
-            configureSpaceTableParam(kGraphicsPixelSpaceParamBase + s,    s, pixRanges,  D3D12_SHADER_VISIBILITY_PIXEL);
-            configureSpaceTableParam(kGraphicsGeometrySpaceParamBase + s, s, geoRanges,  D3D12_SHADER_VISIBILITY_GEOMETRY);
-            configureSpaceTableParam(kGraphicsHullSpaceParamBase + s,     s, hullRanges, D3D12_SHADER_VISIBILITY_HULL);
-            configureSpaceTableParam(kGraphicsDomainSpaceParamBase + s,   s, domRanges,  D3D12_SHADER_VISIBILITY_DOMAIN);
-        }
-
-        configureSamplerStageParams(kGraphicsVertexSamplerParamBase,   D3D12_SHADER_VISIBILITY_VERTEX);
-        configureSamplerStageParams(kGraphicsPixelSamplerParamBase,    D3D12_SHADER_VISIBILITY_PIXEL);
-        configureSamplerStageParams(kGraphicsGeometrySamplerParamBase, D3D12_SHADER_VISIBILITY_GEOMETRY);
-        configureSamplerStageParams(kGraphicsHullSamplerParamBase,     D3D12_SHADER_VISIBILITY_HULL);
-        configureSamplerStageParams(kGraphicsDomainSamplerParamBase,   D3D12_SHADER_VISIBILITY_DOMAIN);
-
-        // Param 16: 32-Bit Root Constants at (b1, space3)
-        rootParams[kGraphicsRootConstantsParamIndex].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rootParams[kGraphicsRootConstantsParamIndex].Constants.ShaderRegister = 1;
-        rootParams[kGraphicsRootConstantsParamIndex].Constants.RegisterSpace  = 3;
-        rootParams[kGraphicsRootConstantsParamIndex].Constants.Num32BitValues = 4;
-        rootParams[kGraphicsRootConstantsParamIndex].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
-
-        // Params 41..44: Graphics UAV Tables (u0..u15 in space0..space3, VISIBILITY_ALL)
-        for (UINT32 s = 0; s < kMaxSpaces; ++s)
-        {
-            rootParams[kGraphicsUAVSpaceParamBase + s].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            rootParams[kGraphicsUAVSpaceParamBase + s].DescriptorTable.NumDescriptorRanges = 1;
-            rootParams[kGraphicsUAVSpaceParamBase + s].DescriptorTable.pDescriptorRanges   = &uavRanges[s];
-            rootParams[kGraphicsUAVSpaceParamBase + s].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
-        }
-
-        D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-        rootDesc.NumParameters     = kGraphicsBaseRootParamCount;
-        rootDesc.pParameters       = rootParams;
-        rootDesc.NumStaticSamplers = 0;
-        rootDesc.pStaticSamplers   = nullptr;
-        rootDesc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-        ComPtr<ID3DBlob> signatureBlob;
-        ComPtr<ID3DBlob> errorBlob;
-        if (FAILED(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob)))
-        {
-            if (errorBlob)
-            {
-                std::cerr << "[D3D12Pipeline] Root Signature Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
-            }
-            return false;
-        }
-
-        return SUCCEEDED(device->CreateRootSignature(
-            0,
-            signatureBlob->GetBufferPointer(),
-            signatureBlob->GetBufferSize(),
-            IID_PPV_ARGS(&m_rootSignature)
-        ));
-    }
-
-    ID3D12RootSignature* D3D12Pipeline::GetOrCreateIndirectRootSignature(
-        ID3D12Device*                 device,
-        const IndirectRootBindingKey& key)
-    {
-        if (!device) return nullptr;
-        if (!key.enabled) return m_rootSignature.Get();
-
-        auto it = m_indirectRootObjects.find(key);
-        if (it != m_indirectRootObjects.end() && it->second.rootSignature)
-        {
-            return it->second.rootSignature.Get();
-        }
-
-        auto mapStage = [](ShaderStage stage, UINT32& outStageIdx, D3D12_SHADER_VISIBILITY& outVis) -> bool
+        bool MapGraphicsStageToIndex(ShaderStage stage, UINT32& outStageIdx, D3D12_SHADER_VISIBILITY& outVis) noexcept
         {
             switch (stage)
             {
@@ -318,97 +149,115 @@ namespace Northstar
                 case ShaderStage::DOMAIN:   outStageIdx = 4; outVis = D3D12_SHADER_VISIBILITY_DOMAIN;   return true;
                 default:                    outStageIdx = 0; outVis = D3D12_SHADER_VISIBILITY_ALL;      return false;
             }
-        };
+        }
+    }
 
-        UINT32 cbvMask[5][kMaxSpaces]{};
-        UINT32 srvMask[5][kMaxSpaces]{};
-        for (UINT32 st = 0; st < 5; ++st)
+    BOOL D3D12Pipeline::BuildGraphicsRootLayout(
+        ID3D12Device*                device,
+        const GraphicsRootLayoutKey& key,
+        GraphicsRootLayout&          outLayout)
+    {
+        if (!device) return false;
+
+        outLayout = GraphicsRootLayout{};
+        for (UINT32 st = 0; st < 5u; ++st)
         {
             for (UINT32 s = 0; s < kMaxSpaces; ++s)
             {
-                cbvMask[st][s] = (1u << kCBVPerSpace) - 1u;
-                if (s == 3)
+                outLayout.cbvSrvParam[st][s]  = -1;
+                outLayout.samplerParam[st][s] = -1;
+            }
+        }
+        for (UINT32 s = 0; s < kMaxSpaces; ++s)
+        {
+            outLayout.uavParam[s] = -1;
+        }
+
+        UINT32 cbvMask[5][kMaxSpaces]{};
+        UINT32 srvMask[5][kMaxSpaces]{};
+        for (UINT32 st = 0; st < 5u; ++st)
+        {
+            for (UINT32 s = 0; s < kMaxSpaces; ++s)
+            {
+                if ((key.cbvSrvMask[st] & (1u << s)) != 0u)
                 {
-                    cbvMask[st][s] &= ~(1u << 1u); // Skip b1, space3 (reserved for 32-bit Root Constants)
+                    cbvMask[st][s] = (1u << kCBVPerSpace) - 1u;
+                    srvMask[st][s] = 0xFFFFFFFFu;
                 }
-                srvMask[st][s] = 0xFFFFFFFFu;
             }
         }
 
-        D3D12_ROOT_PARAMETER   rootParams[kGraphicsRootParamCount]{};
-        D3D12_DESCRIPTOR_RANGE samplerRanges[kMaxSpaces]{};
-        D3D12_DESCRIPTOR_RANGE uavRanges[kMaxSpaces]{};
-
-        // Params 45..47: Promoted per-draw Root CBVs 0..2
-        for (UINT32 i = 0; i < kGraphicsIndirectCBVParamCount; ++i)
+        if (key.indirectKey.enabled)
         {
-            const UINT32 paramIdx = kGraphicsIndirectCBVParamBase + i;
-            UINT32                  stIdx = 0;
-            D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
-
-            if (i < key.cbvCount &&
-                key.cbvSpace[i] < kMaxSpaces &&
-                key.cbvSlot[i] < kCBVPerSpace &&
-                !(key.cbvSpace[i] == 3 && key.cbvSlot[i] == 1) &&
-                mapStage(key.cbvStage[i], stIdx, vis))
+            outLayout.isExtendedIndirect = (key.indirectKey.extended != FALSE);
+            const UINT32 cbvSlots = outLayout.isExtendedIndirect ? kExtendedGraphicsIndirectCBVParamCount : kGraphicsIndirectCBVParamCount;
+            const UINT8  effSrv   = (key.indirectKey.srvCount > 0u) ? key.indirectKey.srvCount : (key.indirectKey.hasPromotedSRV ? 1u : 0u);
+            for (UINT32 i = 0; i < cbvSlots; ++i)
             {
-                cbvMask[stIdx][key.cbvSpace[i]] &= ~(1u << key.cbvSlot[i]);
-                rootParams[paramIdx].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
-                rootParams[paramIdx].Descriptor.ShaderRegister = key.cbvSlot[i];
-                rootParams[paramIdx].Descriptor.RegisterSpace  = key.cbvSpace[i];
-                rootParams[paramIdx].ShaderVisibility          = vis;
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                if (i < key.indirectKey.cbvCount &&
+                    key.indirectKey.cbvSpace[i] < kMaxSpaces &&
+                    key.indirectKey.cbvSlot[i] < kCBVPerSpace &&
+                    MapGraphicsStageToIndex(key.indirectKey.cbvStage[i], stIdx, vis))
+                {
+                    cbvMask[stIdx][key.indirectKey.cbvSpace[i]] &= ~(1u << key.indirectKey.cbvSlot[i]);
+                }
             }
-            else
+            if (effSrv >= 1u)
             {
-                rootParams[paramIdx].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
-                rootParams[paramIdx].Descriptor.ShaderRegister = i; // b0..b2, space5 (unreferenced placeholder)
-                rootParams[paramIdx].Descriptor.RegisterSpace  = 5;
-                rootParams[paramIdx].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                if (key.indirectKey.srvSpace < kMaxSpaces &&
+                    key.indirectKey.srvSlot < kSRVPerSpace &&
+                    MapGraphicsStageToIndex(key.indirectKey.srvStage, stIdx, vis))
+                {
+                    srvMask[stIdx][key.indirectKey.srvSpace] &= ~(1u << key.indirectKey.srvSlot);
+                }
+            }
+            if (outLayout.isExtendedIndirect && effSrv >= 2u)
+            {
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                if (key.indirectKey.srv2Space < kMaxSpaces &&
+                    key.indirectKey.srv2Slot < kSRVPerSpace &&
+                    MapGraphicsStageToIndex(key.indirectKey.srv2Stage, stIdx, vis))
+                {
+                    srvMask[stIdx][key.indirectKey.srv2Space] &= ~(1u << key.indirectKey.srv2Slot);
+                }
             }
         }
 
-        // Param 48: Promoted per-batch Root SRV 0
+        // Compute exact root signature DWORD cost before building parameters so >64 DWORD overflow
+        // fails deterministically with a clear diagnostic and zero silent dropping of set4..15.
+        UINT32 totalDwords = 4u; // 4x 32-bit Root Constants at (b0, space16)
+        for (UINT32 st = 0; st < 5u; ++st)
         {
-            UINT32                  stIdx = 0;
-            D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
-            if (key.hasPromotedSRV &&
-                key.srvSpace < kMaxSpaces &&
-                key.srvSlot < kSRVPerSpace &&
-                mapStage(key.srvStage, stIdx, vis))
+            for (UINT32 s = 0; s < kMaxSpaces; ++s)
             {
-                srvMask[stIdx][key.srvSpace] &= ~(1u << key.srvSlot);
-                rootParams[kGraphicsIndirectSRVParamIndex].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
-                rootParams[kGraphicsIndirectSRVParamIndex].Descriptor.ShaderRegister = key.srvSlot;
-                rootParams[kGraphicsIndirectSRVParamIndex].Descriptor.RegisterSpace  = key.srvSpace;
-                rootParams[kGraphicsIndirectSRVParamIndex].ShaderVisibility          = vis;
-            }
-            else
-            {
-                rootParams[kGraphicsIndirectSRVParamIndex].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
-                rootParams[kGraphicsIndirectSRVParamIndex].Descriptor.ShaderRegister = 0; // t0, space5 (unreferenced placeholder)
-                rootParams[kGraphicsIndirectSRVParamIndex].Descriptor.RegisterSpace  = 5;
-                rootParams[kGraphicsIndirectSRVParamIndex].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+                if (cbvMask[st][s] != 0u || srvMask[st][s] != 0u) ++totalDwords;
+                if ((key.samplerMask[st] & (1u << s)) != 0u)      ++totalDwords;
             }
         }
+        for (UINT32 s = 0; s < kMaxSpaces; ++s)
+        {
+            if ((key.uavMask & (1u << s)) != 0u) ++totalDwords;
+        }
+        if (key.indirectKey.enabled)
+        {
+            const UINT32 cbvSlots = (key.indirectKey.extended != FALSE) ? kExtendedGraphicsIndirectCBVParamCount : kGraphicsIndirectCBVParamCount;
+            const UINT32 srvSlots = (key.indirectKey.extended != FALSE) ? 2u : 1u;
+            totalDwords += (cbvSlots + srvSlots) * 2u;
+        }
 
-        std::vector<D3D12_DESCRIPTOR_RANGE> rangeStorage;
-        rangeStorage.reserve(128);
+        if (totalDwords > kMaxRootSignatureDwords)
+        {
+            std::cerr << "[D3D12Pipeline] Deterministic Root Signature Rejection: active shader bindings across set0..15 require "
+                      << totalDwords << " DWORDs, exceeding the D3D12 64-DWORD hardware limit.\n";
+            return false;
+        }
 
-        const UINT32 stageParamBases[5] = {
-            kGraphicsVertexSpaceParamBase,
-            kGraphicsPixelSpaceParamBase,
-            kGraphicsGeometrySpaceParamBase,
-            kGraphicsHullSpaceParamBase,
-            kGraphicsDomainSpaceParamBase
-        };
-        const UINT32 stageSamplerParamBases[5] = {
-            kGraphicsVertexSamplerParamBase,
-            kGraphicsPixelSamplerParamBase,
-            kGraphicsGeometrySamplerParamBase,
-            kGraphicsHullSamplerParamBase,
-            kGraphicsDomainSamplerParamBase
-        };
-        const D3D12_SHADER_VISIBILITY stageVisibilities[5] = {
+        static constexpr D3D12_SHADER_VISIBILITY kStageVisibilities[5] = {
             D3D12_SHADER_VISIBILITY_VERTEX,
             D3D12_SHADER_VISIBILITY_PIXEL,
             D3D12_SHADER_VISIBILITY_GEOMETRY,
@@ -416,12 +265,22 @@ namespace Northstar
             D3D12_SHADER_VISIBILITY_DOMAIN
         };
 
-        for (UINT32 st = 0; st < 5; ++st)
+        std::vector<D3D12_DESCRIPTOR_RANGE> rangeStorage;
+        rangeStorage.reserve(512);
+        std::vector<D3D12_ROOT_PARAMETER> rootParams;
+        rootParams.reserve(kMaxRootParameters);
+
+        // 1. Per-stage CBV+SRV space descriptor tables (48 descriptors per space: b0..b15 + t0..t31)
+        for (UINT32 st = 0; st < 5u; ++st)
         {
             for (UINT32 s = 0; s < kMaxSpaces; ++s)
             {
-                const SIZE_T firstRangeIdx = rangeStorage.size();
+                if (cbvMask[st][s] == 0u && srvMask[st][s] == 0u)
+                {
+                    continue;
+                }
 
+                const SIZE_T firstRangeIdx = rangeStorage.size();
                 UINT32 r = 0;
                 while (r < kCBVPerSpace)
                 {
@@ -466,53 +325,170 @@ namespace Northstar
                     rangeStorage.push_back(rng);
                 }
 
-                const UINT32 paramIdx = stageParamBases[st] + s;
-                rootParams[paramIdx].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                rootParams[paramIdx].DescriptorTable.NumDescriptorRanges = static_cast<UINT32>(rangeStorage.size() - firstRangeIdx);
-                rootParams[paramIdx].DescriptorTable.pDescriptorRanges   = rangeStorage.data() + firstRangeIdx;
-                rootParams[paramIdx].ShaderVisibility                    = stageVisibilities[st];
+                const INT16 paramIdx = static_cast<INT16>(rootParams.size());
+                outLayout.cbvSrvParam[st][s] = paramIdx;
+
+                D3D12_ROOT_PARAMETER p{};
+                p.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                p.DescriptorTable.NumDescriptorRanges = static_cast<UINT32>(rangeStorage.size() - firstRangeIdx);
+                p.DescriptorTable.pDescriptorRanges   = rangeStorage.data() + firstRangeIdx;
+                p.ShaderVisibility                    = kStageVisibilities[st];
+                rootParams.push_back(p);
             }
         }
 
+        // 2. Per-stage Sampler space descriptor tables (s0..s15)
+        for (UINT32 st = 0; st < 5u; ++st)
+        {
+            for (UINT32 s = 0; s < kMaxSpaces; ++s)
+            {
+                if ((key.samplerMask[st] & (1u << s)) == 0u)
+                {
+                    continue;
+                }
+                const SIZE_T rngIdx = rangeStorage.size();
+                D3D12_DESCRIPTOR_RANGE rng{};
+                rng.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+                rng.NumDescriptors                    = 16;
+                rng.BaseShaderRegister                = 0;
+                rng.RegisterSpace                     = s;
+                rng.OffsetInDescriptorsFromTableStart = 0;
+                rangeStorage.push_back(rng);
+
+                const INT16 paramIdx = static_cast<INT16>(rootParams.size());
+                outLayout.samplerParam[st][s] = paramIdx;
+
+                D3D12_ROOT_PARAMETER p{};
+                p.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                p.DescriptorTable.NumDescriptorRanges = 1;
+                p.DescriptorTable.pDescriptorRanges   = rangeStorage.data() + rngIdx;
+                p.ShaderVisibility                    = kStageVisibilities[st];
+                rootParams.push_back(p);
+            }
+        }
+
+        // 3. Graphics UAV space descriptor tables (u0..u15, VISIBILITY_ALL)
         for (UINT32 s = 0; s < kMaxSpaces; ++s)
         {
-            samplerRanges[s].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-            samplerRanges[s].NumDescriptors                    = 16;
-            samplerRanges[s].BaseShaderRegister                = 0;
-            samplerRanges[s].RegisterSpace                     = s;
-            samplerRanges[s].OffsetInDescriptorsFromTableStart = 0;
-
-            uavRanges[s].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-            uavRanges[s].NumDescriptors                    = kUAVPerSpace;
-            uavRanges[s].BaseShaderRegister                = 0;
-            uavRanges[s].RegisterSpace                     = s;
-            uavRanges[s].OffsetInDescriptorsFromTableStart = 0;
-
-            for (UINT32 st = 0; st < 5; ++st)
+            if ((key.uavMask & (1u << s)) == 0u)
             {
-                const UINT32 sampParam = stageSamplerParamBases[st] + s;
-                rootParams[sampParam].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                rootParams[sampParam].DescriptorTable.NumDescriptorRanges = 1;
-                rootParams[sampParam].DescriptorTable.pDescriptorRanges   = &samplerRanges[s];
-                rootParams[sampParam].ShaderVisibility                    = stageVisibilities[st];
+                continue;
             }
+            const SIZE_T rngIdx = rangeStorage.size();
+            D3D12_DESCRIPTOR_RANGE rng{};
+            rng.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            rng.NumDescriptors                    = kUAVPerSpace;
+            rng.BaseShaderRegister                = 0;
+            rng.RegisterSpace                     = s;
+            rng.OffsetInDescriptorsFromTableStart = 0;
+            rangeStorage.push_back(rng);
 
-            rootParams[kGraphicsUAVSpaceParamBase + s].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            rootParams[kGraphicsUAVSpaceParamBase + s].DescriptorTable.NumDescriptorRanges = 1;
-            rootParams[kGraphicsUAVSpaceParamBase + s].DescriptorTable.pDescriptorRanges   = &uavRanges[s];
-            rootParams[kGraphicsUAVSpaceParamBase + s].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+            const INT16 paramIdx = static_cast<INT16>(rootParams.size());
+            outLayout.uavParam[s] = paramIdx;
+
+            D3D12_ROOT_PARAMETER p{};
+            p.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p.DescriptorTable.NumDescriptorRanges = 1;
+            p.DescriptorTable.pDescriptorRanges   = rangeStorage.data() + rngIdx;
+            p.ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+            rootParams.push_back(p);
         }
 
-        // Param 16: 32-Bit Root Constants at (b1, space3)
-        rootParams[kGraphicsRootConstantsParamIndex].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rootParams[kGraphicsRootConstantsParamIndex].Constants.ShaderRegister = 1;
-        rootParams[kGraphicsRootConstantsParamIndex].Constants.RegisterSpace  = 3;
-        rootParams[kGraphicsRootConstantsParamIndex].Constants.Num32BitValues = 4;
-        rootParams[kGraphicsRootConstantsParamIndex].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+        // 4. Isolated 4x 32-bit Root Constants at (b0, space16)
+        {
+            outLayout.rootConstantsParam = static_cast<INT16>(rootParams.size());
+            D3D12_ROOT_PARAMETER p{};
+            p.ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            p.Constants.ShaderRegister = 0;
+            p.Constants.RegisterSpace  = kInternalRootConstantsSpace;
+            p.Constants.Num32BitValues = 4;
+            p.ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+            rootParams.push_back(p);
+        }
+
+        // 5. Optional Promoted ExecuteIndirect Root CBVs (0..2 or 0..7) and Root SRVs (0 or 0..1)
+        if (key.indirectKey.enabled)
+        {
+            const UINT32 cbvSlots = outLayout.isExtendedIndirect ? kExtendedGraphicsIndirectCBVParamCount : kGraphicsIndirectCBVParamCount;
+            const UINT8  effSrv   = (key.indirectKey.srvCount > 0u) ? key.indirectKey.srvCount : (key.indirectKey.hasPromotedSRV ? 1u : 0u);
+            for (UINT32 i = 0; i < cbvSlots; ++i)
+            {
+                outLayout.indirectCbvParam[i] = static_cast<INT16>(rootParams.size());
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                D3D12_ROOT_PARAMETER    p{};
+                p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+                if (i < key.indirectKey.cbvCount &&
+                    key.indirectKey.cbvSpace[i] < kMaxSpaces &&
+                    key.indirectKey.cbvSlot[i] < kCBVPerSpace &&
+                    MapGraphicsStageToIndex(key.indirectKey.cbvStage[i], stIdx, vis))
+                {
+                    p.Descriptor.ShaderRegister = key.indirectKey.cbvSlot[i];
+                    p.Descriptor.RegisterSpace  = key.indirectKey.cbvSpace[i];
+                    p.ShaderVisibility          = vis;
+                }
+                else
+                {
+                    p.Descriptor.ShaderRegister = i;
+                    p.Descriptor.RegisterSpace  = kInternalPlaceholderSpace;
+                    p.ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+                }
+                rootParams.push_back(p);
+            }
+
+            {
+                outLayout.indirectSrvParam = static_cast<INT16>(rootParams.size());
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                D3D12_ROOT_PARAMETER    p{};
+                p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                if (effSrv >= 1u &&
+                    key.indirectKey.srvSpace < kMaxSpaces &&
+                    key.indirectKey.srvSlot < kSRVPerSpace &&
+                    MapGraphicsStageToIndex(key.indirectKey.srvStage, stIdx, vis))
+                {
+                    p.Descriptor.ShaderRegister = key.indirectKey.srvSlot;
+                    p.Descriptor.RegisterSpace  = key.indirectKey.srvSpace;
+                    p.ShaderVisibility          = vis;
+                }
+                else
+                {
+                    p.Descriptor.ShaderRegister = 0;
+                    p.Descriptor.RegisterSpace  = kInternalPlaceholderSpace;
+                    p.ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+                }
+                rootParams.push_back(p);
+            }
+
+            if (outLayout.isExtendedIndirect)
+            {
+                outLayout.indirectSrv2Param = static_cast<INT16>(rootParams.size());
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                D3D12_ROOT_PARAMETER    p{};
+                p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                if (effSrv >= 2u &&
+                    key.indirectKey.srv2Space < kMaxSpaces &&
+                    key.indirectKey.srv2Slot < kSRVPerSpace &&
+                    MapGraphicsStageToIndex(key.indirectKey.srv2Stage, stIdx, vis))
+                {
+                    p.Descriptor.ShaderRegister = key.indirectKey.srv2Slot;
+                    p.Descriptor.RegisterSpace  = key.indirectKey.srv2Space;
+                    p.ShaderVisibility          = vis;
+                }
+                else
+                {
+                    p.Descriptor.ShaderRegister = 1;
+                    p.Descriptor.RegisterSpace  = kInternalPlaceholderSpace;
+                    p.ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+                }
+                rootParams.push_back(p);
+            }
+        }
 
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-        rootDesc.NumParameters     = kGraphicsRootParamCount;
-        rootDesc.pParameters       = rootParams;
+        rootDesc.NumParameters     = static_cast<UINT32>(rootParams.size());
+        rootDesc.pParameters       = rootParams.data();
         rootDesc.NumStaticSamplers = 0;
         rootDesc.pStaticSamplers   = nullptr;
         rootDesc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -523,90 +499,61 @@ namespace Northstar
         {
             if (errorBlob)
             {
-                std::cerr << "[D3D12Pipeline] Indirect Root Signature Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+                std::cerr << "[D3D12Pipeline] Graphics Root Signature Error: " << static_cast<const char*>(errorBlob->GetBufferPointer()) << std::endl;
             }
-            return nullptr;
+            return false;
         }
 
-        ComPtr<ID3D12RootSignature> createdRootSig;
         if (FAILED(device->CreateRootSignature(
                 0,
                 signatureBlob->GetBufferPointer(),
                 signatureBlob->GetBufferSize(),
-                IID_PPV_ARGS(&createdRootSig))))
+                IID_PPV_ARGS(&outLayout.rootSignature))))
         {
-            return nullptr;
+            return false;
         }
 
-        IndirectRootSignatureEntry& entry = m_indirectRootObjects[key];
-        entry.rootSignature               = createdRootSig;
-        return entry.rootSignature.Get();
+        outLayout.totalParamCount = static_cast<UINT32>(rootParams.size());
+        outLayout.totalDwordCost  = totalDwords;
+        return true;
     }
 
-    ID3D12CommandSignature* D3D12Pipeline::GetOrCreateIndirectCommandSignature(
-        ID3D12Device*                 device,
-        const IndirectRootBindingKey& key)
-    {
-        if (!device) return nullptr;
-
-        IndirectRootBindingKey effKey = key;
-        effKey.enabled                = true;
-
-        ID3D12RootSignature* rootSig = GetOrCreateIndirectRootSignature(device, effKey);
-        if (!rootSig) return nullptr;
-
-        IndirectRootSignatureEntry& entry = m_indirectRootObjects[effKey];
-        if (entry.commandSignature)
-        {
-            return entry.commandSignature.Get();
-        }
-
-        D3D12_INDIRECT_ARGUMENT_DESC argDescs[7]{};
-        argDescs[0].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
-        argDescs[0].VertexBuffer.Slot                     = 0;
-
-        argDescs[1].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
-
-        argDescs[2].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
-        argDescs[2].ConstantBufferView.RootParameterIndex = kGraphicsIndirectCBVParamBase + 0;
-
-        argDescs[3].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
-        argDescs[3].ConstantBufferView.RootParameterIndex = kGraphicsIndirectCBVParamBase + 1;
-
-        argDescs[4].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
-        argDescs[4].ConstantBufferView.RootParameterIndex = kGraphicsIndirectCBVParamBase + 2;
-
-        argDescs[5].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW;
-        argDescs[5].ShaderResourceView.RootParameterIndex = kGraphicsIndirectSRVParamIndex;
-
-        argDescs[6].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
-
-        D3D12_COMMAND_SIGNATURE_DESC sigDesc{};
-        sigDesc.ByteStride       = kNVSIndirectCommandByteStride;
-        sigDesc.NumArgumentDescs = 7;
-        sigDesc.pArgumentDescs   = argDescs;
-        sigDesc.NodeMask         = 0;
-
-        ComPtr<ID3D12CommandSignature> cmdSig;
-        if (FAILED(device->CreateCommandSignature(&sigDesc, rootSig, IID_PPV_ARGS(&cmdSig))))
-        {
-            return nullptr;
-        }
-
-        entry.commandSignature = cmdSig;
-        return entry.commandSignature.Get();
-    }
-
-    BOOL D3D12Pipeline::CreateComputeRootSignature(ID3D12Device* device)
+    BOOL D3D12Pipeline::BuildComputeRootLayout(
+        ID3D12Device*               device,
+        const ComputeRootLayoutKey& key,
+        ComputeRootLayout&          outLayout)
     {
         if (!device) return false;
 
+        outLayout = ComputeRootLayout{};
+        for (UINT32 s = 0; s < kMaxSpaces; ++s)
+        {
+            outLayout.spaceParam[s]   = -1;
+            outLayout.samplerParam[s] = -1;
+        }
+
+        UINT32 totalDwords = 4u; // 4x 32-bit Root Constants at (b0, space16)
+        for (UINT32 s = 0; s < kMaxSpaces; ++s)
+        {
+            if ((key.cbvSrvUavMask & (1u << s)) != 0u) ++totalDwords;
+            if ((key.samplerMask   & (1u << s)) != 0u) ++totalDwords;
+        }
+        if (totalDwords > kMaxRootSignatureDwords)
+        {
+            std::cerr << "[D3D12Pipeline] Deterministic Compute Root Signature Rejection: active bindings require "
+                      << totalDwords << " DWORDs (> 64 DWORD limit).\n";
+            return false;
+        }
+
         D3D12_DESCRIPTOR_RANGE csRanges[kMaxSpaces][3]{};
         D3D12_DESCRIPTOR_RANGE samplerRanges[kMaxSpaces]{};
-        D3D12_ROOT_PARAMETER   rootParams[9]{};
+        std::vector<D3D12_ROOT_PARAMETER> rootParams;
+        rootParams.reserve(kMaxRootParameters);
 
         for (UINT32 s = 0; s < kMaxSpaces; ++s)
         {
+            if ((key.cbvSrvUavMask & (1u << s)) == 0u) continue;
+
             csRanges[s][0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
             csRanges[s][0].NumDescriptors                    = kCBVPerSpace;
             csRanges[s][0].BaseShaderRegister                = 0;
@@ -625,35 +572,48 @@ namespace Northstar
             csRanges[s][2].RegisterSpace                     = s;
             csRanges[s][2].OffsetInDescriptorsFromTableStart = kCBVPerSpace + kSRVPerSpace;
 
-            rootParams[s].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            rootParams[s].DescriptorTable.NumDescriptorRanges = 3;
-            rootParams[s].DescriptorTable.pDescriptorRanges   = csRanges[s];
-            rootParams[s].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+            outLayout.spaceParam[s] = static_cast<INT16>(rootParams.size());
+            D3D12_ROOT_PARAMETER p{};
+            p.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p.DescriptorTable.NumDescriptorRanges = 3;
+            p.DescriptorTable.pDescriptorRanges   = csRanges[s];
+            p.ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+            rootParams.push_back(p);
         }
 
         for (UINT32 s = 0; s < kMaxSpaces; ++s)
         {
+            if ((key.samplerMask & (1u << s)) == 0u) continue;
+
             samplerRanges[s].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
             samplerRanges[s].NumDescriptors                    = 16;
             samplerRanges[s].BaseShaderRegister                = 0;
             samplerRanges[s].RegisterSpace                     = s;
             samplerRanges[s].OffsetInDescriptorsFromTableStart = 0;
 
-            rootParams[kComputeSamplerParamBase + s].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            rootParams[kComputeSamplerParamBase + s].DescriptorTable.NumDescriptorRanges = 1;
-            rootParams[kComputeSamplerParamBase + s].DescriptorTable.pDescriptorRanges   = &samplerRanges[s];
-            rootParams[kComputeSamplerParamBase + s].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+            outLayout.samplerParam[s] = static_cast<INT16>(rootParams.size());
+            D3D12_ROOT_PARAMETER p{};
+            p.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p.DescriptorTable.NumDescriptorRanges = 1;
+            p.DescriptorTable.pDescriptorRanges   = &samplerRanges[s];
+            p.ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+            rootParams.push_back(p);
         }
 
-        rootParams[kComputeRootConstantsParamIndex].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rootParams[kComputeRootConstantsParamIndex].Constants.ShaderRegister = 0;
-        rootParams[kComputeRootConstantsParamIndex].Constants.RegisterSpace  = 4; // space4 (isolated from NSL space0..space3)
-        rootParams[kComputeRootConstantsParamIndex].Constants.Num32BitValues = 4;
-        rootParams[kComputeRootConstantsParamIndex].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+        outLayout.rootConstantsParam = static_cast<INT16>(rootParams.size());
+        {
+            D3D12_ROOT_PARAMETER p{};
+            p.ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            p.Constants.ShaderRegister = 0;
+            p.Constants.RegisterSpace  = kInternalRootConstantsSpace;
+            p.Constants.Num32BitValues = 4;
+            p.ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+            rootParams.push_back(p);
+        }
 
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-        rootDesc.NumParameters     = 9;
-        rootDesc.pParameters       = rootParams;
+        rootDesc.NumParameters     = static_cast<UINT32>(rootParams.size());
+        rootDesc.pParameters       = rootParams.data();
         rootDesc.NumStaticSamplers = 0;
         rootDesc.pStaticSamplers   = nullptr;
         rootDesc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
@@ -664,17 +624,285 @@ namespace Northstar
         {
             if (errorBlob)
             {
-                std::cerr << "[D3D12Pipeline] Compute Root Signature Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+                std::cerr << "[D3D12Pipeline] Compute Root Signature Error: " << static_cast<const char*>(errorBlob->GetBufferPointer()) << std::endl;
             }
             return false;
         }
 
-        return SUCCEEDED(device->CreateRootSignature(
-            0,
-            signatureBlob->GetBufferPointer(),
-            signatureBlob->GetBufferSize(),
-            IID_PPV_ARGS(&m_computeRootSignature)
-        ));
+        if (FAILED(device->CreateRootSignature(
+                0,
+                signatureBlob->GetBufferPointer(),
+                signatureBlob->GetBufferSize(),
+                IID_PPV_ARGS(&outLayout.rootSignature))))
+        {
+            return false;
+        }
+
+        outLayout.totalParamCount = static_cast<UINT32>(rootParams.size());
+        outLayout.totalDwordCost  = totalDwords;
+        return true;
+    }
+
+    BOOL D3D12Pipeline::CreateRootSignature(ID3D12Device* device)
+    {
+        GraphicsRootLayoutKey defaultKey{};
+        return BuildGraphicsRootLayout(device, defaultKey, m_defaultGraphicsLayout);
+    }
+
+    const GraphicsRootLayout* D3D12Pipeline::GetOrCreateGraphicsRootLayout(
+        ID3D12Device*                 device,
+        const D3D12ResourceManager&   resMgr,
+        NativeHandle                  vsHandle,
+        NativeHandle                  psHandle,
+        NativeHandle                  gsHandle,
+        NativeHandle                  hsHandle,
+        NativeHandle                  dsHandle,
+        const IndirectRootBindingKey& indirectRootKey)
+    {
+        if (!device || !m_defaultGraphicsLayout.rootSignature) return nullptr;
+
+        const NativeHandle handles[5] = { vsHandle, psHandle, gsHandle, hsHandle, dsHandle };
+        UINT16 cbvSrvMask[5]{};
+        UINT16 samplerMask[5]{};
+        UINT16 uavMask      = 0u;
+        UINT16 combinedHigh = 0u;
+
+        for (UINT32 st = 0; st < 5u; ++st)
+        {
+            if (handles[st] == 0) continue;
+            const D3D12ShaderResource* sRes = resMgr.GetShader(handles[st]);
+            const ShaderSpaceMask sm = sRes ? sRes->spaceMask : ShaderSpaceMask{};
+            cbvSrvMask[st]  = sm.cbvSrvMask;
+            samplerMask[st] = sm.samplerMask;
+            uavMask         = static_cast<UINT16>(uavMask | sm.uavMask);
+            combinedHigh    = static_cast<UINT16>(combinedHigh | ((sm.cbvSrvMask | sm.samplerMask | sm.uavMask) & 0xFFF0u));
+        }
+        cbvSrvMask[0] = static_cast<UINT16>(cbvSrvMask[0] | 0x0001u);
+
+        if (indirectRootKey.enabled)
+        {
+            for (UINT32 i = 0; i < kGraphicsIndirectCBVParamCount && i < indirectRootKey.cbvCount; ++i)
+            {
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                if (indirectRootKey.cbvSpace[i] < kMaxSpaces &&
+                    MapGraphicsStageToIndex(indirectRootKey.cbvStage[i], stIdx, vis))
+                {
+                    cbvSrvMask[stIdx] = static_cast<UINT16>(cbvSrvMask[stIdx] | (1u << indirectRootKey.cbvSpace[i]));
+                }
+            }
+            if (indirectRootKey.hasPromotedSRV && indirectRootKey.srvSpace < kMaxSpaces)
+            {
+                UINT32                  stIdx = 0;
+                D3D12_SHADER_VISIBILITY vis   = D3D12_SHADER_VISIBILITY_ALL;
+                if (MapGraphicsStageToIndex(indirectRootKey.srvStage, stIdx, vis))
+                {
+                    cbvSrvMask[stIdx] = static_cast<UINT16>(cbvSrvMask[stIdx] | (1u << indirectRootKey.srvSpace));
+                }
+            }
+        }
+
+        // Fast path: all bound shader stages fit inside space0..3 and no promoted indirect root descriptors
+        if (!indirectRootKey.enabled && combinedHigh == 0u)
+        {
+            return &m_defaultGraphicsLayout;
+        }
+
+        GraphicsRootLayoutKey key{};
+        for (UINT32 st = 0; st < 5u; ++st)
+        {
+            key.cbvSrvMask[st]  = cbvSrvMask[st];
+            key.samplerMask[st] = samplerMask[st];
+        }
+        key.uavMask     = uavMask;
+        key.indirectKey = indirectRootKey;
+
+        auto it = m_graphicsRootLayouts.find(key);
+        if (it != m_graphicsRootLayouts.end() && it->second.rootSignature)
+        {
+            return &it->second;
+        }
+
+        GraphicsRootLayout created{};
+        if (!BuildGraphicsRootLayout(device, key, created))
+        {
+            return nullptr;
+        }
+
+        auto [insIt, _] = m_graphicsRootLayouts.emplace(key, std::move(created));
+        return &insIt->second;
+    }
+
+    const ComputeRootLayout* D3D12Pipeline::GetOrCreateComputeRootLayout(
+        ID3D12Device*               device,
+        const D3D12ResourceManager& resMgr,
+        NativeHandle                csHandle)
+    {
+        if (!device || !m_defaultComputeLayout.rootSignature || csHandle == 0) return nullptr;
+
+        const D3D12ShaderResource* csRes = resMgr.GetShader(csHandle);
+        if (!csRes) return nullptr;
+
+        const UINT16 spaceMask = static_cast<UINT16>(csRes->spaceMask.cbvSrvMask | csRes->spaceMask.uavMask);
+        const UINT16 sampMask  = csRes->spaceMask.samplerMask;
+
+        if (((spaceMask | sampMask) & 0xFFF0u) == 0u)
+        {
+            return &m_defaultComputeLayout;
+        }
+
+        ComputeRootLayoutKey key{};
+        key.cbvSrvUavMask = spaceMask;
+        key.samplerMask   = sampMask;
+
+        auto it = m_computeRootLayouts.find(key);
+        if (it != m_computeRootLayouts.end() && it->second.rootSignature)
+        {
+            return &it->second;
+        }
+
+        ComputeRootLayout created{};
+        if (!BuildComputeRootLayout(device, key, created))
+        {
+            return nullptr;
+        }
+
+        auto [insIt, _] = m_computeRootLayouts.emplace(key, std::move(created));
+        return &insIt->second;
+    }
+
+    ID3D12CommandSignature* D3D12Pipeline::GetOrCreateIndirectCommandSignatureForLayout(
+        ID3D12Device*       device,
+        GraphicsRootLayout& layout)
+    {
+        if (!device || !layout.rootSignature) return nullptr;
+        if (layout.indirectCommandSignature)
+        {
+            return layout.indirectCommandSignature.Get();
+        }
+        if (layout.isExtendedIndirect)
+        {
+            for (UINT32 i = 0; i < kExtendedGraphicsIndirectCBVParamCount; ++i)
+            {
+                if (layout.indirectCbvParam[i] < 0) return nullptr;
+            }
+            if (layout.indirectSrvParam < 0 || layout.indirectSrv2Param < 0) return nullptr;
+
+            D3D12_INDIRECT_ARGUMENT_DESC argDescs[13]{};
+            argDescs[0].Type                                   = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+            argDescs[0].VertexBuffer.Slot                      = 0;
+            argDescs[1].Type                                   = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+            for (UINT32 i = 0; i < kExtendedGraphicsIndirectCBVParamCount; ++i)
+            {
+                argDescs[2 + i].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+                argDescs[2 + i].ConstantBufferView.RootParameterIndex = static_cast<UINT32>(layout.indirectCbvParam[i]);
+            }
+            argDescs[10].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW;
+            argDescs[10].ShaderResourceView.RootParameterIndex = static_cast<UINT32>(layout.indirectSrvParam);
+            argDescs[11].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW;
+            argDescs[11].ShaderResourceView.RootParameterIndex = static_cast<UINT32>(layout.indirectSrv2Param);
+            argDescs[12].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+
+            D3D12_COMMAND_SIGNATURE_DESC sigDesc{};
+            sigDesc.ByteStride       = kNVGExtendedIndirectCommandByteStride;
+            sigDesc.NumArgumentDescs = 13;
+            sigDesc.pArgumentDescs   = argDescs;
+            sigDesc.NodeMask         = 0;
+
+            ComPtr<ID3D12CommandSignature> cmdSig;
+            if (FAILED(device->CreateCommandSignature(&sigDesc, layout.rootSignature.Get(), IID_PPV_ARGS(&cmdSig))))
+            {
+                return nullptr;
+            }
+            layout.indirectCommandSignature = cmdSig;
+            return layout.indirectCommandSignature.Get();
+        }
+        if (layout.indirectCbvParam[0] < 0 || layout.indirectCbvParam[1] < 0 ||
+            layout.indirectCbvParam[2] < 0 || layout.indirectSrvParam < 0)
+        {
+            return nullptr;
+        }
+
+        D3D12_INDIRECT_ARGUMENT_DESC argDescs[7]{};
+        argDescs[0].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+        argDescs[0].VertexBuffer.Slot                     = 0;
+        argDescs[1].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+        argDescs[2].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+        argDescs[2].ConstantBufferView.RootParameterIndex = static_cast<UINT32>(layout.indirectCbvParam[0]);
+        argDescs[3].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+        argDescs[3].ConstantBufferView.RootParameterIndex = static_cast<UINT32>(layout.indirectCbvParam[1]);
+        argDescs[4].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+        argDescs[4].ConstantBufferView.RootParameterIndex = static_cast<UINT32>(layout.indirectCbvParam[2]);
+        argDescs[5].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW;
+        argDescs[5].ShaderResourceView.RootParameterIndex = static_cast<UINT32>(layout.indirectSrvParam);
+        argDescs[6].Type                                  = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+
+        D3D12_COMMAND_SIGNATURE_DESC sigDesc{};
+        sigDesc.ByteStride       = kNVSIndirectCommandByteStride;
+        sigDesc.NumArgumentDescs = 7;
+        sigDesc.pArgumentDescs   = argDescs;
+        sigDesc.NodeMask         = 0;
+
+        ComPtr<ID3D12CommandSignature> cmdSig;
+        if (FAILED(device->CreateCommandSignature(&sigDesc, layout.rootSignature.Get(), IID_PPV_ARGS(&cmdSig))))
+        {
+            return nullptr;
+        }
+        layout.indirectCommandSignature = cmdSig;
+        return layout.indirectCommandSignature.Get();
+    }
+
+    ID3D12RootSignature* D3D12Pipeline::GetOrCreateIndirectRootSignature(
+        ID3D12Device*                 device,
+        const IndirectRootBindingKey& key)
+    {
+        if (!device) return nullptr;
+        if (!key.enabled) return m_defaultGraphicsLayout.rootSignature.Get();
+
+        GraphicsRootLayoutKey layoutKey{};
+        layoutKey.indirectKey = key;
+        auto it = m_graphicsRootLayouts.find(layoutKey);
+        if (it != m_graphicsRootLayouts.end() && it->second.rootSignature)
+        {
+            return it->second.rootSignature.Get();
+        }
+
+        GraphicsRootLayout created{};
+        if (!BuildGraphicsRootLayout(device, layoutKey, created))
+        {
+            return nullptr;
+        }
+        auto [insIt, _] = m_graphicsRootLayouts.emplace(layoutKey, std::move(created));
+        return insIt->second.rootSignature.Get();
+    }
+
+    ID3D12CommandSignature* D3D12Pipeline::GetOrCreateIndirectCommandSignature(
+        ID3D12Device*                 device,
+        const IndirectRootBindingKey& key)
+    {
+        if (!device) return nullptr;
+
+        GraphicsRootLayoutKey layoutKey{};
+        layoutKey.indirectKey         = key;
+        layoutKey.indirectKey.enabled = true;
+
+        auto it = m_graphicsRootLayouts.find(layoutKey);
+        if (it == m_graphicsRootLayouts.end())
+        {
+            GraphicsRootLayout created{};
+            if (!BuildGraphicsRootLayout(device, layoutKey, created))
+            {
+                return nullptr;
+            }
+            it = m_graphicsRootLayouts.emplace(layoutKey, std::move(created)).first;
+        }
+        return GetOrCreateIndirectCommandSignatureForLayout(device, it->second);
+    }
+
+    BOOL D3D12Pipeline::CreateComputeRootSignature(ID3D12Device* device)
+    {
+        ComputeRootLayoutKey defaultKey{};
+        return BuildComputeRootLayout(device, defaultKey, m_defaultComputeLayout);
     }
 
     BOOL D3D12Pipeline::CreateCommandSignatures(ID3D12Device* device)
@@ -853,11 +1081,11 @@ namespace Northstar
         DXGI_FORMAT rtvFormat,
         DXGI_FORMAT dsvFormat)
     {
-        if (!device || !m_rootSignature) return nullptr;
+        if (!device || !m_defaultGraphicsLayout.rootSignature) return nullptr;
 
-        ID3D12RootSignature* targetRootSig = indirectRootKey.enabled
-            ? GetOrCreateIndirectRootSignature(device, indirectRootKey)
-            : m_rootSignature.Get();
+        const GraphicsRootLayout* targetLayout = GetOrCreateGraphicsRootLayout(
+            device, resMgr, vsHandle, psHandle, gsHandle, hsHandle, dsHandle, indirectRootKey);
+        ID3D12RootSignature* targetRootSig = targetLayout ? targetLayout->rootSignature.Get() : nullptr;
         if (!targetRootSig)
         {
             return nullptr;
@@ -1166,11 +1394,12 @@ namespace Northstar
     }
 
     ID3D12PipelineState* D3D12Pipeline::GetOrCreateComputePSO(
-        ID3D12Device* device,
+        ID3D12Device*               device,
         const D3D12ResourceManager& resMgr,
-        NativeHandle csHandle)
+        NativeHandle                csHandle,
+        const BackendCapabilities*  deviceCaps)
     {
-        if (!device || !m_computeRootSignature || csHandle == 0) return nullptr;
+        if (!device || !m_defaultComputeLayout.rootSignature || csHandle == 0) return nullptr;
 
         const D3D12ShaderResource* csRes = resMgr.GetShader(csHandle);
         if (!csRes || csRes->stage != ShaderStage::COMPUTE)
@@ -1178,10 +1407,32 @@ namespace Northstar
             return nullptr;
         }
 
+        if (deviceCaps != nullptr)
+        {
+            if (csRes->requiredShaderModel > deviceCaps->maxShaderModel)
+            {
+                return nullptr;
+            }
+            if (csRes->requiresInt64Ops && !deviceCaps->supportsInt64ShaderOps)
+            {
+                return nullptr;
+            }
+            if (csRes->requiresInt64DescriptorHeapAtomics && !deviceCaps->SupportsNVGRasterAtomic64())
+            {
+                return nullptr;
+            }
+        }
+
         auto it = m_computePsoCache.find(csHandle);
         if (it != m_computePsoCache.end())
         {
             return it->second.Get();
+        }
+
+        const ComputeRootLayout* csLayout = GetOrCreateComputeRootLayout(device, resMgr, csHandle);
+        if (!csLayout || !csLayout->rootSignature)
+        {
+            return nullptr;
         }
 
         const void* csPtr  = csRes->blob ? csRes->blob->GetBufferPointer() : csRes->bytecode.data();
@@ -1192,7 +1443,7 @@ namespace Northstar
         }
 
         D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = m_computeRootSignature.Get();
+        psoDesc.pRootSignature = csLayout->rootSignature.Get();
         psoDesc.CS             = { csPtr, csSize };
         psoDesc.NodeMask       = 0;
         psoDesc.Flags          = D3D12_PIPELINE_STATE_FLAG_NONE;

@@ -15,8 +15,8 @@ TokenKind Lexer::LookupKeyword(const std::string& id)
     {
         // ==================== Scalar / Vector Types ====================
         { "Float",   TokenKind::KW_FLOAT  }, { "Int",     TokenKind::KW_INT    },
-        { "UInt",    TokenKind::KW_UINT   }, { "Bool",    TokenKind::KW_BOOL   },
-        { "Double",  TokenKind::KW_DOUBLE },
+        { "UInt",    TokenKind::KW_UINT   }, { "UInt64",  TokenKind::KW_UINT64 },
+        { "Bool",    TokenKind::KW_BOOL   }, { "Double",  TokenKind::KW_DOUBLE },
         { "Vec2",    TokenKind::KW_VEC2   }, { "Vec3",    TokenKind::KW_VEC3   },
         { "Vec4",    TokenKind::KW_VEC4   },
         { "Int2",    TokenKind::KW_INT2   }, { "Int3",    TokenKind::KW_INT3   },
@@ -121,7 +121,9 @@ std::string Token::KindName() const
         case TokenKind::IDENTIFIER:     return "identifier";
         case TokenKind::LIT_INT:        return "integer literal";
         case TokenKind::LIT_UINT:       return "unsigned integer literal";
+        case TokenKind::LIT_UINT64:     return "64-bit unsigned integer literal";
         case TokenKind::LIT_FLOAT:      return "float literal";
+        case TokenKind::LIT_DOUBLE:     return "double literal";
         case TokenKind::LIT_BOOL:       return "bool literal";
         case TokenKind::LIT_STRING:     return "string literal";
         case TokenKind::OP_DOT:         return "'.'";
@@ -286,10 +288,41 @@ Token Lexer::ReadNumber()
         }
 
         bool isUnsigned = false;
+        bool isLong64   = false;
+        size_t suffixLen = 0;
         if (!IsAtEnd() && (Current() == 'u' || Current() == 'U'))
         {
             lexeme += Advance();
             isUnsigned = true;
+            ++suffixLen;
+            if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+            {
+                lexeme += Advance();
+                isLong64 = true;
+                ++suffixLen;
+                if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+                {
+                    lexeme += Advance();
+                    ++suffixLen;
+                }
+            }
+        }
+        else if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+        {
+            lexeme += Advance();
+            isLong64 = true;
+            ++suffixLen;
+            if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+            {
+                lexeme += Advance();
+                ++suffixLen;
+            }
+            if (!IsAtEnd() && (Current() == 'u' || Current() == 'U'))
+            {
+                lexeme += Advance();
+                isUnsigned = true;
+                ++suffixLen;
+            }
         }
 
         // Reject invalid trailing identifier characters (e.g. 0x12g, 0xFFuu)
@@ -306,7 +339,7 @@ Token Lexer::ReadNumber()
         t.lexeme = lexeme;
         try
         {
-            const std::string numBody = isUnsigned ? lexeme.substr(0, lexeme.size() - 1) : lexeme;
+            const std::string numBody = (suffixLen > 0u) ? lexeme.substr(0, lexeme.size() - suffixLen) : lexeme;
             size_t parsedPos = 0;
             const uint64_t val = std::stoull(numBody, &parsedPos, 16);
             if (parsedPos != numBody.size())
@@ -314,7 +347,13 @@ Token Lexer::ReadNumber()
                 t.kind = TokenKind::UNKNOWN;
                 return t;
             }
-            if (isUnsigned || val > static_cast<uint64_t>(INT64_MAX))
+            if (isLong64 || val > UINT32_MAX)
+            {
+                t.kind      = TokenKind::LIT_UINT64;
+                t.uintValue = val;
+                t.intValue  = static_cast<int64_t>(val);
+            }
+            else if (isUnsigned)
             {
                 t.kind      = TokenKind::LIT_UINT;
                 t.uintValue = val;
@@ -371,18 +410,58 @@ Token Lexer::ReadNumber()
         }
     }
 
-    bool hasFloatSuffix = false;
-    bool isUnsigned     = false;
+    bool hasFloatSuffix  = false;
+    bool hasDoubleSuffix = false;
+    bool isUnsigned      = false;
+    bool isLong64        = false;
+    size_t suffixLen     = 0;
     if (!IsAtEnd() && (Current() == 'f' || Current() == 'F'))
     {
         lexeme += Advance();
         isFloat        = true;
         hasFloatSuffix = true;
+        suffixLen      = 1u;
+    }
+    else if (!IsAtEnd() && (Current() == 'd' || Current() == 'D' || (isFloat && (Current() == 'l' || Current() == 'L'))))
+    {
+        lexeme += Advance();
+        isFloat         = true;
+        hasDoubleSuffix = true;
+        suffixLen       = 1u;
     }
     else if (!isFloat && !IsAtEnd() && (Current() == 'u' || Current() == 'U'))
     {
         lexeme += Advance();
         isUnsigned = true;
+        ++suffixLen;
+        if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+        {
+            lexeme += Advance();
+            isLong64 = true;
+            ++suffixLen;
+            if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+            {
+                lexeme += Advance();
+                ++suffixLen;
+            }
+        }
+    }
+    else if (!isFloat && !IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+    {
+        lexeme += Advance();
+        isLong64 = true;
+        ++suffixLen;
+        if (!IsAtEnd() && (Current() == 'l' || Current() == 'L'))
+        {
+            lexeme += Advance();
+            ++suffixLen;
+        }
+        if (!IsAtEnd() && (Current() == 'u' || Current() == 'U'))
+        {
+            lexeme += Advance();
+            isUnsigned = true;
+            ++suffixLen;
+        }
     }
 
     // Reject trailing garbage identifier characters (e.g. 123abc, 1.0fu, 1.2.3)
@@ -400,19 +479,20 @@ Token Lexer::ReadNumber()
     {
         if (isFloat)
         {
-            const std::string numBody = hasFloatSuffix ? lexeme.substr(0, lexeme.size() - 1) : lexeme;
+            const std::string numBody = (suffixLen > 0u) ? lexeme.substr(0, lexeme.size() - suffixLen) : lexeme;
             size_t parsedPos = 0;
-            t.floatValue = std::stod(numBody, &parsedPos);
+            t.floatValue     = std::stod(numBody, &parsedPos);
+            t.hasFloatSuffix = hasFloatSuffix;
             if (parsedPos != numBody.size())
             {
                 t.kind = TokenKind::UNKNOWN;
                 return t;
             }
-            t.kind = TokenKind::LIT_FLOAT;
+            t.kind = hasDoubleSuffix ? TokenKind::LIT_DOUBLE : TokenKind::LIT_FLOAT;
         }
-        else if (isUnsigned)
+        else if (isUnsigned || isLong64)
         {
-            const std::string numBody = lexeme.substr(0, lexeme.size() - 1);
+            const std::string numBody = lexeme.substr(0, lexeme.size() - suffixLen);
             size_t parsedPos = 0;
             const uint64_t val = std::stoull(numBody, &parsedPos, 10);
             if (parsedPos != numBody.size())
@@ -420,7 +500,7 @@ Token Lexer::ReadNumber()
                 t.kind = TokenKind::UNKNOWN;
                 return t;
             }
-            t.kind      = TokenKind::LIT_UINT;
+            t.kind      = (isLong64 || val > UINT32_MAX) ? TokenKind::LIT_UINT64 : TokenKind::LIT_UINT;
             t.uintValue = val;
             t.intValue  = static_cast<int64_t>(val);
         }
@@ -433,9 +513,9 @@ Token Lexer::ReadNumber()
                 t.kind = TokenKind::UNKNOWN;
                 return t;
             }
-            if (val > static_cast<uint64_t>(INT64_MAX))
+            if (val > UINT32_MAX)
             {
-                t.kind      = TokenKind::LIT_UINT;
+                t.kind      = TokenKind::LIT_UINT64;
                 t.uintValue = val;
                 t.intValue  = static_cast<int64_t>(val);
             }

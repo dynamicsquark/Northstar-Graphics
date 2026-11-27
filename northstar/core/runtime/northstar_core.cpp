@@ -10,12 +10,20 @@
 #include <windows.h>
 #endif
 
+#include <cassert>
 #include <cmath>
 
 namespace Northstar
 {
     NorthstarCore::NorthstarCore()
+        : m_ownerThreadId(std::this_thread::get_id())
     {
+    }
+
+    void NorthstarCore::AssertOwnerThread() const noexcept
+    {
+        assert(std::this_thread::get_id() == m_ownerThreadId &&
+               "NorthstarCore API must be invoked from the owner thread that initialized the engine.");
     }
 
     NorthstarCore::~NorthstarCore()
@@ -46,6 +54,7 @@ namespace Northstar
 
             m_geometryManager.SetNVGManager(nullptr);
             m_renderPipeline.SetResourceMaterializer(nullptr);
+            m_renderPipeline.ResetCameraHistory();
             m_nvgManager.SetResourceMaterializer(nullptr);
             m_nvgManager.Shutdown();
             m_resourceMaterializer.Shutdown();
@@ -92,6 +101,7 @@ namespace Northstar
 
         m_backend      = backend;
         m_renderTarget = renderTarget;
+        m_ownerThreadId = std::this_thread::get_id();
         m_backend->SetVSync(m_vsyncEnabled);
         if (m_prePresentCallback)
         {
@@ -303,6 +313,7 @@ namespace Northstar
         // Release NVG, Materializer, NVS Feedback & Page Managers, internal samplers, ComputeKernels and Shaders first while backend & CoreComputeManager are active
         m_geometryManager.SetNVGManager(nullptr);
         m_renderPipeline.SetResourceMaterializer(nullptr);
+        m_renderPipeline.ResetCameraHistory();
         m_nvgManager.SetResourceMaterializer(nullptr);
         m_nvgManager.Shutdown();
         m_resourceMaterializer.Shutdown();
@@ -342,6 +353,7 @@ namespace Northstar
 
     void NorthstarCore::BeginFrame()
     {
+        AssertOwnerThread();
         if (!m_initialized) return;
 
         if (!m_executedPerFrameKernels.empty())
@@ -381,6 +393,7 @@ namespace Northstar
 
     void NorthstarCore::RenderFrame()
     {
+        AssertOwnerThread();
         if (!m_initialized) return;
 
         Scene* activeScene = m_sceneManager.GetActiveScene();
@@ -474,15 +487,22 @@ namespace Northstar
             return;
         }
 
-        for (SIZE_T camIdx = 0; camIdx < cameras.size(); ++camIdx)
+        std::vector<Camera*> renderableCameras;
+        renderableCameras.reserve(cameras.size());
+        for (Camera* cam : cameras)
         {
-            Camera* cam = cameras[camIdx];
             if (!cam) continue;
             if (cam->GetRenderType() == CameraRenderType::TO_TEXTURE && cam->GetRenderTarget() == nullptr)
             {
                 // Never silently hijack the window SwapChain when a TO_TEXTURE camera lacks a bound RenderTarget.
                 continue;
             }
+            renderableCameras.push_back(cam);
+        }
+
+        for (SIZE_T camIdx = 0; camIdx < renderableCameras.size(); ++camIdx)
+        {
+            Camera* cam = renderableCameras[camIdx];
             if (camIdx > 0 && activeScene && m_gpuSceneUpdateEnabled)
             {
                 // Enforce single per-frame GPU Scene snapshot consistency across multi-camera views:
@@ -524,7 +544,9 @@ namespace Northstar
                     sceneObjBuf,
                     sceneSlots,
                     &m_renderPipeline,
-                    m_stats);
+                    m_stats,
+                    (camIdx == 0u),
+                    (camIdx + 1u == renderableCameras.size()));
             }
 
             if (camIdx == 0 && !m_pendingLayeredDepthPasses.empty())
@@ -698,9 +720,40 @@ namespace Northstar
         return m_nvgManager.SerializeVirtualMesh(mesh->GetGPUSceneMeshId(), outBlob);
     }
 
-    void NorthstarCore::SetNVGConfig(const NVGConfig& config)
+    BOOL NorthstarCore::SerializeVirtualMeshToBuffer(const Mesh* mesh, BYTE** outBuffer, SIZE_T* outByteSize) const
     {
-        m_nvgManager.SetConfig(config);
+        if (outBuffer)   *outBuffer   = nullptr;
+        if (outByteSize) *outByteSize = 0u;
+        if (!outBuffer || !outByteSize)
+            return false;
+
+        std::vector<BYTE> blob;
+        if (!SerializeVirtualMesh(mesh, blob) || blob.empty())
+            return false;
+
+        BYTE* rawBuf = new (std::nothrow) BYTE[blob.size()];
+        if (!rawBuf)
+            return false;
+
+        std::memcpy(rawBuf, blob.data(), blob.size());
+        *outBuffer   = rawBuf;
+        *outByteSize = blob.size();
+        return true;
+    }
+
+    void NorthstarCore::FreeSerializedBuffer(BYTE* buffer) const
+    {
+        delete[] buffer;
+    }
+
+    BOOL NorthstarCore::SetNVGConfig(const NVGConfig& config)
+    {
+        if (!m_nvgManager.SetConfig(config))
+        {
+            m_lastError = "SetNVGConfig failed: invalid NVGConfig parameters or physical page pool allocation failure.";
+            return false;
+        }
+        return true;
     }
 
     const NVGConfig& NorthstarCore::GetNVGConfig() const
@@ -1358,34 +1411,38 @@ namespace Northstar
             {
                 continue;
             }
-            const Material* mat = obj->GetMaterial();
-            if (!mat)
+            const UINT32 matSlotCnt = (std::max)(1u, obj->GetMaterialSlotCount());
+            for (UINT32 ms = 0u; ms < matSlotCnt; ++ms)
             {
-                continue;
-            }
+                const Material* mat = obj->GetMaterial(ms);
+                if (!mat)
+                {
+                    continue;
+                }
 
-            MaterialShadowStateSnapshot currentSnap{};
-            currentSnap.stateRevision           = mat->GetStateRevision();
-            currentSnap.shadowShaderSet         = mat->HasPass(PassType::SHADOW) ? mat->GetShaderSet(PassType::SHADOW) : nullptr;
-            currentSnap.shadowShaderSetRevision = currentSnap.shadowShaderSet ? currentSnap.shadowShaderSet->GetStateRevision() : 0u;
-            currentSnap.cullMode                = mat->GetCullMode();
-            currentSnap.alphaTested             = mat->IsAlphaTested();
-            currentSnap.twoSided                = mat->IsTwoSided();
+                MaterialShadowStateSnapshot currentSnap{};
+                currentSnap.stateRevision           = mat->GetStateRevision();
+                currentSnap.shadowShaderSet         = mat->HasPass(PassType::SHADOW) ? mat->GetShaderSet(PassType::SHADOW) : nullptr;
+                currentSnap.shadowShaderSetRevision = currentSnap.shadowShaderSet ? currentSnap.shadowShaderSet->GetStateRevision() : 0u;
+                currentSnap.cullMode                = mat->GetCullMode();
+                currentSnap.alphaTested             = mat->IsAlphaTested();
+                currentSnap.twoSided                = mat->IsTwoSided();
 
-            auto it = matSnapshots.find(mat);
-            if (it == matSnapshots.end())
-            {
-                matSnapshots.emplace(mat, currentSnap);
-            }
-            else if (it->second.stateRevision != currentSnap.stateRevision ||
-                     it->second.shadowShaderSet != currentSnap.shadowShaderSet ||
-                     it->second.shadowShaderSetRevision != currentSnap.shadowShaderSetRevision ||
-                     it->second.cullMode != currentSnap.cullMode ||
-                     it->second.alphaTested != currentSnap.alphaTested ||
-                     it->second.twoSided != currentSnap.twoSided)
-            {
-                it->second = currentSnap;
-                mutatedMaterials.insert(mat);
+                auto it = matSnapshots.find(mat);
+                if (it == matSnapshots.end())
+                {
+                    matSnapshots.emplace(mat, currentSnap);
+                }
+                else if (it->second.stateRevision != currentSnap.stateRevision ||
+                         it->second.shadowShaderSet != currentSnap.shadowShaderSet ||
+                         it->second.shadowShaderSetRevision != currentSnap.shadowShaderSetRevision ||
+                         it->second.cullMode != currentSnap.cullMode ||
+                         it->second.alphaTested != currentSnap.alphaTested ||
+                         it->second.twoSided != currentSnap.twoSided)
+                {
+                    it->second = currentSnap;
+                    mutatedMaterials.insert(mat);
+                }
             }
         }
 
@@ -1739,28 +1796,38 @@ namespace Northstar
             for (RenderObject* obj : scene->GetRenderObjects())
             {
                 if (!obj) continue;
-                const Material* mat = obj->GetMaterial();
-                if (obj->GetCastShadows() && mat && mat->HasPass(PassType::SHADOW) && mat->GetShadowShaderSet() != nullptr)
+                const BOOL   isSkinned  = obj->HasFlag(RenderObjectFlags::SKINNED) || obj->HasSkinningMatrices();
+                const UINT32 matSlotCnt = (std::max)(1u, obj->GetMaterialSlotCount());
+                BOOL countedObjAsCaster = false;
+                for (UINT32 ms = 0u; ms < matSlotCnt; ++ms)
                 {
-                    shadowCasterCount++;
-                    const BOOL isSkinned = obj->HasFlag(RenderObjectFlags::SKINNED) || obj->HasSkinningMatrices();
-                    casterGroupCounts[CasterGroupKey{ obj->GetMesh(), mat, isSkinned }]++;
-                }
-                if (mat && checkedMaterials.insert(mat).second)
-                {
-                    if (ShaderSetReferencesNVS(mat->GetGeometryShaderSet()))
+                    const Material* mat = obj->GetMaterial(ms);
+                    if (!mat) continue;
+                    if (obj->GetCastShadows() && mat->HasPass(PassType::SHADOW) && mat->GetShadowShaderSet() != nullptr)
                     {
-                        sceneHasNVSReceiver = true;
-                    }
-                    if (!sceneHasNVSReceiver && mat->HasComputeKernels())
-                    {
-                        for (const ComputeKernel* k : mat->GetComputeKernels())
+                        if (!countedObjAsCaster)
                         {
-                            if (k && k->IsValid() && k->GetComputeShader() &&
-                                ShaderReflectionReferencesNVS(k->GetComputeShader()->GetReflection()))
+                            shadowCasterCount++;
+                            countedObjAsCaster = true;
+                        }
+                        casterGroupCounts[CasterGroupKey{ obj->GetMesh(), mat, isSkinned }]++;
+                    }
+                    if (checkedMaterials.insert(mat).second)
+                    {
+                        if (ShaderSetReferencesNVS(mat->GetGeometryShaderSet()))
+                        {
+                            sceneHasNVSReceiver = true;
+                        }
+                        if (!sceneHasNVSReceiver && mat->HasComputeKernels())
+                        {
+                            for (const ComputeKernel* k : mat->GetComputeKernels())
                             {
-                                sceneHasNVSReceiver = true;
-                                break;
+                                if (k && k->IsValid() && k->GetComputeShader() &&
+                                    ShaderReflectionReferencesNVS(k->GetComputeShader()->GetReflection()))
+                                {
+                                    sceneHasNVSReceiver = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1775,13 +1842,28 @@ namespace Northstar
         }
         else
         {
+            auto variantReadsShadowDepthBias = [](const ShaderSet* set, ShaderVariant v) noexcept -> BOOL {
+                return ShaderSetVariantReferencesProperty(set, v, "NVS_DEPTH_BIAS_NDC") ||
+                       ShaderSetVariantReferencesProperty(set, v, "NVG_SHADOW_PAGE_DEPTH_BIAS");
+            };
+            auto variantReadsShadowNormalBias = [](const ShaderSet* set, ShaderVariant v) noexcept -> BOOL {
+                return ShaderSetVariantReferencesProperty(set, v, "NVS_NORMAL_BIAS_WORLD") ||
+                       ShaderSetVariantReferencesProperty(set, v, "NVG_SHADOW_PAGE_NORMAL_BIAS");
+            };
+
             for (const auto& kv : casterGroupCounts)
             {
                 const ShaderSet* shadowSet = kv.first.mat->GetShadowShaderSet();
-                const ShaderVariant singleVar = kv.first.skinned ? ShaderVariant::SKINNED : ShaderVariant::STANDARD;
-                const ShaderVariant instVar   = kv.first.skinned ? ShaderVariant::INSTANCED_SKINNED : ShaderVariant::INSTANCED;
-                const BOOL hasSingle = (shadowSet->GetVertexShader(singleVar) != nullptr);
-                const BOOL hasInst   = (shadowSet->GetVertexShader(instVar) != nullptr);
+                ShaderVariant singleVar = kv.first.skinned ? ShaderVariant::SKINNED : ShaderVariant::STANDARD;
+                const ShaderVariant instVar = kv.first.skinned ? ShaderVariant::INSTANCED_SKINNED : ShaderVariant::INSTANCED;
+                BOOL hasSingle = (shadowSet->GetVertexShader(singleVar) != nullptr);
+                const BOOL hasInst = (shadowSet->GetVertexShader(instVar) != nullptr);
+                if (!hasSingle && !hasInst && kv.first.mesh && kv.first.mesh->IsVirtualized() &&
+                    shadowSet->GetVertexShader(ShaderVariant::STANDARD) != nullptr)
+                {
+                    singleVar = ShaderVariant::STANDARD;
+                    hasSingle = true;
+                }
                 if (!hasSingle && !hasInst)
                 {
                     allCastersReadDepthBias  = false;
@@ -1789,16 +1871,16 @@ namespace Northstar
                 }
                 if (hasSingle)
                 {
-                    if (!ShaderSetVariantReferencesProperty(shadowSet, singleVar, "NVS_DEPTH_BIAS_NDC"))
+                    if (!variantReadsShadowDepthBias(shadowSet, singleVar))
                         allCastersReadDepthBias = false;
-                    if (!ShaderSetVariantReferencesProperty(shadowSet, singleVar, "NVS_NORMAL_BIAS_WORLD"))
+                    if (!variantReadsShadowNormalBias(shadowSet, singleVar))
                         allCastersReadNormalBias = false;
                 }
                 if (hasInst && (kv.second > 1u || !hasSingle))
                 {
-                    if (!ShaderSetVariantReferencesProperty(shadowSet, instVar, "NVS_DEPTH_BIAS_NDC"))
+                    if (!variantReadsShadowDepthBias(shadowSet, instVar))
                         allCastersReadDepthBias = false;
-                    if (!ShaderSetVariantReferencesProperty(shadowSet, instVar, "NVS_NORMAL_BIAS_WORLD"))
+                    if (!variantReadsShadowNormalBias(shadowSet, instVar))
                         allCastersReadNormalBias = false;
                 }
             }
@@ -1980,7 +2062,8 @@ namespace Northstar
                     st.hierarchy.pagesPerAxis != dirPagesAxis;
                 const BOOL rasterBiasInvalidated =
                     st.initialized &&
-                    ((!NearlyEqualFloat(st.shadowBias, sBias, 1e-6f) && (st.rasterAppliedDepthBias || sceneRasterReadsDepthBias)) ||
+                    ((st.cullingMask != l->GetCullingMask()) ||
+                     (!NearlyEqualFloat(st.shadowBias, sBias, 1e-6f) && (st.rasterAppliedDepthBias || sceneRasterReadsDepthBias)) ||
                      (st.rasterAppliedDepthBias != sceneRasterReadsDepthBias) ||
                      (!NearlyEqualFloat(st.shadowNormalBias, nBias, 1e-6f) && (st.rasterAppliedNormalBias || sceneRasterReadsNormalBias)) ||
                      (st.rasterAppliedNormalBias != sceneRasterReadsNormalBias));
@@ -2123,6 +2206,7 @@ namespace Northstar
                     st.shadowMaxDistance       = maxDist;
                     st.shadowBias              = sBias;
                     st.shadowNormalBias        = nBias;
+                    st.cullingMask             = l->GetCullingMask();
                     st.depthMode               = static_cast<UINT32>(depthMode);
                     st.isPerspectiveCam        = isPerspectiveCam;
                     st.rasterAppliedDepthBias  = sceneRasterReadsDepthBias;
@@ -2227,7 +2311,8 @@ namespace Northstar
                         !st.enableVirtualMipChain;
                     const BOOL rasterBiasInvalidated =
                         st.initialized &&
-                        ((!NearlyEqualFloat(st.shadowBias, sBias, 1e-6f) && (st.rasterAppliedDepthBias || sceneRasterReadsDepthBias)) ||
+                        ((st.cullingMask != l->GetCullingMask()) ||
+                         (!NearlyEqualFloat(st.shadowBias, sBias, 1e-6f) && (st.rasterAppliedDepthBias || sceneRasterReadsDepthBias)) ||
                          (st.rasterAppliedDepthBias != sceneRasterReadsDepthBias) ||
                          (!NearlyEqualFloat(st.shadowNormalBias, nBias, 1e-6f) && (st.rasterAppliedNormalBias || sceneRasterReadsNormalBias)) ||
                          (st.rasterAppliedNormalBias != sceneRasterReadsNormalBias));
@@ -2317,6 +2402,7 @@ namespace Northstar
                         st.shadowMaxDistance       = maxDist;
                         st.shadowBias              = sBias;
                         st.shadowNormalBias        = nBias;
+                        st.cullingMask             = l->GetCullingMask();
                         st.depthMode               = static_cast<UINT32>(depthMode);
                         st.enableVirtualMipChain   = true;
                         st.rasterAppliedDepthBias  = sceneRasterReadsDepthBias;
@@ -2513,6 +2599,7 @@ namespace Northstar
                     sig.shadowMaxDistance     = maxDist;
                     sig.shadowBias            = l->GetShadowBias();
                     sig.shadowNormalBias      = l->GetShadowNormalBias();
+                    sig.cullingMask           = l->GetCullingMask();
                     sig.depthMode             = static_cast<UINT32>(depthMode);
                     sig.rasterReadsDepthBias  = sceneRasterReadsDepthBias;
                     sig.rasterReadsNormalBias = sceneRasterReadsNormalBias;
@@ -2573,6 +2660,7 @@ namespace Northstar
                     sig.shadowMaxDistance     = l->GetShadowMaxDistance();
                     sig.shadowBias            = l->GetShadowBias();
                     sig.shadowNormalBias      = l->GetShadowNormalBias();
+                    sig.cullingMask           = l->GetCullingMask();
                     sig.depthMode             = static_cast<UINT32>(depthMode);
                     sig.rasterReadsDepthBias  = sceneRasterReadsDepthBias;
                     sig.rasterReadsNormalBias = sceneRasterReadsNormalBias;
@@ -2637,6 +2725,7 @@ namespace Northstar
                         sig.shadowMaxDistance     = l->GetShadowMaxDistance();
                         sig.shadowBias            = l->GetShadowBias();
                         sig.shadowNormalBias      = l->GetShadowNormalBias();
+                        sig.cullingMask           = l->GetCullingMask();
                         sig.depthMode             = static_cast<UINT32>(depthMode);
                         sig.rasterReadsDepthBias  = sceneRasterReadsDepthBias;
                         sig.rasterReadsNormalBias = sceneRasterReadsNormalBias;
@@ -2676,6 +2765,7 @@ namespace Northstar
                         prev.lightRuntimeUid != curr.lightRuntimeUid ||
                         prev.lightType != curr.lightType ||
                         prev.shadowResolution != curr.shadowResolution ||
+                        prev.cullingMask != curr.cullingMask ||
                         !NearlyEqualVec3(prev.direction, curr.direction) ||
                         !NearlyEqualVec3(prev.position, curr.position) ||
                         !NearlyEqualFloat(prev.range, curr.range, 1e-4f) ||
@@ -4112,7 +4202,11 @@ namespace Northstar
             if (obj->HasFlag(RenderObjectFlags::SKINNED) || obj->HasSkinningMatrices())
                 extraMeshFlags |= GPU_MESH_DRAW_DESC_FLAG_SKINNED_VERT;
             syncMesh(obj->GetMesh(), extraMeshFlags, obj->GetLODGroup());
-            syncMaterial(obj->GetMaterial());
+            const UINT32 matSlotCnt = (std::max)(1u, obj->GetMaterialSlotCount());
+            for (UINT32 ms = 0u; ms < matSlotCnt; ++ms)
+            {
+                syncMaterial(obj->GetMaterial(ms));
+            }
         }
 
         if (scene->IsStaticBatched())
@@ -4566,6 +4660,7 @@ namespace Northstar
         m_nvsFeedbackManager.OnCameraDestroyed(camera);
         m_nvsPageManager.OnCameraDestroyed(camera);
         m_nvgManager.OnCameraDestroyed(camera);
+        m_renderPipeline.OnCameraDestroyed(camera);
         m_cameraNVSClipmapStates.erase(camera);
         m_cameraNVSProductionStates.erase(camera);
         if (camera->m_sceneDepthTexture != nullptr)

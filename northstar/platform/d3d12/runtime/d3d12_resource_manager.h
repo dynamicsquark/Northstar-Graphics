@@ -61,7 +61,6 @@ namespace Northstar
         UINT32                 readOnlyDsvDescriptorIndex  = UINT32_MAX;
         UINT32                 fullArrayDsvDescriptorIndex = UINT32_MAX;
         std::vector<UINT32>    dsvLayerDescriptors;
-        std::vector<bool>      dsvLayerNeedsClear;
         HANDLE                 sharedHandle                = nullptr;
     };
 
@@ -73,11 +72,15 @@ namespace Northstar
 
     struct D3D12ShaderResource
     {
-        ShaderStage                   stage      = ShaderStage::NONE;
+        ShaderStage                   stage                              = ShaderStage::NONE;
         ComPtr<ID3DBlob>              blob;
         std::vector<BYTE>             bytecode;
         std::vector<NSCStageIOEntry>  inputLayout;
-        UINT64                        generation = 0;
+        ShaderSpaceMask               spaceMask{};
+        UINT64                        generation                         = 0;
+        UINT32                        requiredShaderModel                = 0x51u;
+        BOOL                          requiresInt64Ops                   = false;
+        BOOL                          requiresInt64DescriptorHeapAtomics = false;
     };
 
     struct D3D12GPUBufferResource
@@ -130,6 +133,8 @@ namespace Northstar
     struct D3D12PendingBufferUpload
     {
         NativeHandle           targetHandle       = 0;
+        NativeHandle           srcGPUHandle       = 0; // Non-zero = GPU-to-GPU CopyBufferRegion from default-heap uploadResource
+        D3D12_RESOURCE_STATES  srcFallbackState   = D3D12_RESOURCE_STATE_COMMON;
         ComPtr<ID3D12Resource> uploadResource;
         BOOL                   isStandaloneUpload = false;
         UINT64                 srcOffset          = 0;
@@ -209,6 +214,15 @@ namespace Northstar
             const void* data,
             UINT32 byteSize,
             UINT32 dstOffset = 0);
+        BOOL CopyGPUBufferRegion(
+            D3D12DeviceContext& ctx,
+            ID3D12GraphicsCommandList* activeFrameCmdList,
+            D3D12ResourceStateTracker& stateTracker,
+            NativeHandle dstHandle,
+            UINT64 dstOffset,
+            NativeHandle srcHandle,
+            UINT64 srcOffset,
+            UINT64 byteSize);
         void FlushPendingGPUBufferUploads(
             ID3D12GraphicsCommandList* cmdList,
             D3D12ResourceStateTracker& stateTracker,
@@ -266,9 +280,17 @@ namespace Northstar
             D3D12DescriptorPool& samplerPool,
             D3D12ResourceStateTracker* stateTracker = nullptr);
 
-        NativeHandle CreateShader(ShaderStage stage, const void* bytecode, SIZE_T bytecodeSize);
+        static BOOL  IsDXILCompilerAvailable() noexcept;
+        static void  InspectDXBCContainerCapabilities(
+            const void* dxbcPtr,
+            SIZE_T      dxbcSize,
+            UINT32&     outRequiredSM,
+            BOOL&       outRequiresInt64Ops,
+            BOOL&       outRequiresInt64DescHeapAtomics) noexcept;
+        NativeHandle CreateShader(ShaderStage stage, const void* bytecode, SIZE_T bytecodeSize, BOOL allowDXILSM66 = true);
         BOOL         GetShaderCompiledBytecode(NativeHandle handle, std::vector<BYTE>& outBytecode) const;
         void         SetShaderInputLayout(NativeHandle handle, const std::vector<NSCStageIOEntry>& inputLayout);
+        void         SetShaderReflectionSpaces(NativeHandle handle, const ShaderSpaceMask& spaceMask);
         void         DestroyShader(NativeHandle handle);
 
         BOOL HasVertexBuffer(NativeHandle handle)   const;
@@ -304,6 +326,7 @@ namespace Northstar
         const D3D12ConstantBufferResource* GetConstantBuffer(NativeHandle handle) const;
         const D3D12TextureResource*        GetTexture(NativeHandle handle)        const;
         D3D12TextureResource*              GetTexture(NativeHandle handle);
+        BOOL                               HasTextureSharedHandle(NativeHandle handle) const;
         HANDLE                             GetTextureSharedHandle(NativeHandle handle) const;
         D3D12_GPU_DESCRIPTOR_HANDLE        GetTextureGPUDescriptorHandle(NativeHandle handle, const D3D12DescriptorPool& srvPool) const;
         const D3D12SamplerResource*        GetSampler(NativeHandle handle)        const;

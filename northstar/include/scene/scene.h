@@ -152,6 +152,26 @@ namespace Northstar
             return m_gpuSkinningPaletteCount;
         }
 
+        GPUBuffer* GetGPUSkinningBoundsBuffer() const
+        {
+            return m_gpuSkinningBoundsBuffer;
+        }
+
+        UINT32 GetGPUSkinningBoundsCount() const
+        {
+            return m_gpuSkinningBoundsCount;
+        }
+
+        GPUBuffer* GetGPUMaterialSlotTableBuffer() const
+        {
+            return m_gpuMaterialSlotTableBuffer;
+        }
+
+        UINT32 GetGPUMaterialSlotTableCount() const
+        {
+            return m_gpuMaterialSlotTableCount;
+        }
+
         const GPUSceneUpdateStats& GetGPUSceneStats() const
         {
             return m_gpuSceneStats;
@@ -310,27 +330,6 @@ namespace Northstar
                 }
                 srcObj->MarkGPUSceneDirty(GPU_SCENE_DIRTY_BATCHING | GPU_SCENE_DIRTY_FLAGS);
             }
-        }
-
-        void ClearBakedStaticBatches()
-        {
-            for (const auto& batch : m_bakedStaticBatches)
-            {
-                for (RenderObject* srcObj : batch.sourceObjects)
-                {
-                    if (!srcObj) continue;
-                    if (SceneObjectLink* link = srcObj->FindSceneLink(this))
-                    {
-                        link->batchGroupId      = 0u;
-                        link->batchSubmeshIndex = 0u;
-                        link->batchStartIndex   = 0u;
-                        link->batchIndexCount   = 0u;
-                    }
-                    srcObj->MarkGPUSceneDirty(GPU_SCENE_DIRTY_BATCHING | GPU_SCENE_DIRTY_FLAGS);
-                }
-            }
-            m_bakedStaticBatches.clear();
-            m_isStaticBatched = false;
         }
 
         // ==================== OBJECT QUERIES & CLEAR ====================
@@ -506,6 +505,15 @@ namespace Northstar
             }
         }
 
+        void ClearBakedStaticBatches()
+        {
+            while (!m_bakedStaticBatches.empty())
+            {
+                RetireBakedStaticBatchAt(m_bakedStaticBatches.size() - 1u);
+            }
+            m_isStaticBatched = false;
+        }
+
         void RetireBakedStaticBatchAt(SIZE_T batchIdx)
         {
             if (batchIdx >= m_bakedStaticBatches.size())
@@ -555,7 +563,11 @@ namespace Northstar
         GPUBuffer*                    m_gpuSceneBuffer           = nullptr;
         GPUBuffer*                    m_gpuSkinningPaletteBuffer = nullptr;
         UINT32                        m_gpuSkinningPaletteCount  = 0u;
-        GPUSceneUpdateStats           m_gpuSceneStats            = {};
+        GPUBuffer*                    m_gpuSkinningBoundsBuffer     = nullptr;
+        UINT32                        m_gpuSkinningBoundsCount      = 0u;
+        GPUBuffer*                    m_gpuMaterialSlotTableBuffer  = nullptr;
+        UINT32                        m_gpuMaterialSlotTableCount   = 0u;
+        GPUSceneUpdateStats           m_gpuSceneStats               = {};
 
         // Main Camera & Directional Light
         Camera*                       m_mainCamera       = nullptr;

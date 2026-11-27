@@ -25,6 +25,9 @@ namespace Northstar
         FLOAT32 gpuNVGHZBMs                        = 0.0f;
         FLOAT32 gpuNVGCullLodMs                    = 0.0f;
         FLOAT32 gpuNVGDrawGenMs                    = 0.0f;
+        FLOAT32 gpuNVGSWRasterMs                   = 0.0f;
+        FLOAT32 gpuNVGSWRasterPass1Ms              = 0.0f;
+        FLOAT32 gpuNVGSWRasterPass2Ms              = 0.0f;
         FLOAT32 gpuLayeredDepthPassMs              = 0.0f;
         FLOAT32 gpuShadowPassMs                    = 0.0f;
         FLOAT32 gpuDepthPrepassMs                  = 0.0f;
@@ -56,6 +59,49 @@ namespace Northstar
         UINT32 ibSizeInBytes       = 0;
         UINT32 ibFormat            = 42u; // DXGI_FORMAT_R32_UINT = 42u, DXGI_FORMAT_R16_UINT = 57u
         BOOL   valid               = false;
+    };
+
+    struct BackendCapabilities
+    {
+        UINT32 maxFeatureLevel                     = 0xB000u; // D3D_FEATURE_LEVEL_11_0
+        UINT32 maxShaderModel                      = 0x51u;   // 0x51 = SM 5.1, 0x66 = SM 6.6
+        UINT32 minWaveLaneCount                    = 0u;
+        UINT32 maxWaveLaneCount                    = 0u;
+        BOOL   supportsWaveOps                     = false;
+        BOOL   supportsInt64ShaderOps              = false;
+        BOOL   supportsAtomicInt64OnTypedResource  = false;
+        BOOL   supportsAtomicInt64OnGroupShared    = false;
+        BOOL   supportsAtomicInt64OnDescriptorHeap = false;
+        BOOL   supportsTypedUAVLoadR32Uint         = false;
+        BOOL   supportsTypedUAVLoadRG32Uint        = false;
+        BOOL   supportsVPAndRTArrayIndexWithoutGS  = false;
+        BOOL   supportsDXILRuntime                 = false;
+
+        BOOL SupportsNVGRasterAtomic64() const noexcept
+        {
+            return (maxShaderModel >= 0x66u) &&
+                   supportsDXILRuntime &&
+                   supportsInt64ShaderOps &&
+                   supportsAtomicInt64OnDescriptorHeap;
+        }
+
+        BOOL SupportsNVGRasterAtomic32() const noexcept
+        {
+            return maxShaderModel >= 0x51u;
+        }
+
+        BOOL SupportsNVGSoftwareRasterizer() const noexcept
+        {
+            return SupportsNVGRasterAtomic64() || SupportsNVGRasterAtomic32();
+        }
+    };
+
+    struct ShaderSpaceMask
+    {
+        UINT16 cbvSrvMask  = 0x000Fu;
+        UINT16 samplerMask = 0x000Fu;
+        UINT16 uavMask     = 0x000Fu;
+        BOOL   isExplicit  = false;
     };
 
     // Low-level GPU plugin.
@@ -150,6 +196,8 @@ namespace Northstar
         { (void)handle; (void)outBytecode; return false; }
         virtual void         SetShaderInputLayout(NativeHandle handle, const std::vector<NSCStageIOEntry>& inputLayout)
         { (void)handle; (void)inputLayout; }
+        virtual void         SetShaderReflectionSpaces(NativeHandle handle, const ShaderSpaceMask& spaceMask)
+        { (void)handle; (void)spaceMask; }
         virtual void         DestroyShader(NativeHandle handle)
         { (void)handle; }
 
@@ -158,6 +206,13 @@ namespace Northstar
         { (void)desc; return 0; }
         virtual BOOL         UpdateGPUBuffer(NativeHandle handle, const void* data, UINT32 byteSize, UINT32 dstOffset = 0)
         { (void)handle; (void)data; (void)byteSize; (void)dstOffset; return false; }
+        virtual BOOL         CopyGPUBufferRegion(
+            NativeHandle dstBuffer,
+            UINT64       dstOffset,
+            NativeHandle srcBuffer,
+            UINT64       srcOffset,
+            UINT64       byteSize)
+        { (void)dstBuffer; (void)dstOffset; (void)srcBuffer; (void)srcOffset; (void)byteSize; return false; }
         virtual BOOL         RequestGPUBufferReadback(NativeHandle handle, UINT32 srcOffset = 0, UINT32 byteSize = 0)
         { (void)handle; (void)srcOffset; (void)byteSize; return false; }
         virtual BOOL         TryGetGPUBufferReadbackData(NativeHandle handle, void* outData, UINT32 byteSize)
@@ -192,6 +247,9 @@ namespace Northstar
         }
 
         // ==================== HARDWARE CAPABILITIES & FALLBACK DIAGNOSTICS ====================
+        virtual BackendCapabilities GetCapabilities() const { return {}; }
+        virtual void SetRestrictedCapabilitiesOverride(BOOL enableOverride, const BackendCapabilities& restrictedCaps)
+        { (void)enableOverride; (void)restrictedCaps; }
         virtual BOOL SupportsVPAndRTArrayIndexWithoutGS() const { return false; }
         virtual void SetForceLayeredDepthFallback(BOOL forceFallback) { (void)forceFallback; }
         virtual BOOL IsForceLayeredDepthFallback() const { return false; }

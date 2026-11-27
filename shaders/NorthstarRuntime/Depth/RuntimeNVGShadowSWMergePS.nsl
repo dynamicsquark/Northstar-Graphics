@@ -1,0 +1,56 @@
+// =====================================================================
+//  RuntimeNVGShadowSWMergePS.nsl — NorthstarRuntime Internal Depth PS
+//  Exports touched 128x128 atomic SW shadow tile texels into NVS
+//  D32_FLOAT physical slices via SV_Depth + hardware depth test so SW
+//  micro-clusters and HW shadow casters compose seamlessly per texel.
+// =====================================================================
+
+STAGE PIXEL
+
+PROPERTY ShadowSWMergePSParams {
+    Buffer Config {
+        Add(isReversedZ) : UInt = 1
+        Add(maxSWTiles)  : UInt = 512
+    }
+    StructuredBuffer InShadowSWDepthKey {
+        Add(key) : UInt
+    }
+}
+
+INPUT_LAYOUT {
+    Get(CLIP_POSITION)
+    Get(UV0)
+}
+
+OUTPUT_LAYOUT {
+    Add(FRAG_DEPTH)
+}
+
+SHADER {
+    STAGE_OUTPUT Main(STAGE_INPUT input) {
+        STAGE_OUTPUT o;
+        UInt tileSlot = UInt(input.UV0.x);
+        UInt px       = Min(UInt(input.CLIP_POSITION.x), 127u);
+        UInt py       = Min(UInt(input.CLIP_POSITION.y), 127u);
+
+        if (tileSlot >= ShadowSWMergePSParams.Config.maxSWTiles) {
+            Clip(-1.0);
+            o.FRAG_DEPTH = 0.0;
+            return o;
+        }
+
+        UInt dKey = ShadowSWMergePSParams.InShadowSWDepthKey[tileSlot * 16384u + py * 128u + px].key;
+        if (dKey == 0u) {
+            Clip(-1.0);
+            o.FRAG_DEPTH = 0.0;
+            return o;
+        }
+
+        if (ShadowSWMergePSParams.Config.isReversedZ != 0u) {
+            o.FRAG_DEPTH = (dKey == 1u) ? 0.0 : AsFloat(dKey);
+        } else {
+            o.FRAG_DEPTH = AsFloat(~dKey);
+        }
+        return o;
+    }
+}

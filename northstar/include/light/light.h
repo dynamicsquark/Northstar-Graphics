@@ -110,7 +110,7 @@ namespace Northstar
         {
             if (std::isfinite(degrees))
             {
-                m_innerConeAngle = std::clamp(degrees, 0.0f, 179.0f);
+                m_innerConeAngle = std::clamp(degrees, 0.0f, m_outerConeAngle);
             }
         }
         void SetOuterConeAngle(FLOAT32 degrees)
@@ -118,6 +118,10 @@ namespace Northstar
             if (std::isfinite(degrees))
             {
                 m_outerConeAngle = std::clamp(degrees, 0.5f, 179.5f);
+                if (m_innerConeAngle > m_outerConeAngle)
+                {
+                    m_innerConeAngle = m_outerConeAngle;
+                }
             }
         }
 

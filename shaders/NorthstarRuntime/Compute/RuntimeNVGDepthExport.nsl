@@ -1,0 +1,115 @@
+// =====================================================================
+//  RuntimeNVGDepthExport.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — Visibility Buffer -> Visibility Texture,
+//  Separate Conservative SWDepthTexture & Winning-Cluster Bitmask Exporter
+//
+//  Decision 4C Isolation Contract:
+//    - Reads either packed 64-bit InVisBuffer64 (useSplitAtomic32 == 0) or
+//      split 2x32-bit InAtomicDepthKey32 + InAtomicPayload32 (useSplitAtomic32 != 0).
+//    - Writes exact per-pixel OutVisTexture (RG32_UINT) for Get(NVG_VISIBILITY_BUFFER).
+//    - Writes 3x3 conservative farthest OutSWDepth (R32_FLOAT) into a dedicated
+//      SWDepthTexture consumed ONLY by HZB construction — NEVER mutating hardware
+//      SceneDepth DSV or user DepthCompare state, and 100% 1-ULP silhouette-safe!
+//    - Marks OutWinningClusterMask[visIdx >> 5] for every cluster that
+//      won >= 1 pixel in the software visibility buffer.
+// =====================================================================
+
+STAGE COMPUTE
+
+PROPERTY NVGDepthExportParams {
+    Buffer Config {
+        Add(viewportWidth)    : UInt = 1
+        Add(viewportHeight)   : UInt = 1
+        Add(isReversedZ)      : UInt = 0
+        Add(useSplitAtomic32) : UInt = 0
+        Add(maskWordCount)    : UInt = 0
+    }
+
+    StructuredBuffer InVisBuffer64 {
+        Add(lo) : UInt
+        Add(hi) : UInt
+    }
+
+    StructuredBuffer InAtomicDepthKey32 {
+        Add(depthKey) : UInt
+    }
+
+    StructuredBuffer InAtomicPayload32 {
+        Add(payload) : UInt
+    }
+
+    RWTexture2D OutTextures {
+        Add(OutVisTexture) : UInt2
+        Add(OutSWDepth)    : Float
+    }
+
+    RWStructuredBuffer OutWinningClusterMask {
+        Add(mask) : UInt
+    }
+}
+
+SHADER {
+    Float ReadSampleSWDepth(Int px, Int py, UInt vpW, Bool isRevZ, Bool useSplit32) {
+        UInt idx = UInt(py) * vpW + UInt(px);
+        UInt lo  = useSplit32
+            ? NVGDepthExportParams.InAtomicPayload32[idx].payload
+            : NVGDepthExportParams.InVisBuffer64[idx].lo;
+        if (lo == 0u) {
+            return isRevZ ? 0.0 : 1.0;
+        }
+        UInt hi = useSplit32
+            ? NVGDepthExportParams.InAtomicDepthKey32[idx].depthKey
+            : NVGDepthExportParams.InVisBuffer64[idx].hi;
+        return isRevZ ? AsFloat(hi) : AsFloat(~hi);
+    }
+
+    [numthreads(8, 8, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
+        UInt vpW = NVGDepthExportParams.Config.viewportWidth;
+        UInt vpH = NVGDepthExportParams.Config.viewportHeight;
+        if (dtid.x >= vpW || dtid.y >= vpH) {
+            return;
+        }
+
+        UInt pxIdx      = dtid.y * vpW + dtid.x;
+        Bool useSplit32 = (NVGDepthExportParams.Config.useSplitAtomic32 != 0u);
+        Bool isRevZ     = (NVGDepthExportParams.Config.isReversedZ != 0u);
+
+        UInt lo32 = useSplit32
+            ? NVGDepthExportParams.InAtomicPayload32[pxIdx].payload
+            : NVGDepthExportParams.InVisBuffer64[pxIdx].lo;
+        UInt hi32 = useSplit32
+            ? NVGDepthExportParams.InAtomicDepthKey32[pxIdx].depthKey
+            : NVGDepthExportParams.InVisBuffer64[pxIdx].hi;
+
+        if (lo32 != 0u) {
+            UInt winVisIdx = (lo32 >> 8u) - 1u;
+            UInt maskIdx   = winVisIdx >> 5u;
+            if (maskIdx < NVGDepthExportParams.Config.maskWordCount) {
+                UInt prev = 0u;
+                InterlockedOr(NVGDepthExportParams.OutWinningClusterMask[maskIdx].mask, 1u << (winVisIdx & 31u), prev);
+            }
+        }
+
+        // 3x3 conservative farthest-depth neighborhood filter for HZB consumption (100% 1-ULP silhouette-safe)
+        Int maxX = Int(vpW) - 1;
+        Int maxY = Int(vpH) - 1;
+        Int cx   = Int(dtid.x);
+        Int cy   = Int(dtid.y);
+        Float consDepth = ReadSampleSWDepth(cx, cy, vpW, isRevZ, useSplit32);
+        for (Int dy = -1; dy <= 1; dy = dy + 1) {
+            Int ny = Clamp(cy + dy, 0, maxY);
+            for (Int dx = -1; dx <= 1; dx = dx + 1) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                Int nx   = Clamp(cx + dx, 0, maxX);
+                Float nd = ReadSampleSWDepth(nx, ny, vpW, isRevZ, useSplit32);
+                consDepth = isRevZ ? Min(consDepth, nd) : Max(consDepth, nd);
+            }
+        }
+
+        NVGDepthExportParams.OutTextures.OutVisTexture[dtid.xy] = UInt2(lo32, hi32);
+        NVGDepthExportParams.OutTextures.OutSWDepth[dtid.xy]    = consDepth;
+    }
+}

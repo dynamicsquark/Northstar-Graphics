@@ -433,6 +433,7 @@ bool PropertyParser::ParseEntry(
                             case DataTypeID::UINT2:
                             case DataTypeID::UINT3:
                             case DataTypeID::UINT4:
+                            case DataTypeID::UINT64:
                                 entry.defaultValue = "0";
                                 break;
                             case DataTypeID::BOOL:
@@ -466,12 +467,13 @@ bool PropertyParser::ParseEntry(
                     entry.typeID == DataTypeID::UINT  ||
                     entry.typeID == DataTypeID::UINT2 ||
                     entry.typeID == DataTypeID::UINT3 ||
-                    entry.typeID == DataTypeID::UINT4;
+                    entry.typeID == DataTypeID::UINT4 ||
+                    entry.typeID == DataTypeID::UINT64;
                 if (!validRWTexType)
                 {
                     diag.ReportError(entry.location,
                         "Unsupported element type '" + entry.typeName + "' for RWTexture2D entry '" +
-                        entry.name + "'. Expected Float, Vec2..Vec4, Int..Int4, or UInt..UInt4.");
+                        entry.name + "'. Expected Float, Vec2..Vec4, Int..Int4, UInt..UInt4, or UInt64.");
                     return false;
                 }
             }
@@ -590,6 +592,7 @@ bool PropertyParser::ParseEntry(
             case DataTypeID::INT3:                     entry.typeName = "Int3";                   break;
             case DataTypeID::INT4:                     entry.typeName = "Int4";                   break;
             case DataTypeID::UINT:                     entry.typeName = "UInt";                   break;
+            case DataTypeID::UINT64:                   entry.typeName = "UInt64";                 break;
             case DataTypeID::UINT2:                    entry.typeName = "UInt2";                  break;
             case DataTypeID::UINT3:                    entry.typeName = "UInt3";                  break;
             case DataTypeID::UINT4:                    entry.typeName = "UInt4";                  break;

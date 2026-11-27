@@ -128,6 +128,46 @@ namespace Northstar
 
         // Anchor function inside the NorthstarCore shared module whose address is used to resolve the module's own directory.
         void CoreModuleAddressAnchor() {}
+
+        ShaderSpaceMask BuildInternalShaderSpaceMask(const Shader& shader) noexcept
+        {
+            const ShaderReflection& refl = shader.GetReflection();
+            if (refl.nscVersion == 0) return ShaderSpaceMask{};
+
+            ShaderSpaceMask mask{};
+            mask.cbvSrvMask  = (shader.GetStage() == ShaderStage::VERTEX) ? 0x0001u : 0x0000u;
+            mask.samplerMask = 0x0000u;
+            mask.uavMask     = 0x0000u;
+            mask.isExplicit  = true;
+
+            for (const auto& b : refl.buffers)
+                if (b.set < 16u) mask.cbvSrvMask = static_cast<UINT16>(mask.cbvSrvMask | (1u << b.set));
+            for (const auto& sb : refl.structuredBuffers)
+            {
+                if (refl.FindUAV(sb.name) != nullptr) continue;
+                if (sb.set < 16u) mask.cbvSrvMask = static_cast<UINT16>(mask.cbvSrvMask | (1u << sb.set));
+            }
+            for (const auto& t : refl.textures)
+                if (t.set < 16u) mask.cbvSrvMask = static_cast<UINT16>(mask.cbvSrvMask | (1u << t.set));
+            for (const auto& sm : refl.samplers)
+                if (sm.set < 16u) mask.samplerMask = static_cast<UINT16>(mask.samplerMask | (1u << sm.set));
+            for (const auto& uav : refl.uavBuffers)
+            {
+                if (uav.set < 16u) mask.uavMask = static_cast<UINT16>(mask.uavMask | (1u << uav.set));
+                for (const auto& f : uav.fields)
+                    if (f.set < 16u && f.binding != 0xFFFFu)
+                        mask.uavMask = static_cast<UINT16>(mask.uavMask | (1u << f.set));
+            }
+            return mask;
+        }
+
+        UINT32 SelectInternalShaderModel(const NorthstarBackend* backend) noexcept
+        {
+            if (!backend || backend->GetTargetAPI() != TargetAPI::HLSL12)
+                return 0x50u;
+            const BackendCapabilities caps = backend->GetCapabilities();
+            return (caps.maxShaderModel >= 0x66u && caps.supportsDXILRuntime) ? 0x66u : 0x51u;
+        }
     }
 
     InternalResourceManager::InternalResourceManager()
@@ -514,6 +554,101 @@ namespace Northstar
             m_entries.push_back(std::move(entry));
         }
 
+        // Slot 16: InternalComputeKernelId::NVG_MICROPOLY_RASTER_ATOMIC64 (FEATURE_DEPENDENT, Single-Pass 64-bit Atomic)
+        {
+            InternalComputeShaderSpec spec{};
+            spec.idName                    = "Runtime.NVGMicropolyRasterAtomic64";
+            spec.relativeCategory          = "Compute";
+            spec.baseFileName              = "RuntimeNVGMicropolyRasterAtomic64";
+            spec.requirement               = InternalResourceRequirement::FEATURE_DEPENDENT;
+            spec.expectedThreadsX          = 64;
+            spec.expectedThreadsY          = 1;
+            spec.expectedThreadsZ          = 1;
+            spec.requiredConstantBuffers   = { "Config" };
+            spec.requiredSRVStructuredBufs = {
+                "InPagePool", "InCompactedVisibleClusters", "InBucketRanges",
+                "InGPUSceneObjects", "InClusterMeta", "InMaterialTable",
+                "InBonePalette", "InSkinnedBounds"
+            };
+            spec.requiredUAVStructuredBufs = {
+                "OutVisBuffer64", "OutSWClusterList", "OutSWScheduledMask",
+                "OutWinningClusterMask", "OutQueueCounters", "OutTelemetry"
+            };
+            LoadedInternalComputeEntry entry{};
+            entry.spec = std::move(spec);
+            m_entries.push_back(std::move(entry));
+        }
+
+        // Slot 17: InternalComputeKernelId::NVG_MICROPOLY_RASTER_ATOMIC32 (FEATURE_DEPENDENT, Universal Two-Pass 2x32-bit Atomic)
+        {
+            InternalComputeShaderSpec spec{};
+            spec.idName                    = "Runtime.NVGMicropolyRasterAtomic32";
+            spec.relativeCategory          = "Compute";
+            spec.baseFileName              = "RuntimeNVGMicropolyRasterAtomic32";
+            spec.requirement               = InternalResourceRequirement::FEATURE_DEPENDENT;
+            spec.expectedThreadsX          = 64;
+            spec.expectedThreadsY          = 1;
+            spec.expectedThreadsZ          = 1;
+            spec.requiredConstantBuffers   = { "Config" };
+            spec.requiredSRVStructuredBufs = {
+                "InPagePool", "InCompactedVisibleClusters", "InBucketRanges",
+                "InGPUSceneObjects", "InClusterMeta", "InMaterialTable",
+                "InBonePalette", "InSkinnedBounds"
+            };
+            spec.requiredUAVStructuredBufs = {
+                "OutAtomicDepthKey32", "OutAtomicPayload32", "OutSWClusterList",
+                "OutSWScheduledMask", "OutWinningClusterMask", "OutQueueCounters", "OutTelemetry"
+            };
+            LoadedInternalComputeEntry entry{};
+            entry.spec = std::move(spec);
+            m_entries.push_back(std::move(entry));
+        }
+
+        // Slot 18: InternalComputeKernelId::NVG_DEPTH_EXPORT (FEATURE_DEPENDENT)
+        {
+            InternalComputeShaderSpec spec{};
+            spec.idName                    = "Runtime.NVGDepthExport";
+            spec.relativeCategory          = "Compute";
+            spec.baseFileName              = "RuntimeNVGDepthExport";
+            spec.requirement               = InternalResourceRequirement::FEATURE_DEPENDENT;
+            spec.expectedThreadsX          = 8;
+            spec.expectedThreadsY          = 8;
+            spec.expectedThreadsZ          = 1;
+            spec.requiredConstantBuffers   = { "Config" };
+            spec.requiredSRVStructuredBufs = { "InVisBuffer64", "InAtomicDepthKey32", "InAtomicPayload32" };
+            spec.requiredUAVStructuredBufs = { "OutWinningClusterMask" };
+            LoadedInternalComputeEntry entry{};
+            entry.spec = std::move(spec);
+            m_entries.push_back(std::move(entry));
+        }
+
+        // Slot 19: InternalComputeKernelId::NVG_SHADOW_MICROPOLY_RASTER (FEATURE_DEPENDENT)
+        {
+            InternalComputeShaderSpec spec{};
+            spec.idName                    = "Runtime.NVGShadowMicropolyRaster";
+            spec.relativeCategory          = "Compute";
+            spec.baseFileName              = "RuntimeNVGShadowMicropolyRaster";
+            spec.requirement               = InternalResourceRequirement::FEATURE_DEPENDENT;
+            spec.expectedThreadsX          = 64;
+            spec.expectedThreadsY          = 1;
+            spec.expectedThreadsZ          = 1;
+            spec.requiredConstantBuffers   = { "Config" };
+            spec.requiredSRVStructuredBufs = {
+                "InPagePool", "InShadowPageViews", "InGPUSceneObjects", "InClusterMeta",
+                "InMaterialTable", "InBonePalette", "InSkinnedBounds"
+            };
+            spec.requiredUAVStructuredBufs = {
+                "InOutCompactedVisibleClusters", "InOutBucketRanges", "OutPathAIndirectArgs",
+                "OutShadowSWDepthKey", "OutShadowSWClusterList", "OutShadowSWScheduledMask",
+                "OutShadowSWFallbackMask", "OutPageNeedsSWTile", "OutPageTileMap",
+                "OutDirtySWTileSlices", "OutMergeIndirectArgs", "OutDispatchArgs",
+                "OutQueueCounters", "OutTelemetry"
+            };
+            LoadedInternalComputeEntry entry{};
+            entry.spec = std::move(spec);
+            m_entries.push_back(std::move(entry));
+        }
+
         // Graphics Slot 0: InternalShaderId::LAYERED_DEPTH_CLEAR_VS
         InternalGraphicsShaderSpec clearVsSpec{};
         clearVsSpec.idName                    = "Runtime.LayeredDepthClearVS";
@@ -539,6 +674,49 @@ namespace Northstar
         LoadedInternalGraphicsEntry passGsEntry{};
         passGsEntry.spec = std::move(passGsSpec);
         m_graphicsEntries.push_back(std::move(passGsEntry));
+
+        // Graphics Slot 2: InternalShaderId::NVG_SHADOW_SW_MERGE_VS (FEATURE_DEPENDENT)
+        {
+            InternalGraphicsShaderSpec spec{};
+            spec.idName                    = "Runtime.NVGShadowSWMergeVS";
+            spec.relativeCategory          = "Depth";
+            spec.baseFileName              = "RuntimeNVGShadowSWMergeVS";
+            spec.expectedStage             = ShaderStage::VERTEX;
+            spec.requirement               = InternalResourceRequirement::FEATURE_DEPENDENT;
+            spec.requiredConstantBuffers   = { "Config" };
+            spec.requiredSRVStructuredBufs = { "DirtySWTiles" };
+            LoadedInternalGraphicsEntry entry{};
+            entry.spec = std::move(spec);
+            m_graphicsEntries.push_back(std::move(entry));
+        }
+
+        // Graphics Slot 3: InternalShaderId::NVG_SHADOW_SW_MERGE_GS (FEATURE_DEPENDENT)
+        {
+            InternalGraphicsShaderSpec spec{};
+            spec.idName           = "Runtime.NVGShadowSWMergeGS";
+            spec.relativeCategory = "Depth";
+            spec.baseFileName     = "RuntimeNVGShadowSWMergeGS";
+            spec.expectedStage    = ShaderStage::GEOMETRY;
+            spec.requirement      = InternalResourceRequirement::FEATURE_DEPENDENT;
+            LoadedInternalGraphicsEntry entry{};
+            entry.spec = std::move(spec);
+            m_graphicsEntries.push_back(std::move(entry));
+        }
+
+        // Graphics Slot 4: InternalShaderId::NVG_SHADOW_SW_MERGE_PS (FEATURE_DEPENDENT)
+        {
+            InternalGraphicsShaderSpec spec{};
+            spec.idName                    = "Runtime.NVGShadowSWMergePS";
+            spec.relativeCategory          = "Depth";
+            spec.baseFileName              = "RuntimeNVGShadowSWMergePS";
+            spec.expectedStage             = ShaderStage::PIXEL;
+            spec.requirement               = InternalResourceRequirement::FEATURE_DEPENDENT;
+            spec.requiredConstantBuffers   = { "Config" };
+            spec.requiredSRVStructuredBufs = { "InShadowSWDepthKey" };
+            LoadedInternalGraphicsEntry entry{};
+            entry.spec = std::move(spec);
+            m_graphicsEntries.push_back(std::move(entry));
+        }
     }
 
     BOOL InternalResourceManager::RegisterComputeShaderSpec(const InternalComputeShaderSpec& spec)
@@ -725,7 +903,7 @@ namespace Northstar
         return true;
     }
 
-    BOOL InternalResourceManager::LoadEntry(LoadedInternalComputeEntry& entry, std::string& outError)
+    BOOL InternalResourceManager::LoadEntry(LoadedInternalComputeEntry& entry, std::string& outError, BOOL bypassDiskCache)
     {
         outError.clear();
         if (entry.loaded && entry.kernel && entry.kernel->IsValid())
@@ -862,7 +1040,30 @@ namespace Northstar
             }
         }
 
-        // Register native shader handle on backend (prefer Core-cached DXBC bytecode when available)
+        // Enforce 64-bit integer and 64-bit descriptor-heap atomic hardware capabilities BEFORE DXBC cache lookup or compilation
+        const BackendCapabilities backendCaps = m_backend->GetCapabilities();
+        if (refl.UsesInt64Atomic() && !backendCaps.SupportsNVGRasterAtomic64())
+        {
+            delete shader;
+            outError = "NorthstarRuntime compute shader '" + entry.spec.idName +
+                       "' requires Shader Model 6.6 DXIL, Int64ShaderOps, and 64-bit descriptor-heap atomics, which are unsupported on the active adapter.";
+            return false;
+        }
+        if (refl.UsesInt64() && !(backendCaps.maxShaderModel >= 0x60u && backendCaps.supportsDXILRuntime && backendCaps.supportsInt64ShaderOps))
+        {
+            delete shader;
+            outError = "NorthstarRuntime compute shader '" + entry.spec.idName +
+                       "' requires 64-bit integer shader operations (Int64ShaderOps + DXIL), which are unsupported on the active adapter.";
+            return false;
+        }
+
+        // Register native shader handle on backend (prefer Core-cached DXBC/DXIL bytecode when available)
+        const UINT32 targetSM = SelectInternalShaderModel(m_backend);
+        if (!bypassDiskCache && m_backend->GetTargetAPI() == TargetAPI::HLSL12 && !shader->HasBytecode() && shader->HasSourceCode())
+        {
+            ShaderLoader::TryPopulateCachedDXBC(*shader, targetSM);
+        }
+
         NativeHandle nativeHandle = 0;
         if (shader->HasBytecode())
         {
@@ -884,12 +1085,23 @@ namespace Northstar
                 std::vector<BYTE> compiledDxbc;
                 if (m_backend->GetShaderCompiledBytecode(nativeHandle, compiledDxbc) && !compiledDxbc.empty())
                 {
-                    ShaderLoader::StoreCachedDXBC(*shader, compiledDxbc.data(), compiledDxbc.size());
+                    if (!bypassDiskCache)
+                    {
+                        ShaderLoader::StoreCachedDXBC(*shader, compiledDxbc.data(), compiledDxbc.size(), targetSM);
+                    }
                     shader->SetBytecode(std::move(compiledDxbc));
                 }
             }
         }
         shader->SetNativeHandle(nativeHandle);
+        if (nativeHandle != 0)
+        {
+            const ShaderSpaceMask spaceMask = BuildInternalShaderSpaceMask(*shader);
+            if (spaceMask.isExplicit)
+            {
+                m_backend->SetShaderReflectionSpaces(nativeHandle, spaceMask);
+            }
+        }
 
         // On D3D12 hardware backend (TargetAPI::HLSL12), native shader compilation/creation must succeed
         if (m_backend->GetTargetAPI() == TargetAPI::HLSL12 && nativeHandle == 0)
@@ -1028,6 +1240,12 @@ namespace Northstar
             }
         }
 
+        const UINT32 targetSM = SelectInternalShaderModel(m_backend);
+        if (m_backend->GetTargetAPI() == TargetAPI::HLSL12 && !shader->HasBytecode() && shader->HasSourceCode())
+        {
+            ShaderLoader::TryPopulateCachedDXBC(*shader, targetSM);
+        }
+
         NativeHandle nativeHandle = 0;
         if (shader->HasBytecode())
         {
@@ -1049,7 +1267,7 @@ namespace Northstar
                 std::vector<BYTE> compiledDxbc;
                 if (m_backend->GetShaderCompiledBytecode(nativeHandle, compiledDxbc) && !compiledDxbc.empty())
                 {
-                    ShaderLoader::StoreCachedDXBC(*shader, compiledDxbc.data(), compiledDxbc.size());
+                    ShaderLoader::StoreCachedDXBC(*shader, compiledDxbc.data(), compiledDxbc.size(), targetSM);
                     shader->SetBytecode(std::move(compiledDxbc));
                 }
             }
@@ -1063,9 +1281,17 @@ namespace Northstar
             return false;
         }
 
-        if (nativeHandle != 0 && shader->GetStage() == ShaderStage::VERTEX)
+        if (nativeHandle != 0)
         {
-            m_backend->SetShaderInputLayout(nativeHandle, shader->GetInputLayout());
+            if (shader->GetStage() == ShaderStage::VERTEX)
+            {
+                m_backend->SetShaderInputLayout(nativeHandle, shader->GetInputLayout());
+            }
+            const ShaderSpaceMask spaceMask = BuildInternalShaderSpaceMask(*shader);
+            if (spaceMask.isExplicit)
+            {
+                m_backend->SetShaderReflectionSpaces(nativeHandle, spaceMask);
+            }
         }
 
         entry.shader = shader;
@@ -1307,6 +1533,158 @@ namespace Northstar
 
         m_lastError = "Feature kernel '" + idName + "' is not registered in InternalResourceManager.";
         return nullptr;
+    }
+
+    ComputeKernel* InternalResourceManager::ReloadFeatureKernel(const std::string& idName, BOOL bypassDiskCache)
+    {
+        if (!m_initialized || idName.empty())
+        {
+            m_lastError = "Cannot reload feature kernel '" + idName + "': InternalResourceManager is not initialized.";
+            return nullptr;
+        }
+        if (m_backend)
+        {
+            m_backend->WaitForGPU();
+        }
+        for (auto& entry : m_entries)
+        {
+            if (entry.spec.idName == idName)
+            {
+                if (entry.kernel)
+                {
+                    if (m_computeManager)
+                    {
+                        m_computeManager->DestroyInternalComputeKernel(entry.kernel);
+                    }
+                    else
+                    {
+                        delete entry.kernel;
+                    }
+                    entry.kernel = nullptr;
+                }
+                if (entry.shader)
+                {
+                    if (m_backend && entry.shader->GetNativeHandle() != 0)
+                    {
+                        m_backend->DestroyShader(entry.shader->GetNativeHandle());
+                        entry.shader->SetNativeHandle(0);
+                    }
+                    delete entry.shader;
+                    entry.shader = nullptr;
+                }
+                entry.loaded = false;
+
+                std::string loadErr;
+                if (!LoadEntry(entry, loadErr, bypassDiskCache))
+                {
+                    m_lastError = loadErr;
+                    return nullptr;
+                }
+                return entry.kernel;
+            }
+        }
+        m_lastError = "Feature kernel '" + idName + "' is not registered in InternalResourceManager.";
+        return nullptr;
+    }
+
+    BOOL InternalResourceManager::RecompileLoadedNativeShaders(BOOL bypassDiskCache)
+    {
+        if (!m_initialized || !m_backend)
+        {
+            return false;
+        }
+        m_backend->WaitForGPU();
+        const BackendCapabilities caps     = m_backend->GetCapabilities();
+        const UINT32              targetSM = SelectInternalShaderModel(m_backend);
+
+        auto recompileOne = [&](Shader* sh, const std::string& idName) -> BOOL {
+            if (!sh || !sh->IsValid()) return true;
+            if (sh->GetNativeHandle() != 0)
+            {
+                m_backend->DestroyShader(sh->GetNativeHandle());
+                sh->SetNativeHandle(0);
+            }
+            const ShaderReflection& refl = sh->GetReflection();
+            if (refl.UsesInt64Atomic() && !caps.SupportsNVGRasterAtomic64())
+            {
+                return true; // Intentionally stays unloaded (nativeHandle == 0) under restricted capability profile
+            }
+            if (refl.UsesInt64() && !(caps.maxShaderModel >= 0x60u && caps.supportsDXILRuntime && caps.supportsInt64ShaderOps))
+            {
+                return true;
+            }
+            if (!sh->HasSourceCode())
+            {
+                return false;
+            }
+            sh->SetBytecode(std::vector<BYTE>{});
+            if (!bypassDiskCache && m_backend->GetTargetAPI() == TargetAPI::HLSL12)
+            {
+                ShaderLoader::TryPopulateCachedDXBC(*sh, targetSM);
+            }
+            NativeHandle newHandle = 0;
+            if (sh->HasBytecode())
+            {
+                newHandle = m_backend->CreateShader(sh->GetStage(), sh->GetBytecodeData(), sh->GetBytecodeSize());
+            }
+            else
+            {
+                newHandle = m_backend->CreateShader(sh->GetStage(), sh->GetSourceCode().data(), sh->GetSourceCode().size());
+                if (newHandle != 0)
+                {
+                    std::vector<BYTE> compiledDxbc;
+                    if (m_backend->GetShaderCompiledBytecode(newHandle, compiledDxbc) && !compiledDxbc.empty())
+                    {
+                        if (!bypassDiskCache)
+                        {
+                            ShaderLoader::StoreCachedDXBC(*sh, compiledDxbc.data(), compiledDxbc.size(), targetSM);
+                        }
+                        sh->SetBytecode(std::move(compiledDxbc));
+                    }
+                }
+            }
+            sh->SetNativeHandle(newHandle);
+            if (m_backend->GetTargetAPI() == TargetAPI::HLSL12 && newHandle == 0)
+            {
+                m_lastError = "Failed to recompile internal shader '" + idName + "' for active capabilities.";
+                return false;
+            }
+            if (newHandle != 0)
+            {
+                if (sh->GetStage() == ShaderStage::VERTEX)
+                {
+                    m_backend->SetShaderInputLayout(newHandle, sh->GetInputLayout());
+                }
+                const ShaderSpaceMask spaceMask = BuildInternalShaderSpaceMask(*sh);
+                if (spaceMask.isExplicit)
+                {
+                    m_backend->SetShaderReflectionSpaces(newHandle, spaceMask);
+                }
+            }
+            return true;
+        };
+
+        for (auto& entry : m_entries)
+        {
+            if (entry.loaded && entry.shader)
+            {
+                if (!recompileOne(entry.shader, entry.spec.idName))
+                {
+                    return false;
+                }
+            }
+        }
+        for (auto& gEntry : m_graphicsEntries)
+        {
+            if (gEntry.loaded && gEntry.shader)
+            {
+                if (!recompileOne(gEntry.shader, gEntry.spec.idName))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     Shader* InternalResourceManager::AcquireFeatureGraphicsShader(const std::string& idName)

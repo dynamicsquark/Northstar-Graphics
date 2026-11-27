@@ -85,6 +85,195 @@ namespace Northstar
             inst.cpuSkinningPalette.resize(static_cast<SIZE_T>(appendOffset) + static_cast<SIZE_T>(count), Mat4::Identity());
             return appendOffset;
         }
+
+        static void MarkSkinningBoundsDirtyAllRings(GPUSceneInstance& inst) noexcept
+        {
+            for (UINT32 r = 0u; r < GPUSceneInstance::kSkinningRingCount; ++r)
+            {
+                inst.skinningBoundsRingDirty[r] = true;
+            }
+        }
+
+        static UINT32 AllocateSkinningBoundsSlot(GPUSceneInstance& inst)
+        {
+            if (!inst.skinningBoundsFreeSlots.empty())
+            {
+                const UINT32 idx = inst.skinningBoundsFreeSlots.back();
+                inst.skinningBoundsFreeSlots.pop_back();
+                if (idx < inst.cpuSkinningBounds.size())
+                {
+                    inst.cpuSkinningBounds[idx] = GPUSceneSkinningBoundsData{};
+                }
+                return idx;
+            }
+            const UINT32 idx = static_cast<UINT32>(inst.cpuSkinningBounds.size());
+            inst.cpuSkinningBounds.push_back(GPUSceneSkinningBoundsData{});
+            return idx;
+        }
+
+        static void FreeSkinningBoundsSlot(GPUSceneInstance& inst, UINT32& ioSlot)
+        {
+            if (ioSlot == 0xFFFFFFFFu)
+            {
+                return;
+            }
+            if (ioSlot < inst.cpuSkinningBounds.size())
+            {
+                inst.cpuSkinningBounds[ioSlot] = GPUSceneSkinningBoundsData{};
+                inst.skinningBoundsFreeSlots.push_back(ioSlot);
+                MarkSkinningBoundsDirtyAllRings(inst);
+            }
+            ioSlot = 0xFFFFFFFFu;
+        }
+
+        static void MarkMaterialSlotsDirtyAllRings(GPUSceneInstance& inst) noexcept
+        {
+            for (UINT32 r = 0u; r < GPUSceneInstance::kSkinningRingCount; ++r)
+            {
+                inst.materialSlotRingDirty[r] = true;
+            }
+        }
+
+        static void FreeMaterialSlotRange(GPUSceneInstance& inst, UINT32 offset, UINT32 capacity)
+        {
+            if (capacity == 0u) return;
+
+            SkinningPaletteFreeRange nr{ offset, capacity };
+            auto pos = std::lower_bound(
+                inst.materialSlotFreeRanges.begin(),
+                inst.materialSlotFreeRanges.end(),
+                nr,
+                [](const SkinningPaletteFreeRange& a, const SkinningPaletteFreeRange& b) {
+                    return a.offset < b.offset;
+                });
+            pos = inst.materialSlotFreeRanges.insert(pos, nr);
+
+            if (pos + 1 != inst.materialSlotFreeRanges.end() &&
+                pos->offset + pos->count == (pos + 1)->offset)
+            {
+                pos->count += (pos + 1)->count;
+                inst.materialSlotFreeRanges.erase(pos + 1);
+            }
+            if (pos != inst.materialSlotFreeRanges.begin())
+            {
+                auto prev = pos - 1;
+                if (prev->offset + prev->count == pos->offset)
+                {
+                    prev->count += pos->count;
+                    inst.materialSlotFreeRanges.erase(pos);
+                }
+            }
+
+            if (!inst.materialSlotFreeRanges.empty())
+            {
+                const SkinningPaletteFreeRange& tail = inst.materialSlotFreeRanges.back();
+                if (tail.offset + tail.count == static_cast<UINT32>(inst.cpuMaterialSlotTable.size()))
+                {
+                    inst.cpuMaterialSlotTable.resize(tail.offset);
+                    inst.materialSlotFreeRanges.pop_back();
+                }
+            }
+            MarkMaterialSlotsDirtyAllRings(inst);
+        }
+
+        static UINT32 AllocateMaterialSlotRange(GPUSceneInstance& inst, UINT32 count)
+        {
+            for (SIZE_T i = 0u; i < inst.materialSlotFreeRanges.size(); ++i)
+            {
+                if (inst.materialSlotFreeRanges[i].count >= count)
+                {
+                    const UINT32 allocOffset = inst.materialSlotFreeRanges[i].offset;
+                    if (inst.materialSlotFreeRanges[i].count == count)
+                    {
+                        inst.materialSlotFreeRanges.erase(inst.materialSlotFreeRanges.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                    else
+                    {
+                        inst.materialSlotFreeRanges[i].offset += count;
+                        inst.materialSlotFreeRanges[i].count  -= count;
+                    }
+                    return allocOffset;
+                }
+            }
+
+            const UINT32 appendOffset = static_cast<UINT32>(inst.cpuMaterialSlotTable.size());
+            inst.cpuMaterialSlotTable.resize(static_cast<SIZE_T>(appendOffset) + static_cast<SIZE_T>(count), 0u);
+            return appendOffset;
+        }
+
+        static UINT32 ComputeMultiMaterialRevisionHash(const RenderObject* obj) noexcept
+        {
+            if (!obj) return 0u;
+            const UINT32 slotCnt = obj->GetMaterialSlotCount();
+            UINT32 h = 2166136261u;
+            auto mixU32 = [&](UINT32 v) noexcept {
+                h ^= v;
+                h *= 16777619u;
+            };
+            mixU32(slotCnt);
+            for (UINT32 s = 0u; s < slotCnt; ++s)
+            {
+                const Material* m = obj->GetMaterial(s);
+                mixU32(m ? m->GetGPUSceneMaterialId() : 0u);
+                mixU32(m ? m->GetStateRevision() : 0u);
+            }
+            return (h == 0u) ? 1u : h;
+        }
+
+        static void ComputeSkinnedObjectEnvelope(
+            const AABB&                 baseBox,
+            const Mat4*                 bones,
+            UINT32                      boneCount,
+            GPUSceneSkinningBoundsData& outBounds) noexcept
+        {
+            outBounds = GPUSceneSkinningBoundsData{};
+            if (!bones || boneCount == 0u || !baseBox.IsValid())
+            {
+                return;
+            }
+
+            Vec3    envMin   = Vec3(0.0f, 0.0f, 0.0f);
+            Vec3    envMax   = Vec3(0.0f, 0.0f, 0.0f);
+            FLOAT32 maxScale = 1.0f;
+
+            const Vec3 bMin = baseBox.m_Min;
+            const Vec3 bMax = baseBox.m_Max;
+
+            for (UINT32 k = 0u; k < boneCount; ++k)
+            {
+                const Mat4& B = bones[k];
+
+                const FLOAT32 c0Len = std::sqrt(B.m[0] * B.m[0] + B.m[1] * B.m[1] + B.m[2] * B.m[2]);
+                const FLOAT32 c1Len = std::sqrt(B.m[4] * B.m[4] + B.m[5] * B.m[5] + B.m[6] * B.m[6]);
+                const FLOAT32 c2Len = std::sqrt(B.m[8] * B.m[8] + B.m[9] * B.m[9] + B.m[10] * B.m[10]);
+                maxScale = (std::max)({ maxScale, c0Len, c1Len, c2Len });
+
+                // Exact Arvo affine range of (B - I) * p over p in [bMin, bMax]
+                const FLOAT32 d0x = B.m[0] - 1.0f, d0y = B.m[1],        d0z = B.m[2];
+                const FLOAT32 d1x = B.m[4],        d1y = B.m[5] - 1.0f, d1z = B.m[6];
+                const FLOAT32 d2x = B.m[8],        d2y = B.m[9],        d2z = B.m[10] - 1.0f;
+                const FLOAT32 tx  = B.m[12],       ty  = B.m[13],       tz  = B.m[14];
+
+                const FLOAT32 loX = tx + (std::min)(d0x * bMin.x, d0x * bMax.x) + (std::min)(d1x * bMin.y, d1x * bMax.y) + (std::min)(d2x * bMin.z, d2x * bMax.z);
+                const FLOAT32 hiX = tx + (std::max)(d0x * bMin.x, d0x * bMax.x) + (std::max)(d1x * bMin.y, d1x * bMax.y) + (std::max)(d2x * bMin.z, d2x * bMax.z);
+
+                const FLOAT32 loY = ty + (std::min)(d0y * bMin.x, d0y * bMax.x) + (std::min)(d1y * bMin.y, d1y * bMax.y) + (std::min)(d2y * bMin.z, d2y * bMax.z);
+                const FLOAT32 hiY = ty + (std::max)(d0y * bMin.x, d0y * bMax.x) + (std::max)(d1y * bMin.y, d1y * bMax.y) + (std::max)(d2y * bMin.z, d2y * bMax.z);
+
+                const FLOAT32 loZ = tz + (std::min)(d0z * bMin.x, d0z * bMax.x) + (std::min)(d1z * bMin.y, d1z * bMax.y) + (std::min)(d2z * bMin.z, d2z * bMax.z);
+                const FLOAT32 hiZ = tz + (std::max)(d0z * bMin.x, d0z * bMax.x) + (std::max)(d1z * bMin.y, d1z * bMax.y) + (std::max)(d2z * bMin.z, d2z * bMax.z);
+
+                envMin.x = (std::min)(envMin.x, loX);
+                envMin.y = (std::min)(envMin.y, loY);
+                envMin.z = (std::min)(envMin.z, loZ);
+                envMax.x = (std::max)(envMax.x, hiX);
+                envMax.y = (std::max)(envMax.y, hiY);
+                envMax.z = (std::max)(envMax.z, hiZ);
+            }
+
+            outBounds.localDeltaMin = Vec4(envMin.x, envMin.y, envMin.z, maxScale);
+            outBounds.localDeltaMax = Vec4(envMax.x, envMax.y, envMax.z, 0.0f);
+        }
     }
 
     CoreGPUSceneManager::~CoreGPUSceneManager()
@@ -128,7 +317,11 @@ namespace Northstar
                 inst.scene->m_gpuSceneBuffer           = nullptr;
                 inst.scene->m_gpuSkinningPaletteBuffer = nullptr;
                 inst.scene->m_gpuSkinningPaletteCount  = 0u;
-                inst.scene->m_gpuSceneStats            = {};
+                inst.scene->m_gpuSkinningBoundsBuffer    = nullptr;
+                inst.scene->m_gpuSkinningBoundsCount     = 0u;
+                inst.scene->m_gpuMaterialSlotTableBuffer = nullptr;
+                inst.scene->m_gpuMaterialSlotTableCount  = 0u;
+                inst.scene->m_gpuSceneStats              = {};
             }
             if (inst.gpuBuffer && m_bufferManager)
             {
@@ -143,8 +336,24 @@ namespace Northstar
                     inst.skinningRingBuffers[r]    = nullptr;
                     inst.skinningRingCapacities[r] = 0u;
                 }
+                if (inst.skinningBoundsRingBuffers[r] && m_bufferManager)
+                {
+                    m_bufferManager->DestroyGPUBuffer(inst.skinningBoundsRingBuffers[r]);
+                    inst.skinningBoundsRingBuffers[r]    = nullptr;
+                    inst.skinningBoundsRingCapacities[r] = 0u;
+                }
+                if (inst.materialSlotRingBuffers[r] && m_bufferManager)
+                {
+                    m_bufferManager->DestroyGPUBuffer(inst.materialSlotRingBuffers[r]);
+                    inst.materialSlotRingBuffers[r]    = nullptr;
+                    inst.materialSlotRingCapacities[r] = 0u;
+                }
+                inst.skinningBoundsRingDirty[r] = false;
+                inst.materialSlotRingDirty[r]   = false;
             }
-            inst.activeSkinningBuffer = nullptr;
+            inst.activeSkinningBuffer       = nullptr;
+            inst.activeSkinningBoundsBuffer = nullptr;
+            inst.activeMaterialSlotBuffer   = nullptr;
         }
         m_instances.clear();
         m_bufferManager             = nullptr;
@@ -164,7 +373,11 @@ namespace Northstar
                 scene->m_gpuSceneBuffer           = nullptr;
                 scene->m_gpuSkinningPaletteBuffer = nullptr;
                 scene->m_gpuSkinningPaletteCount  = 0u;
-                scene->m_gpuSceneStats            = {};
+                scene->m_gpuSkinningBoundsBuffer    = nullptr;
+                scene->m_gpuSkinningBoundsCount     = 0u;
+                scene->m_gpuMaterialSlotTableBuffer = nullptr;
+                scene->m_gpuMaterialSlotTableCount  = 0u;
+                scene->m_gpuSceneStats              = {};
                 if (m_instances[i].gpuBuffer && m_bufferManager)
                 {
                     m_bufferManager->DestroyGPUBuffer(m_instances[i].gpuBuffer);
@@ -178,8 +391,24 @@ namespace Northstar
                         m_instances[i].skinningRingBuffers[r]    = nullptr;
                         m_instances[i].skinningRingCapacities[r] = 0u;
                     }
+                    if (m_instances[i].skinningBoundsRingBuffers[r] && m_bufferManager)
+                    {
+                        m_bufferManager->DestroyGPUBuffer(m_instances[i].skinningBoundsRingBuffers[r]);
+                        m_instances[i].skinningBoundsRingBuffers[r]    = nullptr;
+                        m_instances[i].skinningBoundsRingCapacities[r] = 0u;
+                    }
+                    if (m_instances[i].materialSlotRingBuffers[r] && m_bufferManager)
+                    {
+                        m_bufferManager->DestroyGPUBuffer(m_instances[i].materialSlotRingBuffers[r]);
+                        m_instances[i].materialSlotRingBuffers[r]    = nullptr;
+                        m_instances[i].materialSlotRingCapacities[r] = 0u;
+                    }
+                    m_instances[i].skinningBoundsRingDirty[r] = false;
+                    m_instances[i].materialSlotRingDirty[r]   = false;
                 }
-                m_instances[i].activeSkinningBuffer = nullptr;
+                m_instances[i].activeSkinningBuffer       = nullptr;
+                m_instances[i].activeSkinningBoundsBuffer = nullptr;
+                m_instances[i].activeMaterialSlotBuffer   = nullptr;
                 m_instances.erase(m_instances.begin() + static_cast< std::ptrdiff_t >(i));
                 return;
             }
@@ -202,6 +431,14 @@ namespace Northstar
                         se.skinningPaletteOffset   = 0u;
                         se.skinningPaletteCapacity = 0u;
                         se.skinningBoneCount       = 0u;
+                    }
+                    FreeSkinningBoundsSlot(inst, se.skinningBoundsSlot);
+                    if (se.materialSlotCapacity > 0u)
+                    {
+                        FreeMaterialSlotRange(inst, se.materialSlotOffset, se.materialSlotCapacity);
+                        se.materialSlotOffset     = 0u;
+                        se.materialSlotCapacity   = 0u;
+                        se.boundMultiMaterialHash = 0u;
                     }
                     se.object                = nullptr;
                     se.boundMesh             = nullptr;
@@ -284,9 +521,9 @@ namespace Northstar
             {
                 for (RenderObject* ro : inst.scene->m_renderObjects)
                 {
-                    if (ro && ro->GetMaterial() == destroyedMaterial)
+                    if (ro)
                     {
-                        ro->SetMaterial(nullptr);
+                        ro->ClearDestroyedMaterial(destroyedMaterial);
                     }
                 }
             }
@@ -303,14 +540,30 @@ namespace Northstar
                     }
                     continue;
                 }
-                if (se.boundMaterial == destroyedMaterial || (se.occupied && se.object && se.object->GetMaterial() == destroyedMaterial))
+                BOOL usesDestroyedMat = (se.boundMaterial == destroyedMaterial);
+                if (!usesDestroyedMat && se.occupied && se.object)
                 {
-                    if (se.occupied && se.object && se.object->GetMaterial() == destroyedMaterial)
+                    const UINT32 slotCnt = se.object->GetMaterialSlotCount();
+                    for (UINT32 ms = 0u; ms < slotCnt; ++ms)
                     {
-                        se.object->SetMaterial(nullptr);
+                        if (se.object->GetMaterial(ms) == destroyedMaterial)
+                        {
+                            usesDestroyedMat = true;
+                            break;
+                        }
                     }
-                    se.boundMaterial         = nullptr;
-                    se.boundMaterialRevision = 0u;
+                }
+                if (usesDestroyedMat)
+                {
+                    if (se.occupied && se.object)
+                    {
+                        se.object->ClearDestroyedMaterial(destroyedMaterial);
+                    }
+                    if (se.boundMaterial == destroyedMaterial)
+                    {
+                        se.boundMaterial         = nullptr;
+                        se.boundMaterialRevision = 0u;
+                    }
                     if (se.occupied)
                     {
                         se.dirtyMask |= GPU_SCENE_DIRTY_MATERIAL;
@@ -459,6 +712,11 @@ namespace Northstar
         outRecord.lodAndMaterialFlags = 0u;
         outRecord.boundingSphere      = Vec4(0.0f, 0.0f, 0.0f, 0.0f);
         outRecord.worldMatrix         = Mat4::Identity();
+        outRecord.prevWorldMatrix     = Mat4::Identity();
+        outRecord.layerMask            = 0u;
+        outRecord.materialTableOffset  = 0u;
+        outRecord.materialSlotCount    = 0u;
+        outRecord.skinningBoundsOffset = 0xFFFFFFFFu;
     }
 
     void CoreGPUSceneManager::BuildObjectRecord(
@@ -571,16 +829,23 @@ namespace Northstar
         const BOOL   depthTest     = mat ? mat->IsDepthTestEnabled()                    : true;
         const BOOL   depthWrite    = mat ? mat->IsDepthWriteEnabled()                   : true;
         const BOOL   wireframe     = mat ? mat->IsWireframe()                           : false;
-        const BOOL   hasGeomPass   = mat ? mat->HasPass(PassType::GEOMETRY)             : false;
-        const BOOL   hasShadowPass = mat ? mat->HasPass(PassType::SHADOW)               : false;
-        const BOOL   hasDepthPass  = mat ? mat->HasPass(PassType::DEPTH)                : false;
+        BOOL         hasGeomPass   = mat ? mat->HasPass(PassType::GEOMETRY)             : false;
+        BOOL         hasShadowPass = mat ? mat->HasPass(PassType::SHADOW)               : false;
+        BOOL         hasDepthPass  = mat ? mat->HasPass(PassType::DEPTH)                : false;
 
-        if (mat != nullptr)
+        const UINT32 totalMatSlots = (std::max)(1u, obj->GetMaterialSlotCount());
+        for (UINT32 ms = 0u; ms < totalMatSlots; ++ms)
         {
-            if (mat->IsAlphaTested()) objFlags |= GPU_SCENE_OBJ_ALPHA_TESTED;
-            if (mat->IsTransparent()) objFlags |= GPU_SCENE_OBJ_TRANSPARENT;
-            if (mat->IsTwoSided())    objFlags |= GPU_SCENE_OBJ_TWO_SIDED;
-            if (!mat->IsTransparent() && depthTest && depthWrite && obj->HasFlag(RenderObjectFlags::VISIBLE))
+            const Material* slotMat = obj->GetMaterial(ms);
+            if (!slotMat) continue;
+            if (slotMat->HasPass(PassType::GEOMETRY)) hasGeomPass   = true;
+            if (slotMat->HasPass(PassType::SHADOW))   hasShadowPass = true;
+            if (slotMat->HasPass(PassType::DEPTH))    hasDepthPass  = true;
+            if (slotMat->IsAlphaTested())             objFlags |= GPU_SCENE_OBJ_ALPHA_TESTED;
+            if (slotMat->IsTransparent())             objFlags |= GPU_SCENE_OBJ_TRANSPARENT;
+            if (slotMat->IsTwoSided())                objFlags |= GPU_SCENE_OBJ_TWO_SIDED;
+            if (!slotMat->IsTransparent() && slotMat->IsDepthTestEnabled() && slotMat->IsDepthWriteEnabled() &&
+                obj->HasFlag(RenderObjectFlags::VISIBLE))
             {
                 objFlags |= GPU_SCENE_OBJ_DEPTH_PREPASS;
             }
@@ -594,7 +859,12 @@ namespace Northstar
             lodCount, cullMode, blendMode, depthTest, depthWrite,
             wireframe, hasGeomPass, hasShadowPass, hasDepthPass);
 
-        outRecord.worldMatrix = obj->GetWorldMatrix();
+        outRecord.worldMatrix          = obj->GetWorldMatrix();
+        outRecord.prevWorldMatrix      = obj->GetWorldMatrix();
+        outRecord.layerMask            = obj->GetLayerMask();
+        outRecord.materialTableOffset  = 0u;
+        outRecord.materialSlotCount    = (std::max)(1u, obj->GetMaterialSlotCount());
+        outRecord.skinningBoundsOffset = 0xFFFFFFFFu;
 
         const AABB& aabb = obj->GetWorldAABB();
         outRecord.aabbMin = aabb.m_Min;
@@ -629,12 +899,13 @@ namespace Northstar
         Material* mat  = se.object->GetMaterial();
         LODGroup* lod  = se.object->GetLODGroup();
 
-        se.boundMesh             = mesh;
-        se.boundMeshRevision     = mesh ? mesh->GetStateRevision() : 0u;
-        se.boundMaterial         = mat;
-        se.boundMaterialRevision = mat  ? mat->GetStateRevision()  : 0u;
-        se.boundLODGroup         = lod;
-        se.boundLODGroupRevision = lod  ? lod->GetStateRevision()  : 0u;
+        se.boundMesh              = mesh;
+        se.boundMeshRevision      = mesh ? mesh->GetStateRevision() : 0u;
+        se.boundMaterial          = mat;
+        se.boundMaterialRevision  = mat  ? mat->GetStateRevision()  : 0u;
+        se.boundMultiMaterialHash = ComputeMultiMaterialRevisionHash(se.object);
+        se.boundLODGroup          = lod;
+        se.boundLODGroupRevision  = lod  ? lod->GetStateRevision()  : 0u;
 
         if (mesh)
         {
@@ -659,6 +930,21 @@ namespace Northstar
             if (!found)
             {
                 inst.watchedMaterials.push_back({ mat, mat->GetStateRevision() });
+            }
+        }
+        const UINT32 matSlots = se.object->GetMaterialSlotCount();
+        for (UINT32 ms = 1u; ms < matSlots; ++ms)
+        {
+            Material* extraMat = se.object->GetMaterial(ms);
+            if (!extraMat) continue;
+            BOOL found = false;
+            for (const auto& w : inst.watchedMaterials)
+            {
+                if (w.material == extraMat) { found = true; break; }
+            }
+            if (!found)
+            {
+                inst.watchedMaterials.push_back({ extraMat, extraMat->GetStateRevision() });
             }
         }
 
@@ -724,11 +1010,17 @@ namespace Northstar
                 se.dirtyMask |= (GPU_SCENE_DIRTY_MESH | GPU_SCENE_DIRTY_BOUNDS);
                 slotResourceMutated = true;
             }
-            if (anyMaterialChanged && se.boundMaterial && se.boundMaterial->GetStateRevision() != se.boundMaterialRevision)
+            if (anyMaterialChanged)
             {
-                se.boundMaterialRevision = se.boundMaterial->GetStateRevision();
-                se.dirtyMask |= GPU_SCENE_DIRTY_MATERIAL;
-                slotResourceMutated = true;
+                const UINT32 curMultiHash = ComputeMultiMaterialRevisionHash(se.object);
+                if ((se.boundMaterial && se.boundMaterial->GetStateRevision() != se.boundMaterialRevision) ||
+                    (se.object->GetMaterialSlotCount() > 1u && curMultiHash != se.boundMultiMaterialHash))
+                {
+                    se.boundMaterialRevision  = se.boundMaterial ? se.boundMaterial->GetStateRevision() : 0u;
+                    se.boundMultiMaterialHash = curMultiHash;
+                    se.dirtyMask |= GPU_SCENE_DIRTY_MATERIAL;
+                    slotResourceMutated = true;
+                }
             }
             if (anyLODGroupChanged && se.boundLODGroup && se.boundLODGroup->GetStateRevision() != se.boundLODGroupRevision)
             {
@@ -854,8 +1146,12 @@ namespace Northstar
             inst.gpuBuffer != nullptr &&
             inst.gpuBuffer->IsValid())
         {
-            scene->m_gpuSceneBuffer = inst.gpuBuffer;
-            scene->m_gpuSceneStats  = inst.lastStats;
+            scene->m_gpuSceneBuffer             = inst.gpuBuffer;
+            scene->m_gpuSkinningBoundsBuffer    = inst.activeSkinningBoundsBuffer;
+            scene->m_gpuSkinningBoundsCount     = static_cast<UINT32>(inst.cpuSkinningBounds.size());
+            scene->m_gpuMaterialSlotTableBuffer = inst.activeMaterialSlotBuffer;
+            scene->m_gpuMaterialSlotTableCount  = static_cast<UINT32>(inst.cpuMaterialSlotTable.size());
+            scene->m_gpuSceneStats              = inst.lastStats;
             return true;
         }
 
@@ -863,6 +1159,23 @@ namespace Northstar
         if (inst.initialized && !scene->m_gpuSceneCleared)
         {
             CheckWatchedResourceMutations(inst);
+
+            if (!inst.prevTransformCatchupSlots.empty())
+            {
+                std::vector<UINT32> catchupSlots;
+                catchupSlots.swap(inst.prevTransformCatchupSlots);
+                for (UINT32 cs : catchupSlots)
+                {
+                    if (cs >= inst.slots.size()) continue;
+                    GPUSceneSlotEntry& cse = inst.slots[cs];
+                    cse.pendingPrevTransformCatchup = false;
+                    if (cse.occupied && cse.object != nullptr && !cse.queuedDirty)
+                    {
+                        cse.queuedDirty = true;
+                        inst.dirtySlotIndices.push_back(cs);
+                    }
+                }
+            }
         }
 
         // Fast O(1) exit when already initialized and 0% dirty!
@@ -898,6 +1211,10 @@ namespace Northstar
             inst.lastStats.cpuTotalUpdateMs     = inst.lastStats.cpuDirtyCollectMs;
             inst.lastUpdatedFrameNumber         = frameNumber;
             scene->m_gpuSceneBuffer             = inst.gpuBuffer;
+            scene->m_gpuSkinningBoundsBuffer    = inst.activeSkinningBoundsBuffer;
+            scene->m_gpuSkinningBoundsCount     = static_cast<UINT32>(inst.cpuSkinningBounds.size());
+            scene->m_gpuMaterialSlotTableBuffer = inst.activeMaterialSlotBuffer;
+            scene->m_gpuMaterialSlotTableCount  = static_cast<UINT32>(inst.cpuMaterialSlotTable.size());
             scene->m_gpuSceneStats              = inst.lastStats;
             return true;
         }
@@ -1064,12 +1381,21 @@ namespace Northstar
                 se.skinningPaletteOffset   = 0u;
                 se.skinningPaletteCapacity = 0u;
                 se.skinningBoneCount       = 0u;
+                se.skinningBoundsSlot      = 0xFFFFFFFFu;
+                se.materialSlotOffset      = 0u;
+                se.materialSlotCapacity    = 0u;
+                se.boundMultiMaterialHash  = 0u;
                 se.skinningPoseDirty       = false;
                 se.trackedVirtual          = false;
                 se.trackedMaterialKernel   = false;
+                se.hasPrevWorldMatrix      = false;
+                se.pendingPrevTransformCatchup = false;
+                se.lastFrameWorldMatrix    = Mat4::Identity();
+                se.lastTransformFrame      = 0ull;
                 BuildInvalidSlotRecord(s, inst.cpuRecords[s]);
                 inst.dirtySlotIndices.push_back(s);
             }
+            inst.prevTransformCatchupSlots.clear();
             inst.freeSlots.clear();
             // Push cleared slots in reverse order so slot 0 is popped first on reuse
             for (UINT32 s = clearedWatermarkToZeroOnGPU; s > 0u; --s)
@@ -1084,12 +1410,20 @@ namespace Northstar
             inst.watchedLODGroups.clear();
             inst.cpuSkinningPalette.clear();
             inst.skinningFreeRanges.clear();
+            inst.cpuSkinningBounds.clear();
+            inst.skinningBoundsFreeSlots.clear();
+            inst.cpuMaterialSlotTable.clear();
+            inst.materialSlotFreeRanges.clear();
             for (UINT32 r = 0u; r < GPUSceneInstance::kSkinningRingCount; ++r)
             {
-                inst.skinningRingDirtyMin[r] = 0xFFFFFFFFu;
-                inst.skinningRingDirtyMax[r] = 0u;
+                inst.skinningRingDirtyMin[r]    = 0xFFFFFFFFu;
+                inst.skinningRingDirtyMax[r]    = 0u;
+                inst.skinningBoundsRingDirty[r] = false;
+                inst.materialSlotRingDirty[r]   = false;
             }
-            scene->m_gpuSkinningPaletteCount = 0u;
+            scene->m_gpuSkinningPaletteCount   = 0u;
+            scene->m_gpuSkinningBoundsCount    = 0u;
+            scene->m_gpuMaterialSlotTableCount = 0u;
             scene->m_gpuSceneCleared = false;
         }
 
@@ -1105,6 +1439,14 @@ namespace Northstar
                     se.skinningPaletteOffset   = 0u;
                     se.skinningPaletteCapacity = 0u;
                 }
+                FreeSkinningBoundsSlot(inst, se.skinningBoundsSlot);
+                if (se.materialSlotCapacity > 0u)
+                {
+                    FreeMaterialSlotRange(inst, se.materialSlotOffset, se.materialSlotCapacity);
+                    se.materialSlotOffset     = 0u;
+                    se.materialSlotCapacity   = 0u;
+                    se.boundMultiMaterialHash = 0u;
+                }
                 se.occupied              = false;
                 se.object                = nullptr;
                 se.currentGeneration     = 0u;
@@ -1118,6 +1460,10 @@ namespace Northstar
                 se.boundSkinningRevision = 0u;
                 se.skinningBoneCount     = 0u;
                 se.skinningPoseDirty     = false;
+                se.hasPrevWorldMatrix    = false;
+                se.pendingPrevTransformCatchup = false;
+                se.lastFrameWorldMatrix  = Mat4::Identity();
+                se.lastTransformFrame    = 0ull;
                 if (se.trackedVirtual)
                 {
                     if (inst.virtualActiveCount > 0u) inst.virtualActiveCount--;
@@ -1212,7 +1558,9 @@ namespace Northstar
 
         // Step 4: Rebuild CPU records & skinning palette entries only for dirty slots (O(K))
         const UINT32 dirtySlotCount = static_cast<UINT32>(inst.dirtySlotIndices.size());
-        BOOL anySkinningPaletteModified = false;
+        BOOL anySkinningPaletteModified   = false;
+        BOOL anySkinningBoundsModified    = false;
+        BOOL anyMaterialSlotTableModified = false;
 
         for (UINT32 slotIdx : inst.dirtySlotIndices)
         {
@@ -1240,6 +1588,10 @@ namespace Northstar
                         se.skinningPaletteOffset   = AllocateSkinningPaletteRange(inst, boneCount);
                         se.skinningPaletteCapacity = boneCount;
                     }
+                    if (se.skinningBoundsSlot == 0xFFFFFFFFu)
+                    {
+                        se.skinningBoundsSlot = AllocateSkinningBoundsSlot(inst);
+                    }
                     se.skinningBoneCount = boneCount;
                     const Mat4* srcBones = se.object->GetSkinningMatrixData();
                     if (srcBones != nullptr)
@@ -1249,13 +1601,20 @@ namespace Northstar
                             srcBones,
                             static_cast<SIZE_T>(boneCount) * sizeof(Mat4));
                     }
+                    ComputeSkinnedObjectEnvelope(
+                        se.object->GetLocalAABB(),
+                        srcBones,
+                        boneCount,
+                        inst.cpuSkinningBounds[se.skinningBoundsSlot]);
                     if (link != nullptr)
                     {
                         link->skinningPaletteOffset = se.skinningPaletteOffset;
                         link->skinningBoneCount     = boneCount;
                     }
                     MarkSkinningPaletteDirtyAllRings(inst, se.skinningPaletteOffset, boneCount);
+                    MarkSkinningBoundsDirtyAllRings(inst);
                     anySkinningPaletteModified = true;
+                    anySkinningBoundsModified  = true;
                 }
                 else
                 {
@@ -1264,6 +1623,11 @@ namespace Northstar
                         FreeSkinningPaletteRange(inst, se.skinningPaletteOffset, se.skinningPaletteCapacity);
                         se.skinningPaletteOffset   = 0u;
                         se.skinningPaletteCapacity = 0u;
+                    }
+                    if (se.skinningBoundsSlot != 0xFFFFFFFFu)
+                    {
+                        FreeSkinningBoundsSlot(inst, se.skinningBoundsSlot);
+                        anySkinningBoundsModified = true;
                     }
                     if (se.skinningBoneCount != 0u)
                     {
@@ -1277,7 +1641,66 @@ namespace Northstar
                     }
                 }
 
+                const UINT32 matSlotCount = (std::max)(1u, se.object->GetMaterialSlotCount());
+                if (matSlotCount > 1u)
+                {
+                    if (se.materialSlotCapacity < matSlotCount)
+                    {
+                        if (se.materialSlotCapacity > 0u)
+                        {
+                            FreeMaterialSlotRange(inst, se.materialSlotOffset, se.materialSlotCapacity);
+                        }
+                        se.materialSlotOffset   = AllocateMaterialSlotRange(inst, matSlotCount);
+                        se.materialSlotCapacity = matSlotCount;
+                    }
+                    for (UINT32 ms = 0u; ms < matSlotCount; ++ms)
+                    {
+                        const Material* sm = se.object->GetMaterial(ms);
+                        inst.cpuMaterialSlotTable[se.materialSlotOffset + ms] = sm ? sm->GetGPUSceneMaterialId() : 0u;
+                    }
+                    se.boundMultiMaterialHash = ComputeMultiMaterialRevisionHash(se.object);
+                    MarkMaterialSlotsDirtyAllRings(inst);
+                    anyMaterialSlotTableModified = true;
+                }
+                else if (se.materialSlotCapacity > 0u)
+                {
+                    FreeMaterialSlotRange(inst, se.materialSlotOffset, se.materialSlotCapacity);
+                    se.materialSlotOffset        = 0u;
+                    se.materialSlotCapacity      = 0u;
+                    se.boundMultiMaterialHash    = 0u;
+                    anyMaterialSlotTableModified = true;
+                }
+
                 BuildObjectRecord(se.object, link, slotIdx, se.currentGeneration, inst.cpuRecords[slotIdx]);
+                inst.cpuRecords[slotIdx].skinningBoundsOffset = se.skinningBoundsSlot;
+                inst.cpuRecords[slotIdx].materialTableOffset  = (matSlotCount > 1u) ? se.materialSlotOffset : 0u;
+                const Mat4& currW = inst.cpuRecords[slotIdx].worldMatrix;
+                if (!se.hasPrevWorldMatrix)
+                {
+                    inst.cpuRecords[slotIdx].prevWorldMatrix = currW;
+                    se.lastFrameWorldMatrix                  = currW;
+                    se.lastTransformFrame                    = frameNumber;
+                    se.hasPrevWorldMatrix                    = true;
+                }
+                else
+                {
+                    inst.cpuRecords[slotIdx].prevWorldMatrix = se.lastFrameWorldMatrix;
+                    se.lastFrameWorldMatrix                  = currW;
+                    se.lastTransformFrame                    = frameNumber;
+                }
+                if (link != nullptr)
+                {
+                    link->prevWorldMatrix    = inst.cpuRecords[slotIdx].prevWorldMatrix;
+                    link->hasPrevWorldMatrix = true;
+                }
+                if (std::memcmp(&inst.cpuRecords[slotIdx].prevWorldMatrix, &currW, sizeof(Mat4)) != 0)
+                {
+                    if (!se.pendingPrevTransformCatchup)
+                    {
+                        se.pendingPrevTransformCatchup = true;
+                        inst.prevTransformCatchupSlots.push_back(slotIdx);
+                    }
+                }
                 const BOOL nowVirtual = (inst.cpuRecords[slotIdx].objectFlags & GPU_SCENE_OBJ_VIRTUAL_GEOMETRY) != 0u;
                 if (nowVirtual != se.trackedVirtual)
                 {
@@ -1285,8 +1708,16 @@ namespace Northstar
                     else if (inst.virtualActiveCount > 0u) inst.virtualActiveCount--;
                     se.trackedVirtual = nowVirtual;
                 }
-                const Material* slotMat = se.object->GetMaterial();
-                const BOOL nowMatKernel = (slotMat != nullptr && slotMat->HasComputeKernels());
+                BOOL nowMatKernel = false;
+                for (UINT32 ms = 0u; ms < matSlotCount; ++ms)
+                {
+                    const Material* sm = se.object->GetMaterial(ms);
+                    if (sm != nullptr && sm->HasComputeKernels())
+                    {
+                        nowMatKernel = true;
+                        break;
+                    }
+                }
                 if (nowMatKernel != se.trackedMaterialKernel)
                 {
                     if (nowMatKernel) inst.materialKernelActiveCount++;
@@ -1370,6 +1801,94 @@ namespace Northstar
         }
         scene->m_gpuSkinningPaletteBuffer = inst.activeSkinningBuffer;
         scene->m_gpuSkinningPaletteCount  = static_cast<UINT32>(inst.cpuSkinningPalette.size());
+
+        // Upload persistent triple-buffered GPU Skinning Bounds Buffer when modified
+        if ((anySkinningBoundsModified || (inst.activeSkinningBoundsBuffer == nullptr && !inst.cpuSkinningBounds.empty())) &&
+            !inst.cpuSkinningBounds.empty())
+        {
+            inst.skinningBoundsRingIndex = (inst.skinningBoundsRingIndex + 1u) % GPUSceneInstance::kSkinningRingCount;
+            const UINT32 bRingIdx = inst.skinningBoundsRingIndex;
+            const UINT32 bCount   = static_cast<UINT32>(inst.cpuSkinningBounds.size());
+            const UINT32 bReqCap  = ComputeTargetCapacity(inst.skinningBoundsRingCapacities[bRingIdx], (std::max)(bCount, 16u));
+
+            if (inst.skinningBoundsRingBuffers[bRingIdx] == nullptr)
+            {
+                GPUBufferDesc sbDesc{};
+                sbDesc.elementCount = bReqCap;
+                sbDesc.stride       = sizeof(GPUSceneSkinningBoundsData);
+                sbDesc.usage        = GPUBufferUsage::STRUCTURED_SRV | GPUBufferUsage::CPU_READBACK;
+                sbDesc.initialData  = nullptr;
+                sbDesc.debugName    = "Northstar.GPUScene.SkinningBoundsBuffer";
+                inst.skinningBoundsRingBuffers[bRingIdx]    = m_bufferManager->CreateGPUBuffer(sbDesc);
+                inst.skinningBoundsRingCapacities[bRingIdx] = inst.skinningBoundsRingBuffers[bRingIdx] ? bReqCap : 0u;
+                inst.skinningBoundsRingDirty[bRingIdx]      = true;
+            }
+            else if (bReqCap > inst.skinningBoundsRingCapacities[bRingIdx])
+            {
+                if (m_bufferManager->ResizeGPUBuffer(inst.skinningBoundsRingBuffers[bRingIdx], bReqCap, nullptr))
+                {
+                    inst.skinningBoundsRingCapacities[bRingIdx] = bReqCap;
+                    inst.skinningBoundsRingDirty[bRingIdx]      = true;
+                }
+            }
+
+            if (inst.skinningBoundsRingBuffers[bRingIdx] != nullptr && inst.skinningBoundsRingDirty[bRingIdx])
+            {
+                m_bufferManager->UpdateGPUBuffer(
+                    inst.skinningBoundsRingBuffers[bRingIdx],
+                    inst.cpuSkinningBounds.data(),
+                    bCount * static_cast<UINT32>(sizeof(GPUSceneSkinningBoundsData)),
+                    0u);
+                inst.skinningBoundsRingDirty[bRingIdx] = false;
+                inst.activeSkinningBoundsBuffer        = inst.skinningBoundsRingBuffers[bRingIdx];
+            }
+        }
+        scene->m_gpuSkinningBoundsBuffer = inst.activeSkinningBoundsBuffer;
+        scene->m_gpuSkinningBoundsCount  = static_cast<UINT32>(inst.cpuSkinningBounds.size());
+
+        // Upload persistent triple-buffered GPU Multi-Material Slot Table Buffer when modified
+        if ((anyMaterialSlotTableModified || (inst.activeMaterialSlotBuffer == nullptr && !inst.cpuMaterialSlotTable.empty())) &&
+            !inst.cpuMaterialSlotTable.empty())
+        {
+            inst.materialSlotRingIndex = (inst.materialSlotRingIndex + 1u) % GPUSceneInstance::kSkinningRingCount;
+            const UINT32 mRingIdx = inst.materialSlotRingIndex;
+            const UINT32 mCount   = static_cast<UINT32>(inst.cpuMaterialSlotTable.size());
+            const UINT32 mReqCap  = ComputeTargetCapacity(inst.materialSlotRingCapacities[mRingIdx], (std::max)(mCount, 64u));
+
+            if (inst.materialSlotRingBuffers[mRingIdx] == nullptr)
+            {
+                GPUBufferDesc msDesc{};
+                msDesc.elementCount = mReqCap;
+                msDesc.stride       = sizeof(UINT32);
+                msDesc.usage        = GPUBufferUsage::STRUCTURED_SRV | GPUBufferUsage::CPU_READBACK;
+                msDesc.initialData  = nullptr;
+                msDesc.debugName    = "Northstar.GPUScene.MaterialSlotTableBuffer";
+                inst.materialSlotRingBuffers[mRingIdx]    = m_bufferManager->CreateGPUBuffer(msDesc);
+                inst.materialSlotRingCapacities[mRingIdx] = inst.materialSlotRingBuffers[mRingIdx] ? mReqCap : 0u;
+                inst.materialSlotRingDirty[mRingIdx]      = true;
+            }
+            else if (mReqCap > inst.materialSlotRingCapacities[mRingIdx])
+            {
+                if (m_bufferManager->ResizeGPUBuffer(inst.materialSlotRingBuffers[mRingIdx], mReqCap, nullptr))
+                {
+                    inst.materialSlotRingCapacities[mRingIdx] = mReqCap;
+                    inst.materialSlotRingDirty[mRingIdx]      = true;
+                }
+            }
+
+            if (inst.materialSlotRingBuffers[mRingIdx] != nullptr && inst.materialSlotRingDirty[mRingIdx])
+            {
+                m_bufferManager->UpdateGPUBuffer(
+                    inst.materialSlotRingBuffers[mRingIdx],
+                    inst.cpuMaterialSlotTable.data(),
+                    mCount * static_cast<UINT32>(sizeof(UINT32)),
+                    0u);
+                inst.materialSlotRingDirty[mRingIdx] = false;
+                inst.activeMaterialSlotBuffer        = inst.materialSlotRingBuffers[mRingIdx];
+            }
+        }
+        scene->m_gpuMaterialSlotTableBuffer = inst.activeMaterialSlotBuffer;
+        scene->m_gpuMaterialSlotTableCount  = static_cast<UINT32>(inst.cpuMaterialSlotTable.size());
 
         const auto tRecordBuildEnd = std::chrono::high_resolution_clock::now();
 
@@ -1465,6 +1984,10 @@ namespace Northstar
                 const GPUSceneUploadRange& r = inst.lastUploadRanges[rIdx];
                 for (UINT32 s = r.firstSlot; s < r.firstSlot + r.slotCount && s < inst.slots.size(); ++s)
                 {
+                    if (s < inst.gpuCommittedRecords.size() && inst.slots[s].occupied)
+                    {
+                        inst.slots[s].lastFrameWorldMatrix = inst.gpuCommittedRecords[s].worldMatrix;
+                    }
                     if (!inst.slots[s].queuedDirty)
                     {
                         inst.slots[s].queuedDirty = true;
@@ -1682,6 +2205,8 @@ namespace Northstar
             {
                 const SceneObjectLink* link = se.object->FindSceneLink(scene);
                 BuildObjectRecord(se.object, link, s, se.currentGeneration, inst->cpuRecords[s]);
+                inst->cpuRecords[s].skinningBoundsOffset = se.skinningBoundsSlot;
+                inst->cpuRecords[s].materialTableOffset  = (se.materialSlotCapacity > 1u) ? se.materialSlotOffset : 0u;
             }
             else
             {

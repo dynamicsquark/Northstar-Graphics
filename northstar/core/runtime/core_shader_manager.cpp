@@ -7,6 +7,60 @@
 
 namespace Northstar
 {
+    namespace
+    {
+        ShaderSpaceMask BuildShaderSpaceMaskFromReflection(const Shader& shader) noexcept
+        {
+            const ShaderReflection& refl = shader.GetReflection();
+            if (refl.nscVersion == 0)
+            {
+                return ShaderSpaceMask{};
+            }
+
+            ShaderSpaceMask mask{};
+            mask.cbvSrvMask  = (shader.GetStage() == ShaderStage::VERTEX) ? 0x0001u : 0x0000u;
+            mask.samplerMask = 0x0000u;
+            mask.uavMask     = 0x0000u;
+            mask.isExplicit  = true;
+
+            for (const auto& b : refl.buffers)
+            {
+                if (b.set < 16u) mask.cbvSrvMask = static_cast<UINT16>(mask.cbvSrvMask | (1u << b.set));
+            }
+            for (const auto& sb : refl.structuredBuffers)
+            {
+                if (refl.FindUAV(sb.name) != nullptr) continue;
+                if (sb.set < 16u) mask.cbvSrvMask = static_cast<UINT16>(mask.cbvSrvMask | (1u << sb.set));
+            }
+            for (const auto& t : refl.textures)
+            {
+                if (t.set < 16u) mask.cbvSrvMask = static_cast<UINT16>(mask.cbvSrvMask | (1u << t.set));
+            }
+            for (const auto& sm : refl.samplers)
+            {
+                if (sm.set < 16u) mask.samplerMask = static_cast<UINT16>(mask.samplerMask | (1u << sm.set));
+            }
+            for (const auto& uav : refl.uavBuffers)
+            {
+                if (uav.set < 16u) mask.uavMask = static_cast<UINT16>(mask.uavMask | (1u << uav.set));
+                for (const auto& f : uav.fields)
+                {
+                    if (f.set < 16u && f.binding != 0xFFFFu)
+                        mask.uavMask = static_cast<UINT16>(mask.uavMask | (1u << f.set));
+                }
+            }
+            return mask;
+        }
+
+        UINT32 SelectTargetShaderModel(const NorthstarBackend* backend) noexcept
+        {
+            if (!backend || backend->GetTargetAPI() != TargetAPI::HLSL12)
+                return 0x50u;
+            const BackendCapabilities caps = backend->GetCapabilities();
+            return (caps.maxShaderModel >= 0x66u && caps.supportsDXILRuntime) ? 0x66u : 0x51u;
+        }
+    }
+
     CoreShaderManager::~CoreShaderManager()
     {
         Shutdown();
@@ -21,10 +75,27 @@ namespace Northstar
 
         if (shader.GetNativeHandle() == 0)
         {
-            const BOOL isHLSL12Backend = (m_backend->GetTargetAPI() == TargetAPI::HLSL12);
+            const ShaderReflection& shaderRefl = shader.GetReflection();
+            if (m_backend->IsHardwareBackend())
+            {
+                const BackendCapabilities caps = m_backend->GetCapabilities();
+                if (shaderRefl.UsesInt64Atomic() && !caps.SupportsNVGRasterAtomic64())
+                {
+                    m_lastError = "CreateShader failed: shader requires Shader Model 6.6 DXIL, Int64ShaderOps, and 64-bit descriptor-heap atomics.";
+                    return false;
+                }
+                if (shaderRefl.UsesInt64() && !(caps.maxShaderModel >= 0x60u && caps.supportsDXILRuntime && caps.supportsInt64ShaderOps))
+                {
+                    m_lastError = "CreateShader failed: shader requires 64-bit integer shader operations (Int64ShaderOps + DXIL).";
+                    return false;
+                }
+            }
+
+            const BOOL   isHLSL12Backend = (m_backend->GetTargetAPI() == TargetAPI::HLSL12);
+            const UINT32 targetSM        = SelectTargetShaderModel(m_backend);
             if (!shader.HasBytecode() && shader.HasSourceCode() && isHLSL12Backend)
             {
-                ShaderLoader::TryPopulateCachedDXBC(shader);
+                ShaderLoader::TryPopulateCachedDXBC(shader, targetSM);
             }
 
             if (shader.HasBytecode())
@@ -50,7 +121,7 @@ namespace Northstar
                     std::vector<BYTE> compiledDxbc;
                     if (m_backend->GetShaderCompiledBytecode(h, compiledDxbc) && !compiledDxbc.empty())
                     {
-                        ShaderLoader::StoreCachedDXBC(shader, compiledDxbc.data(), compiledDxbc.size());
+                        ShaderLoader::StoreCachedDXBC(shader, compiledDxbc.data(), compiledDxbc.size(), targetSM);
                     }
                 }
             }
@@ -63,9 +134,17 @@ namespace Northstar
             }
         }
 
-        if (shader.GetNativeHandle() != 0 && !shader.GetInputLayout().empty())
+        if (shader.GetNativeHandle() != 0)
         {
-            m_backend->SetShaderInputLayout(shader.GetNativeHandle(), shader.GetInputLayout());
+            if (!shader.GetInputLayout().empty())
+            {
+                m_backend->SetShaderInputLayout(shader.GetNativeHandle(), shader.GetInputLayout());
+            }
+            const ShaderSpaceMask spaceMask = BuildShaderSpaceMaskFromReflection(shader);
+            if (spaceMask.isExplicit)
+            {
+                m_backend->SetShaderReflectionSpaces(shader.GetNativeHandle(), spaceMask);
+            }
         }
         return true;
     }
@@ -87,12 +166,6 @@ namespace Northstar
         else if (!desc.name.empty())
         {
             shader->SetName(desc.name);
-        }
-
-        if (!m_backend && !shader->HasBytecode() && shader->HasSourceCode() &&
-            shader->GetReflection().api == TargetAPI::HLSL12)
-        {
-            ShaderLoader::TryPopulateCachedDXBC(*shader);
         }
 
         if (m_backend)
@@ -165,18 +238,37 @@ namespace Northstar
             return nullptr;
         }
 
-        const BOOL hasAnyGraphics =
+        const BOOL hasAnyVertex =
             (desc.vertexShader != nullptr) ||
             (desc.instancedVertexShader != nullptr) ||
             (desc.skinnedVertexShader != nullptr) ||
-            (desc.instancedSkinnedVertexShader != nullptr) ||
+            (desc.instancedSkinnedVertexShader != nullptr);
+
+        const BOOL hasAnyGraphics =
+            hasAnyVertex ||
             (desc.hullShader != nullptr) ||
             (desc.domainShader != nullptr) ||
             (desc.geometryShader != nullptr) ||
             (desc.pixelShader != nullptr);
+
+        if (!hasAnyGraphics && desc.computeShader == nullptr)
+        {
+            m_lastError = "CreateShaderSet failed: empty ShaderSetDesc contains no shader stages.";
+            return nullptr;
+        }
         if (hasAnyGraphics && desc.computeShader != nullptr)
         {
             m_lastError = "CreateShaderSet failed: cannot mix graphics stages and computeShader in the same ShaderSet.";
+            return nullptr;
+        }
+        if (hasAnyGraphics && !hasAnyVertex)
+        {
+            m_lastError = "CreateShaderSet failed: graphics ShaderSet requires at least one vertex shader variant.";
+            return nullptr;
+        }
+        if ((desc.hullShader != nullptr) != (desc.domainShader != nullptr))
+        {
+            m_lastError = "CreateShaderSet failed: tessellation requires both hullShader and domainShader.";
             return nullptr;
         }
 

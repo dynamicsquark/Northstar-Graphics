@@ -26,9 +26,9 @@ namespace Northstar
 
     // Engine semantic version
     inline constexpr UINT32      VERSION_MAJOR  = 0;
-    inline constexpr UINT32      VERSION_MINOR  = 6;
+    inline constexpr UINT32      VERSION_MINOR  = 7;
     inline constexpr UINT32      VERSION_PATCH  = 0;
-    inline constexpr const char* VERSION_STRING = "0.6.0";
+    inline constexpr const char* VERSION_STRING = "0.7.0";
 
     // Hardware backend selection for RuntimeSession
     enum class BackendAPI : UINT8

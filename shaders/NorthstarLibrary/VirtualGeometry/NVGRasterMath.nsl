@@ -1,0 +1,296 @@
+// =====================================================================
+//  NVGRasterMath.nsl — NorthstarLibrary Shared Software Rasterizer Math
+//  Clean-room, backend-neutral NSL mathematical helpers shared between
+//  Northstar's camera micropolygon rasterizer and NVS shadow page
+//  micropolygon rasterizer:
+//    - Gershgorin-Frobenius 3x3 singular-value upper bound (>= sigma_max)
+//      with non-finite / overflow detection (exact for orthogonal/mirrored
+//      non-uniform scale, strictly conservative for arbitrary 3D shear).
+//    - Homogeneous 5-plane Sutherland-Hodgman frustum & guard-band clipper
+//      (w >= wNear + tight 8-pixel X/Y guard-band).
+//    - Exact D3D12 16.8 subpixel quantization, 48-bit split area sign,
+//      and pre-commit overflow/span validator.
+// =====================================================================
+
+// Returns a guaranteed upper bound on sigma_max(M_3x3) for any finite 3x3
+// linear submatrix of wm, or -1.0 if any entry is non-finite or exceeds 1e12.
+Float NVGComputeMaxWorldScaleUpperBound(Mat4 wm) {
+    Vec3 c0 = Mul(wm, Vec4(1.0, 0.0, 0.0, 0.0)).xyz;
+    Vec3 c1 = Mul(wm, Vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+    Vec3 c2 = Mul(wm, Vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+    Vec3 tr = Mul(wm, Vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+
+    Float g00     = Dot(c0, c0);
+    Float g11     = Dot(c1, c1);
+    Float g22     = Dot(c2, c2);
+    Float traceSq = g00 + g11 + g22;
+    Float trLenSq = Dot(tr, tr);
+    if (!IsFinite(traceSq) || !IsFinite(trLenSq) || traceSq < 0.0 || traceSq > 1.0e24 || trLenSq > 1.0e24) {
+        return -1.0;
+    }
+
+    Float g01 = Abs(Dot(c0, c1));
+    Float g02 = Abs(Dot(c0, c2));
+    Float g12 = Abs(Dot(c1, c2));
+    Float r0  = g00 + g01 + g02;
+    Float r1  = g11 + g01 + g12;
+    Float r2  = g22 + g02 + g12;
+    Float boundSq = Min(traceSq, Max(r0, Max(r1, r2)));
+    if (!IsFinite(boundSq) || boundSq > 1.0e24) {
+        return -1.0;
+    }
+    return Sqrt(Max(boundSq, 0.0));
+}
+
+// Clips homogeneous triangle (c0, c1, c2) against:
+//   1) w >= max(wNear, minNearEps) (for perspective projections, or w <= 1e-6 safety)
+//   2) Tight homogeneous X/Y guard-band [-gX * w .. +gX * w], [-gY * w .. +gY * w]
+//      where gX = 1 + 16/vpW, gY = 1 + 16/vpH (8 pixels outside viewport),
+//      preventing 16.8 subpixel INT32 overflow on near-plane-straddling triangles
+//      while leaving interior viewport edges 100% untouched on the fast path.
+// Emits 0 or 3..8 vertices into p0..p7 (convex fan: (p0, p[k], p[k+1])).
+UInt NVGClipPolygonHomogeneous(
+    Vec4      c0,
+    Vec4      c1,
+    Vec4      c2,
+    UInt      vpW,
+    UInt      vpH,
+    Float     wNear,
+    Float     minNearEps,
+    Bool      isOrtho,
+    out Vec4  p0,
+    out Vec4  p1,
+    out Vec4  p2,
+    out Vec4  p3,
+    out Vec4  p4,
+    out Vec4  p5,
+    out Vec4  p6,
+    out Vec4  p7)
+{
+    p0 = c0; p1 = c1; p2 = c2; p3 = c2;
+    p4 = c2; p5 = c2; p6 = c2; p7 = c2;
+
+    Float fW      = Max(Float(vpW), 1.0);
+    Float fH      = Max(Float(vpH), 1.0);
+    Float gX      = 1.0 + (16.0 / fW);
+    Float gY      = 1.0 + (16.0 / fH);
+    Float effNear = Max(wNear, minNearEps);
+
+    Bool needNear = (!isOrtho) || (c0.w <= 1.0e-5) || (c1.w <= 1.0e-5) || (c2.w <= 1.0e-5);
+    if (needNear) {
+        if (c0.w < effNear && c1.w < effNear && c2.w < effNear) {
+            return 0u;
+        }
+    }
+
+    Bool wOk = (!needNear) || (c0.w >= effNear && c1.w >= effNear && c2.w >= effNear);
+    if (wOk) {
+        // Trivial X/Y frustum reject when all 3 vertices have positive w and lie outside one guard-band plane
+        if ((c0.x < -gX * c0.w && c1.x < -gX * c1.w && c2.x < -gX * c2.w) ||
+            (c0.x >  gX * c0.w && c1.x >  gX * c1.w && c2.x >  gX * c2.w) ||
+            (c0.y < -gY * c0.w && c1.y < -gY * c1.w && c2.y < -gY * c2.w) ||
+            (c0.y >  gY * c0.w && c1.y >  gY * c1.w && c2.y >  gY * c2.w)) {
+            return 0u;
+        }
+        // Fast path: all 3 vertices already lie inside the homogeneous guard-band -> zero clipping
+        if (Abs(c0.x) <= gX * c0.w && Abs(c1.x) <= gX * c1.w && Abs(c2.x) <= gX * c2.w &&
+            Abs(c0.y) <= gY * c0.w && Abs(c1.y) <= gY * c1.w && Abs(c2.y) <= gY * c2.w) {
+            return 3u;
+        }
+    }
+
+    Vec4 vA[8];
+    Vec4 vB[8];
+    for (UInt k = 0u; k < 8u; k = k + 1u) {
+        vA[k] = c0;
+        vB[k] = c0;
+    }
+    vA[0] = c0; vA[1] = c1; vA[2] = c2;
+    UInt cnt = 3u;
+
+    // Stage 0: Near plane w >= effNear
+    if (needNear) {
+        UInt outCnt = 0u;
+        for (UInt i = 0u; i < cnt; i = i + 1u) {
+            UInt j  = (i + 1u == cnt) ? 0u : (i + 1u);
+            Vec4 va = vA[i];
+            Vec4 vb = vA[j];
+            Float da = va.w - effNear;
+            Float db = vb.w - effNear;
+            Bool  ia = (da >= 0.0);
+            Bool  ib = (db >= 0.0);
+            if (ia && outCnt < 8u) {
+                vB[outCnt] = va;
+                outCnt = outCnt + 1u;
+            }
+            if (ia != ib && outCnt < 8u) {
+                Float denom = da - db;
+                Float t     = (Abs(denom) > 1.0e-12) ? Saturate(da / denom) : 0.0;
+                vB[outCnt] = Vec4(
+                    va.x + (vb.x - va.x) * t,
+                    va.y + (vb.y - va.y) * t,
+                    va.z + (vb.z - va.z) * t,
+                    effNear);
+                outCnt = outCnt + 1u;
+            }
+        }
+        cnt = outCnt;
+        if (cnt < 3u) { return 0u; }
+        for (UInt c = 0u; c < cnt; c = c + 1u) { vA[c] = vB[c]; }
+    }
+
+    // Stages 1..4: Left (x + gX*w >= 0), Right (gX*w - x >= 0), Bottom (y + gY*w >= 0), Top (gY*w - y >= 0)
+    for (UInt plane = 0u; plane < 4u; plane = plane + 1u) {
+        UInt outCnt = 0u;
+        for (UInt i = 0u; i < cnt; i = i + 1u) {
+            UInt j  = (i + 1u == cnt) ? 0u : (i + 1u);
+            Vec4 va = vA[i];
+            Vec4 vb = vA[j];
+            Float da = 0.0;
+            Float db = 0.0;
+            if (plane == 0u)      { da = va.x + gX * va.w; db = vb.x + gX * vb.w; }
+            else if (plane == 1u) { da = gX * va.w - va.x; db = gX * vb.w - vb.x; }
+            else if (plane == 2u) { da = va.y + gY * va.w; db = vb.y + gY * vb.w; }
+            else                  { da = gY * va.w - va.y; db = gY * vb.w - vb.y; }
+
+            Bool ia = (da >= 0.0);
+            Bool ib = (db >= 0.0);
+            if (ia && outCnt < 8u) {
+                vB[outCnt] = va;
+                outCnt = outCnt + 1u;
+            }
+            if (ia != ib && outCnt < 8u) {
+                Float denom = da - db;
+                Float t     = (Abs(denom) > 1.0e-12) ? Saturate(da / denom) : 0.0;
+                vB[outCnt] = va + (vb - va) * t;
+                outCnt = outCnt + 1u;
+            }
+        }
+        cnt = outCnt;
+        if (cnt < 3u) { return 0u; }
+        for (UInt c = 0u; c < cnt; c = c + 1u) { vA[c] = vB[c]; }
+    }
+
+    p0 = vA[0]; p1 = vA[1]; p2 = vA[2]; p3 = vA[3];
+    p4 = vA[4]; p5 = vA[5]; p6 = vA[6]; p7 = vA[7];
+    return cnt;
+}
+
+// Exact 48-bit signed 2x area decomposition for 16.8 subpixel directed edges:
+//   returns +1 for CW front-facing (Area > 0), -1 for CCW back-facing (Area < 0), 0 for degenerate (Area == 0).
+Int NVGComputeSubpixelAreaSign16_8(Int e01x, Int e01y, Int e12x, Int e12y) {
+    Int q01x = e01x >> 8; Int r01x = e01x & 255;
+    Int q01y = e01y >> 8; Int r01y = e01y & 255;
+    Int q12x = e12x >> 8; Int r12x = e12x & 255;
+    Int q12y = e12y >> 8; Int r12y = e12y & 255;
+
+    Int rTerm = r01x * r12y - r01y * r12x;
+    Int mTerm = (q01x * r12y + r01x * q12y - q01y * r12x - r01y * q12x) + (rTerm >> 8);
+    Int qTerm = (q01x * q12y - q01y * q12x) + (mTerm >> 8);
+    if (qTerm > 0) { return 1; }
+    if (qTerm < 0) { return -1; }
+    Int rem16 = ((mTerm & 255) << 8) | (rTerm & 255);
+    return (rem16 > 0) ? 1 : 0;
+}
+
+// Validates whether a clipped sub-triangle stays within safe 16.8 subpixel
+// INT32 limits and within maxAllowedSpanPx along both viewport axes.
+// Returns true iff the cluster MUST abort SW rasterization and fall back to HW!
+Bool NVGSubTriangleRequiresHWFallback16_8(
+    Vec4 p0,
+    Vec4 p1,
+    Vec4 p2,
+    UInt vpW,
+    UInt vpH,
+    UInt cullMode,
+    Int  maxAllowedSpanPx)
+{
+    if (p0.w <= 0.0 || p1.w <= 0.0 || p2.w <= 0.0) {
+        return true;
+    }
+    Float invW0 = 1.0 / p0.w;
+    Float invW1 = 1.0 / p1.w;
+    Float invW2 = 1.0 / p2.w;
+    if (!IsFinite(invW0) || !IsFinite(invW1) || !IsFinite(invW2)) {
+        return true;
+    }
+
+    Float fW     = Float(vpW);
+    Float fH     = Float(vpH);
+    Float scaleX =  0.5 * fW * 256.0;
+    Float scaleY = -0.5 * fH * 256.0;
+    Float biasX  =  0.5 * fW * 256.0 + 0.5;
+    Float biasY  =  0.5 * fH * 256.0 + 0.5;
+
+    Float raw0x = (p0.x * invW0) * scaleX + biasX;
+    Float raw0y = (p0.y * invW0) * scaleY + biasY;
+    Float raw1x = (p1.x * invW1) * scaleX + biasX;
+    Float raw1y = (p1.y * invW1) * scaleY + biasY;
+    Float raw2x = (p2.x * invW2) * scaleX + biasX;
+    Float raw2y = (p2.y * invW2) * scaleY + biasY;
+    if (!IsFinite(raw0x) || !IsFinite(raw0y) ||
+        !IsFinite(raw1x) || !IsFinite(raw1y) ||
+        !IsFinite(raw2x) || !IsFinite(raw2y)) {
+        return true;
+    }
+
+    Float fv0x = Floor(raw0x);
+    Float fv0y = Floor(raw0y);
+    Float fv1x = Floor(raw1x);
+    Float fv1y = Floor(raw1y);
+    Float fv2x = Floor(raw2x);
+    Float fv2y = Floor(raw2y);
+
+    Float maxSubW = fW * 256.0;
+    Float maxSubH = fH * 256.0;
+    if (Max(fv0x, Max(fv1x, fv2x)) < 128.0 || Min(fv0x, Min(fv1x, fv2x)) > (maxSubW - 128.0) ||
+        Max(fv0y, Max(fv1y, fv2y)) < 128.0 || Min(fv0y, Min(fv1y, fv2y)) > (maxSubH - 128.0)) {
+        return false;
+    }
+
+    if (!(Abs(fv0x) <= 1048576.0 && Abs(fv0y) <= 1048576.0 &&
+          Abs(fv1x) <= 1048576.0 && Abs(fv1y) <= 1048576.0 &&
+          Abs(fv2x) <= 1048576.0 && Abs(fv2y) <= 1048576.0)) {
+        return true;
+    }
+
+    Int v0x = Int(fv0x); Int v0y = Int(fv0y);
+    Int v1x = Int(fv1x); Int v1y = Int(fv1y);
+    Int v2x = Int(fv2x); Int v2y = Int(fv2y);
+
+    Int e01x = v1x - v0x; Int e01y = v1y - v0y;
+    Int e12x = v2x - v1x; Int e12y = v2y - v1y;
+    if (Abs(e01x) > 360000 || Abs(e01y) > 360000 ||
+        Abs(e12x) > 360000 || Abs(e12y) > 360000 ||
+        Abs(v0x - v2x) > 360000 || Abs(v0y - v2y) > 360000) {
+        return true;
+    }
+
+    Int areaSign = NVGComputeSubpixelAreaSign16_8(e01x, e01y, e12x, e12y);
+    if (areaSign == 0) {
+        return false;
+    }
+    Bool areaNeg = (areaSign < 0);
+    if ((cullMode == 2u && areaNeg) || (cullMode == 1u && !areaNeg)) {
+        return false;
+    }
+
+    Int minVx = Min(v0x, Min(v1x, v2x));
+    Int minVy = Min(v0y, Min(v1y, v2y));
+    Int maxVx = Max(v0x, Max(v1x, v2x));
+    Int maxVy = Max(v0y, Max(v1y, v2y));
+
+    Int minPxX = Max((minVx + 127) >> 8, 0);
+    Int minPxY = Max((minVy + 127) >> 8, 0);
+    Int maxPxX = Min((maxVx - 128) >> 8, Int(vpW) - 1);
+    Int maxPxY = Min((maxVy - 128) >> 8, Int(vpH) - 1);
+    if (minPxX > maxPxX || minPxY > maxPxY) {
+        return false;
+    }
+
+    if ((maxPxX - minPxX + 1) > maxAllowedSpanPx ||
+        (maxPxY - minPxY + 1) > maxAllowedSpanPx) {
+        return true;
+    }
+    return false;
+}

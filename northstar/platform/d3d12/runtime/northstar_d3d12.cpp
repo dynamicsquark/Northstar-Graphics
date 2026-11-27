@@ -59,10 +59,8 @@ namespace Northstar
         static constexpr UINT32 kUAVPerSpace               = D3D12Pipeline::kUAVPerSpace;               // 16
         static constexpr UINT32 kGraphicsDescPerSpace      = kCBVPerSpace + kSRVPerSpace;               // 48
         static constexpr UINT32 kDescriptorsPerSpaceTable  = D3D12Pipeline::kDescriptorsPerSpaceTable;  // 64
-        static constexpr UINT32 kMaxSpaces                 = D3D12Pipeline::kMaxSpaces;                 // 4
-        static constexpr UINT32 kGraphicsSamplerParamBase  = D3D12Pipeline::kGraphicsSamplerParamBase;  // 8
-        static constexpr UINT32 kComputeSamplerParamBase   = D3D12Pipeline::kComputeSamplerParamBase;   // 4
-        static constexpr UINT32 kComputeRootConstantsParam = D3D12Pipeline::kComputeRootConstantsParamIndex; // 8
+        static constexpr UINT32 kMaxSpaces                 = D3D12Pipeline::kMaxSpaces;                 // 16
+        static constexpr UINT32 kMaxRootParams             = D3D12Pipeline::kMaxRootParameters;         // 64
         static constexpr UINT32 kTablesPerBackBuffer       = 6144;
         static constexpr UINT32 kRingDescriptorsPerBB      = 4608 * kDescriptorsPerSpaceTable; // 294912 (3 * 294912 = 884736 < 1000000)
         UINT32 dynamicTableBase[kMaxFramesInFlight] = { UINT32_MAX, UINT32_MAX, UINT32_MAX };
@@ -249,7 +247,10 @@ namespace Northstar
             FULL_FRAME          = 11,
             NVG_HZB             = 12,
             NVG_CULL_LOD        = 13,
-            NVG_DRAW_GEN        = 14
+            NVG_DRAW_GEN        = 14,
+            NVG_SW_RASTER       = 15,
+            NVG_SW_RASTER_PASS1 = 16,
+            NVG_SW_RASTER_PASS2 = 17
         };
 
         struct TimestampSpanRecord
@@ -391,6 +392,18 @@ namespace Northstar
             {
                 return TimestampSpanKind::NVG_DRAW_GEN;
             }
+            if (group == ComputeDispatchProfileGroup::NVG_SW_RASTER)
+            {
+                return TimestampSpanKind::NVG_SW_RASTER;
+            }
+            if (group == ComputeDispatchProfileGroup::NVG_SW_RASTER_PASS1)
+            {
+                return TimestampSpanKind::NVG_SW_RASTER_PASS1;
+            }
+            if (group == ComputeDispatchProfileGroup::NVG_SW_RASTER_PASS2)
+            {
+                return TimestampSpanKind::NVG_SW_RASTER_PASS2;
+            }
             return genericKind;
         }
 
@@ -450,12 +463,15 @@ namespace Northstar
                 FLOAT32 feedbackMs     = 0.0f;
                 FLOAT32 residencyMs    = 0.0f;
                 FLOAT32 nvgHzbMs       = 0.0f;
-                FLOAT32 nvgCullLodMs   = 0.0f;
-                FLOAT32 nvgDrawGenMs   = 0.0f;
-                FLOAT32 interCompMs    = 0.0f;
-                FLOAT32 postCompMs     = 0.0f;
-                FLOAT32 mainSpanMs     = 0.0f;
-                FLOAT32 fullFrameMs    = 0.0f;
+                FLOAT32 nvgCullLodMs      = 0.0f;
+                FLOAT32 nvgDrawGenMs      = 0.0f;
+                FLOAT32 nvgSwRasterMs     = 0.0f;
+                FLOAT32 nvgSwRasterPass1Ms= 0.0f;
+                FLOAT32 nvgSwRasterPass2Ms= 0.0f;
+                FLOAT32 interCompMs       = 0.0f;
+                FLOAT32 postCompMs        = 0.0f;
+                FLOAT32 mainSpanMs        = 0.0f;
+                FLOAT32 fullFrameMs       = 0.0f;
 
                 const UINT32 spanN = (std::min)(flags.spanCount, kMaxSpansPerBackBuffer);
                 for (UINT32 i = 0; i < spanN; ++i)
@@ -464,34 +480,41 @@ namespace Northstar
                     const FLOAT32 d = deltaMs(sp.startIdx, sp.endIdx);
                     switch (sp.kind)
                     {
-                    case TimestampSpanKind::UPLOAD:              uploadMs       += d; break;
-                    case TimestampSpanKind::PRE_COMPUTE:         preCompMs      += d; break;
-                    case TimestampSpanKind::PRE_LAYERED_DEPTH:   preLayeredMs   += d; break;
-                    case TimestampSpanKind::INTER_LAYERED_DEPTH: interLayeredMs += d; break;
-                    case TimestampSpanKind::SHADOW_RASTER:       shadowRasterMs += d; break;
-                    case TimestampSpanKind::DEPTH_PREPASS:       depthPreMs     += d; break;
-                    case TimestampSpanKind::NVS_FEEDBACK:        feedbackMs     += d; break;
-                    case TimestampSpanKind::NVS_RESIDENCY_CULL:  residencyMs    += d; break;
-                    case TimestampSpanKind::NVG_HZB:             nvgHzbMs       += d; break;
-                    case TimestampSpanKind::NVG_CULL_LOD:        nvgCullLodMs   += d; break;
-                    case TimestampSpanKind::NVG_DRAW_GEN:        nvgDrawGenMs   += d; break;
-                    case TimestampSpanKind::INTER_COMPUTE:       interCompMs    += d; break;
-                    case TimestampSpanKind::POST_COMPUTE:        postCompMs     += d; break;
-                    case TimestampSpanKind::MAIN_SPAN:           mainSpanMs     += d; break;
-                    case TimestampSpanKind::FULL_FRAME:          fullFrameMs    += d; break;
+                    case TimestampSpanKind::UPLOAD:              uploadMs           += d; break;
+                    case TimestampSpanKind::PRE_COMPUTE:         preCompMs          += d; break;
+                    case TimestampSpanKind::PRE_LAYERED_DEPTH:   preLayeredMs       += d; break;
+                    case TimestampSpanKind::INTER_LAYERED_DEPTH: interLayeredMs     += d; break;
+                    case TimestampSpanKind::SHADOW_RASTER:       shadowRasterMs     += d; break;
+                    case TimestampSpanKind::DEPTH_PREPASS:       depthPreMs         += d; break;
+                    case TimestampSpanKind::NVS_FEEDBACK:        feedbackMs         += d; break;
+                    case TimestampSpanKind::NVS_RESIDENCY_CULL:  residencyMs        += d; break;
+                    case TimestampSpanKind::NVG_HZB:             nvgHzbMs           += d; break;
+                    case TimestampSpanKind::NVG_CULL_LOD:        nvgCullLodMs       += d; break;
+                    case TimestampSpanKind::NVG_DRAW_GEN:        nvgDrawGenMs       += d; break;
+                    case TimestampSpanKind::NVG_SW_RASTER:       nvgSwRasterMs      += d; break;
+                    case TimestampSpanKind::NVG_SW_RASTER_PASS1: nvgSwRasterPass1Ms += d; break;
+                    case TimestampSpanKind::NVG_SW_RASTER_PASS2: nvgSwRasterPass2Ms += d; break;
+                    case TimestampSpanKind::INTER_COMPUTE:       interCompMs        += d; break;
+                    case TimestampSpanKind::POST_COMPUTE:        postCompMs         += d; break;
+                    case TimestampSpanKind::MAIN_SPAN:           mainSpanMs         += d; break;
+                    case TimestampSpanKind::FULL_FRAME:          fullFrameMs        += d; break;
                     }
                 }
 
+                nvgSwRasterMs += nvgSwRasterPass1Ms + nvgSwRasterPass2Ms;
                 const FLOAT32 layeredMs   = preLayeredMs + interLayeredMs;
-                const FLOAT32 totalCompMs = preCompMs + feedbackMs + residencyMs + nvgHzbMs + nvgCullLodMs + nvgDrawGenMs + interCompMs + postCompMs;
+                const FLOAT32 totalCompMs = preCompMs + feedbackMs + residencyMs + nvgHzbMs + nvgCullLodMs + nvgDrawGenMs + nvgSwRasterMs + interCompMs + postCompMs;
 
-                lastFrameMetrics.gpuSceneUploadMs      = uploadMs;
-                lastFrameMetrics.gpuComputePassMs      = totalCompMs;
-                lastFrameMetrics.gpuNVSFeedbackMs      = feedbackMs;
-                lastFrameMetrics.gpuNVSResidencyCullMs = residencyMs;
-                lastFrameMetrics.gpuNVGHZBMs           = nvgHzbMs;
-                lastFrameMetrics.gpuNVGCullLodMs       = nvgCullLodMs;
-                lastFrameMetrics.gpuNVGDrawGenMs       = nvgDrawGenMs;
+                lastFrameMetrics.gpuSceneUploadMs         = uploadMs;
+                lastFrameMetrics.gpuComputePassMs         = totalCompMs;
+                lastFrameMetrics.gpuNVSFeedbackMs         = feedbackMs;
+                lastFrameMetrics.gpuNVSResidencyCullMs    = residencyMs;
+                lastFrameMetrics.gpuNVGHZBMs              = nvgHzbMs;
+                lastFrameMetrics.gpuNVGCullLodMs          = nvgCullLodMs;
+                lastFrameMetrics.gpuNVGDrawGenMs          = nvgDrawGenMs;
+                lastFrameMetrics.gpuNVGSWRasterMs         = nvgSwRasterMs;
+                lastFrameMetrics.gpuNVGSWRasterPass1Ms    = nvgSwRasterPass1Ms;
+                lastFrameMetrics.gpuNVGSWRasterPass2Ms    = nvgSwRasterPass2Ms;
                 lastFrameMetrics.gpuLayeredDepthPassMs = layeredMs;
                 lastFrameMetrics.gpuDepthPrepassMs     = depthPreMs;
 
@@ -511,7 +534,7 @@ namespace Northstar
                 {
                     lastFrameMetrics.gpuShadowPassMs = shadowRasterMs;
                     const FLOAT32 subPasses =
-                        depthPreMs + feedbackMs + residencyMs + nvgHzbMs + nvgCullLodMs + nvgDrawGenMs + interCompMs + interLayeredMs + shadowRasterMs;
+                        depthPreMs + feedbackMs + residencyMs + nvgHzbMs + nvgCullLodMs + nvgDrawGenMs + nvgSwRasterMs + interCompMs + interLayeredMs + shadowRasterMs;
                     lastFrameMetrics.gpuGeometryPassMs = (mainSpanMs > subPasses) ? (mainSpanMs - subPasses) : 0.0f;
                     lastFrameMetrics.gpuTotalFrameMs   = fullFrameMs;
                 }
@@ -650,6 +673,7 @@ namespace Northstar
             UINT32& currentTableOffset,
             UINT32& tablesUsedThisFrame,
             BOOL& isComputeRootSigActive,
+            const ComputeRootLayout*& currentComputeLayout,
             ID3D12PipelineState*& currentComputePSO,
             UINT32 currentComputeRootTable[kMaxSpaces],
             UINT32 currentComputeSamplerTable[kMaxSpaces])
@@ -692,8 +716,12 @@ namespace Northstar
                 return false;
             }
 
-            ID3D12PipelineState* csPso = pipeline.GetOrCreateComputePSO(device, resourceMgr, cmd.computeShader);
-            if (!csPso)
+            const BackendCapabilities& activeCaps = deviceContext.GetCapabilities();
+            const ComputeRootLayout* csLayout = pipeline.GetOrCreateComputeRootLayout(device, resourceMgr, cmd.computeShader);
+            ID3D12PipelineState* csPso        = csLayout
+                ? pipeline.GetOrCreateComputePSO(device, resourceMgr, cmd.computeShader, &activeCaps)
+                : nullptr;
+            if (!csLayout || !csPso)
             {
                 if (indirectArgBuf) lastFrameMetrics.indirectCommandsRejected++;
                 return false;
@@ -908,17 +936,24 @@ namespace Northstar
 
             stateTracker.FlushBarriers(frameCmdList.Get());
 
-            // 3. Bind Compute Root Signature & Safe Fallback Tables if not already active
-            if (!isComputeRootSigActive)
+            // 3. Bind Compute Root Signature & Safe Fallback Tables if not already active or if space layout changed
+            if (!isComputeRootSigActive || currentComputeLayout != csLayout)
             {
-                frameCmdList->SetComputeRootSignature(pipeline.GetComputeRootSignature());
+                frameCmdList->SetComputeRootSignature(csLayout->rootSignature.Get());
                 if (defaultDummySpaceTableIndex != UINT32_MAX)
                 {
                     D3D12_GPU_DESCRIPTOR_HANDLE dummySpaceGPU = cbvSrvUavPool.GetGPUHandle(defaultDummySpaceTableIndex);
                     for (UINT32 s = 0; s < kMaxSpaces; ++s)
                     {
-                        frameCmdList->SetComputeRootDescriptorTable(s, dummySpaceGPU);
-                        currentComputeRootTable[s] = defaultDummySpaceTableIndex;
+                        if (csLayout->spaceParam[s] >= 0)
+                        {
+                            frameCmdList->SetComputeRootDescriptorTable(static_cast<UINT32>(csLayout->spaceParam[s]), dummySpaceGPU);
+                            currentComputeRootTable[s] = defaultDummySpaceTableIndex;
+                        }
+                        else
+                        {
+                            currentComputeRootTable[s] = UINT32_MAX;
+                        }
                     }
                 }
                 if (defaultDummySamplerTableIndex != UINT32_MAX)
@@ -926,11 +961,19 @@ namespace Northstar
                     D3D12_GPU_DESCRIPTOR_HANDLE dummySampGPU = samplerPool.GetGPUHandle(defaultDummySamplerTableIndex);
                     for (UINT32 s = 0; s < kMaxSpaces; ++s)
                     {
-                        frameCmdList->SetComputeRootDescriptorTable(kComputeSamplerParamBase + s, dummySampGPU);
-                        currentComputeSamplerTable[s] = defaultDummySamplerTableIndex;
+                        if (csLayout->samplerParam[s] >= 0)
+                        {
+                            frameCmdList->SetComputeRootDescriptorTable(static_cast<UINT32>(csLayout->samplerParam[s]), dummySampGPU);
+                            currentComputeSamplerTable[s] = defaultDummySamplerTableIndex;
+                        }
+                        else
+                        {
+                            currentComputeSamplerTable[s] = UINT32_MAX;
+                        }
                     }
                 }
                 isComputeRootSigActive = true;
+                currentComputeLayout   = csLayout;
             }
 
             if (csPso != currentComputePSO)
@@ -939,9 +982,12 @@ namespace Northstar
                 currentComputePSO = csPso;
             }
 
-            // 4. Populate 64-Descriptor Space Tables (CBV b0..b15, SRV t0..t31, UAV u0..u15) for active spaces 0..3
+            // 4. Populate 64-Descriptor Space Tables (CBV b0..b15, SRV t0..t31, UAV u0..u15) for active spaces 0..15
             for (UINT32 space = 0; space < kMaxSpaces; ++space)
             {
+                const INT16 spaceParamIdx = csLayout->spaceParam[space];
+                if (spaceParamIdx < 0) continue;
+
                 BOOL isActive = false;
                 for (SIZE_T b = 0; b < cmd.constantBuffers.size(); ++b)
                 {
@@ -1230,29 +1276,32 @@ namespace Northstar
 
                 if (currentComputeRootTable[space] != tableStart)
                 {
-                    frameCmdList->SetComputeRootDescriptorTable(space, cbvSrvUavPool.GetGPUHandle(tableStart));
+                    frameCmdList->SetComputeRootDescriptorTable(static_cast<UINT32>(spaceParamIdx), cbvSrvUavPool.GetGPUHandle(tableStart));
                     currentComputeRootTable[space] = tableStart;
                 }
             }
 
-            // 5. Populate Multi-Space Samplers (Params 4..7 -> s0..s15, space0..space3)
+            // 5. Populate Multi-Space Samplers (s0..s15, space0..space15)
             for (UINT32 space = 0; space < kMaxSpaces; ++space)
             {
+                const INT16 sampParamIdx = csLayout->samplerParam[space];
+                if (sampParamIdx < 0) continue;
                 const UINT32 targetSamplerTable = GetOrCreateSamplerTable(device, cmd.samplers, space, ShaderStage::COMPUTE);
                 if (targetSamplerTable != UINT32_MAX && targetSamplerTable != currentComputeSamplerTable[space])
                 {
                     frameCmdList->SetComputeRootDescriptorTable(
-                        kComputeSamplerParamBase + space,
+                        static_cast<UINT32>(sampParamIdx),
                         samplerPool.GetGPUHandle(targetSamplerTable)
                     );
                     currentComputeSamplerTable[space] = targetSamplerTable;
                 }
             }
 
-            // 6. Bind Compute Root Constants (Param 8 -> b0, space4, 4 DWORDs)
-            if (cmd.useRootConstants)
+            // 6. Bind Compute Root Constants (b0, space16, 4 DWORDs)
+            if (cmd.useRootConstants && csLayout->rootConstantsParam >= 0)
             {
-                frameCmdList->SetComputeRoot32BitConstants(kComputeRootConstantsParam, 4, cmd.rootConstants, 0);
+                frameCmdList->SetComputeRoot32BitConstants(
+                    static_cast<UINT32>(csLayout->rootConstantsParam), 4, cmd.rootConstants, 0);
             }
 
             // 7. Dispatch Thread Groups (Direct or GPU-Driven DispatchIndirect)
@@ -1278,86 +1327,80 @@ namespace Northstar
         BOOL forceLayeredDepthFallback = false;
         BOOL loggedLayeredDepthFallbackOnce = false;
 
-        void BindGraphicsRootSigAndFallbacks(ID3D12RootSignature* targetRootSig = nullptr)
+        void BindGraphicsRootSigAndFallbacks(const GraphicsRootLayout* targetLayout = nullptr)
         {
             if (!frameCmdList) return;
-            ID3D12RootSignature* rootSig = targetRootSig ? targetRootSig : pipeline.GetRootSignature();
-            if (!rootSig) return;
-            frameCmdList->SetGraphicsRootSignature(rootSig);
+            const GraphicsRootLayout* layout = targetLayout ? targetLayout : pipeline.GetDefaultGraphicsRootLayout();
+            if (!layout || !layout->rootSignature) return;
+
+            frameCmdList->SetGraphicsRootSignature(layout->rootSignature.Get());
             if (defaultDummySpaceTableIndex != UINT32_MAX)
             {
                 D3D12_GPU_DESCRIPTOR_HANDLE dummySpaceGPU = cbvSrvUavPool.GetGPUHandle(defaultDummySpaceTableIndex);
                 D3D12_GPU_DESCRIPTOR_HANDLE dummyUavGPU   = cbvSrvUavPool.GetGPUHandle(defaultDummySpaceTableIndex + kCBVPerSpace + kSRVPerSpace);
-                for (UINT32 p = 0; p < 8; ++p)
+                for (UINT32 st = 0; st < 5u; ++st)
                 {
-                    frameCmdList->SetGraphicsRootDescriptorTable(p, dummySpaceGPU);
+                    for (UINT32 s = 0; s < kMaxSpaces; ++s)
+                    {
+                        if (layout->cbvSrvParam[st][s] >= 0)
+                        {
+                            frameCmdList->SetGraphicsRootDescriptorTable(
+                                static_cast<UINT32>(layout->cbvSrvParam[st][s]),
+                                dummySpaceGPU);
+                        }
+                    }
                 }
                 for (UINT32 s = 0; s < kMaxSpaces; ++s)
                 {
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsGeometrySpaceParamBase + s,
-                        dummySpaceGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsHullSpaceParamBase + s,
-                        dummySpaceGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsDomainSpaceParamBase + s,
-                        dummySpaceGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsUAVSpaceParamBase + s,
-                        dummyUavGPU
-                    );
+                    if (layout->uavParam[s] >= 0)
+                    {
+                        frameCmdList->SetGraphicsRootDescriptorTable(
+                            static_cast<UINT32>(layout->uavParam[s]),
+                            dummyUavGPU);
+                    }
                 }
             }
             if (defaultDummySamplerTableIndex != UINT32_MAX)
             {
                 D3D12_GPU_DESCRIPTOR_HANDLE dummySampGPU = samplerPool.GetGPUHandle(defaultDummySamplerTableIndex);
-                for (UINT32 s = 0; s < kMaxSpaces; ++s)
+                for (UINT32 st = 0; st < 5u; ++st)
                 {
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsVertexSamplerParamBase + s,
-                        dummySampGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsPixelSamplerParamBase + s,
-                        dummySampGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsGeometrySamplerParamBase + s,
-                        dummySampGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsHullSamplerParamBase + s,
-                        dummySampGPU
-                    );
-                    frameCmdList->SetGraphicsRootDescriptorTable(
-                        D3D12Pipeline::kGraphicsDomainSamplerParamBase + s,
-                        dummySampGPU
-                    );
+                    for (UINT32 s = 0; s < kMaxSpaces; ++s)
+                    {
+                        if (layout->samplerParam[st][s] >= 0)
+                        {
+                            frameCmdList->SetGraphicsRootDescriptorTable(
+                                static_cast<UINT32>(layout->samplerParam[st][s]),
+                                dummySampGPU);
+                        }
+                    }
                 }
             }
-            const UINT32 zeroRootConsts[4] = { 0, 0, 0, 0 };
-            frameCmdList->SetGraphicsRoot32BitConstants(
-                D3D12Pipeline::kGraphicsRootConstantsParamIndex,
-                4,
-                zeroRootConsts,
-                0
-            );
-            if (rootSig != pipeline.GetRootSignature() && defaultDummyZeroCBuffer)
+            if (layout->rootConstantsParam >= 0)
+            {
+                const UINT32 zeroRootConsts[4] = { 0, 0, 0, 0 };
+                frameCmdList->SetGraphicsRoot32BitConstants(
+                    static_cast<UINT32>(layout->rootConstantsParam),
+                    4,
+                    zeroRootConsts,
+                    0
+                );
+            }
+            if (defaultDummyZeroCBuffer && layout->indirectSrvParam >= 0)
             {
                 const D3D12_GPU_VIRTUAL_ADDRESS zeroVA = defaultDummyZeroCBuffer->GetGPUVirtualAddress();
                 for (UINT32 i = 0; i < D3D12Pipeline::kGraphicsIndirectCBVParamCount; ++i)
                 {
-                    frameCmdList->SetGraphicsRootConstantBufferView(
-                        D3D12Pipeline::kGraphicsIndirectCBVParamBase + i,
-                        zeroVA
-                    );
+                    if (layout->indirectCbvParam[i] >= 0)
+                    {
+                        frameCmdList->SetGraphicsRootConstantBufferView(
+                            static_cast<UINT32>(layout->indirectCbvParam[i]),
+                            zeroVA
+                        );
+                    }
                 }
                 frameCmdList->SetGraphicsRootShaderResourceView(
-                    D3D12Pipeline::kGraphicsIndirectSRVParamIndex,
+                    static_cast<UINT32>(layout->indirectSrvParam),
                     zeroVA
                 );
             }
@@ -1370,11 +1413,12 @@ namespace Northstar
             UINT32& currentTableOffset,
             UINT32& tablesUsedThisFrame,
             BOOL& isComputeRootSigActive,
+            const ComputeRootLayout*& currentComputeLayout,
             ID3D12PipelineState*& currentPSO,
             ID3D12PipelineState*& currentComputePSO,
             NativeHandle& currentVB,
             NativeHandle& currentIB,
-            UINT32 currentRootTable[D3D12Pipeline::kGraphicsRootParamCount],
+            UINT32 currentRootTable[kMaxRootParams],
             UINT32 currentSamplerTableIndex[5][kMaxSpaces])
         {
             ID3D12Device* device = deviceContext.GetDevice();
@@ -1605,13 +1649,21 @@ namespace Northstar
                     stateTracker.FlushBarriers(frameCmdList.Get());
                     depthTex->currentState = stateTracker.GetResourceState(depthTex->resource.Get());
 
-                    if (isComputeRootSigActive)
+                    const GraphicsRootLayout* clearLayout = pipeline.GetOrCreateGraphicsRootLayout(
+                        device, resourceMgr, pass.selectiveClear.clearVertexShader, 0, clearGsHandle, 0, 0, IndirectRootBindingKey{});
+                    if (!clearLayout)
                     {
-                        BindGraphicsRootSigAndFallbacks();
-                        for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                        lastFrameMetrics.indirectCommandsRejected++;
+                        return false;
+                    }
+                    if (isComputeRootSigActive || clearLayout != pipeline.GetDefaultGraphicsRootLayout())
+                    {
+                        BindGraphicsRootSigAndFallbacks(clearLayout);
+                        for (UINT32 p = 0; p < kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                         ResetGraphicsSamplerCache(currentSamplerTableIndex);
                         isComputeRootSigActive = false;
-                        currentPSO = nullptr;
+                        currentComputeLayout   = nullptr;
+                        currentPSO             = nullptr;
                     }
 
                     frameCmdList->RSSetViewports(1, &passVp);
@@ -1670,8 +1722,14 @@ namespace Northstar
                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
                     );
 
-                    frameCmdList->SetGraphicsRootDescriptorTable(0, cbvSrvUavPool.GetGPUHandle(tableStart));
-                    currentRootTable[0] = tableStart;
+                    const INT16 clearVsSpace0Param = clearLayout->cbvSrvParam[0][0];
+                    if (clearVsSpace0Param >= 0)
+                    {
+                        frameCmdList->SetGraphicsRootDescriptorTable(
+                            static_cast<UINT32>(clearVsSpace0Param),
+                            cbvSrvUavPool.GetGPUHandle(tableStart));
+                        currentRootTable[clearVsSpace0Param] = tableStart;
+                    }
 
                     frameCmdList->ExecuteIndirect(
                         pipeline.GetDrawIndirectSignature(),
@@ -1682,6 +1740,13 @@ namespace Northstar
                         indirectCountBuf ? pass.selectiveClear.indirectCountBufferOffset : 0
                     );
                     lastFrameMetrics.indirectDrawCommandsExecuted++;
+                    if (clearLayout != pipeline.GetDefaultGraphicsRootLayout())
+                    {
+                        BindGraphicsRootSigAndFallbacks(pipeline.GetDefaultGraphicsRootLayout());
+                        for (UINT32 p = 0; p < kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
+                        ResetGraphicsSamplerCache(currentSamplerTableIndex);
+                        currentPSO = nullptr;
+                    }
                     if (useGsFallback)
                     {
                         lastFrameMetrics.layeredDepthFallbackPassesExecuted++;
@@ -1759,14 +1824,15 @@ namespace Northstar
                 stateTracker.FlushBarriers(frameCmdList.Get());
                 depthTex->currentState = stateTracker.GetResourceState(depthTex->resource.Get());
 
-                ID3D12RootSignature* currentGraphicsRootSig = pipeline.GetRootSignature();
+                const GraphicsRootLayout* currentGraphicsLayout = pipeline.GetDefaultGraphicsRootLayout();
                 if (isComputeRootSigActive)
                 {
-                    BindGraphicsRootSigAndFallbacks(currentGraphicsRootSig);
-                    for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                    BindGraphicsRootSigAndFallbacks(currentGraphicsLayout);
+                    for (UINT32 p = 0; p < kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                     ResetGraphicsSamplerCache(currentSamplerTableIndex);
                     isComputeRootSigActive = false;
-                    currentPSO = nullptr;
+                    currentComputeLayout   = nullptr;
+                    currentPSO             = nullptr;
                 }
 
                 frameCmdList->RSSetViewports(1, &passVp);
@@ -1806,18 +1872,38 @@ namespace Northstar
                     const auto* pIb = skipsIaBuffers ? nullptr : resourceMgr.GetIndexBuffer(ibHandle);
                     const BOOL hasIndices = isNvsIndirect ? true : (isVertexPullIndirect ? false : (pIb != nullptr));
 
+                    const NativeHandle gsHandle = isNvsIndirect
+                        ? cmd.geometryShader
+                        : ((cmd.geometryShader != 0)
+                            ? cmd.geometryShader
+                            : (useGsFallback ? pass.fallbackGeometryShader : 0));
+
+                    IndirectRootBindingKey effIndirectKey = cmd.indirectRootKey;
+                    if (isNvsIndirect) effIndirectKey.enabled = true;
+
+                    const GraphicsRootLayout* reqLayout = pipeline.GetOrCreateGraphicsRootLayout(
+                        device, resourceMgr, cmd.vertexShader, cmd.pixelShader, gsHandle, cmd.hullShader, cmd.domainShader, effIndirectKey);
+                    if (!reqLayout || !reqLayout->rootSignature)
+                    {
+                        if (cmd.indirectArgsBuffer != 0) lastFrameMetrics.indirectCommandsRejected++;
+                        continue;
+                    }
+
                     D3D12GPUBufferResource* indirectArgBuf   = nullptr;
                     D3D12GPUBufferResource* indirectCountBuf = nullptr;
                     ID3D12CommandSignature* indirectCmdSig   = nullptr;
 
                     if (cmd.indirectArgsBuffer != 0)
                     {
+                        const UINT32 promotedStride = effIndirectKey.extended
+                            ? D3D12Pipeline::kNVGExtendedIndirectCommandByteStride
+                            : D3D12Pipeline::kNVSIndirectCommandByteStride;
                         const UINT32 argStride = isNvsIndirect
-                            ? D3D12Pipeline::kNVSIndirectCommandByteStride
+                            ? promotedStride
                             : (hasIndices ? sizeof(GPUIndirectDrawIndexedArgs) : sizeof(GPUIndirectDrawArgs));
                         const UINT32 reqAlign = isNvsIndirect ? 8u : 4u;
                         indirectCmdSig = isNvsIndirect
-                            ? pipeline.GetOrCreateIndirectCommandSignature(device, cmd.indirectRootKey)
+                            ? pipeline.GetOrCreateIndirectCommandSignatureForLayout(device, const_cast<GraphicsRootLayout&>(*reqLayout))
                             : (hasIndices ? pipeline.GetDrawIndexedIndirectSignature() : pipeline.GetDrawIndirectSignature());
                         indirectArgBuf = resourceMgr.GetGPUBuffer(cmd.indirectArgsBuffer);
 
@@ -1883,27 +1969,13 @@ namespace Northstar
                         continue;
                     }
 
-                    const NativeHandle gsHandle = isNvsIndirect
-                        ? cmd.geometryShader
-                        : ((cmd.geometryShader != 0)
-                            ? cmd.geometryShader
-                            : (useGsFallback ? pass.fallbackGeometryShader : 0));
-
-                    ID3D12RootSignature* reqRootSig = cmd.indirectRootKey.enabled
-                        ? pipeline.GetOrCreateIndirectRootSignature(device, cmd.indirectRootKey)
-                        : pipeline.GetRootSignature();
-                    if (!reqRootSig)
+                    if (reqLayout != currentGraphicsLayout)
                     {
-                        if (cmd.indirectArgsBuffer != 0) lastFrameMetrics.indirectCommandsRejected++;
-                        continue;
-                    }
-                    if (reqRootSig != currentGraphicsRootSig)
-                    {
-                        BindGraphicsRootSigAndFallbacks(reqRootSig);
-                        for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                        BindGraphicsRootSigAndFallbacks(reqLayout);
+                        for (UINT32 p = 0; p < kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                         ResetGraphicsSamplerCache(currentSamplerTableIndex);
-                        currentGraphicsRootSig = reqRootSig;
-                        currentPSO             = nullptr;
+                        currentGraphicsLayout = reqLayout;
+                        currentPSO            = nullptr;
                     }
 
                     // Depth-only target PSO (NumRenderTargets = 0, DSVFormat = depthTex->dsvFormat; supports optional alpha-test PS and user GS/HS/DS)
@@ -1924,7 +1996,7 @@ namespace Northstar
                         true,
                         cmd.hullShader,
                         cmd.domainShader,
-                        cmd.indirectRootKey,
+                        effIndirectKey,
                         DXGI_FORMAT_UNKNOWN,
                         depthTex->dsvFormat
                     );
@@ -2010,6 +2082,9 @@ namespace Northstar
                     BOOL layeredRingExhausted = false;
                     for (UINT32 space = 0; space < kMaxSpaces; ++space)
                     {
+                        const INT16 vsParamIdx = currentGraphicsLayout->cbvSrvParam[0][space];
+                        if (vsParamIdx < 0) continue;
+
                         BOOL spaceActive = (space == 0);
                         if (!spaceActive &&
                             cmd.hasReflectedInstanceBinding &&
@@ -2354,18 +2429,22 @@ namespace Northstar
                             }
                         }
 
-                        if (currentRootTable[space] != tableStart)
+                        const UINT32 vsRootParam = static_cast<UINT32>(vsParamIdx);
+                        if (currentRootTable[vsRootParam] != tableStart)
                         {
-                            frameCmdList->SetGraphicsRootDescriptorTable(space, cbvSrvUavPool.GetGPUHandle(tableStart));
-                            currentRootTable[space] = tableStart;
+                            frameCmdList->SetGraphicsRootDescriptorTable(vsRootParam, cbvSrvUavPool.GetGPUHandle(tableStart));
+                            currentRootTable[vsRootParam] = tableStart;
                         }
                     }
 
-                    // Bind Pixel Space Tables (Params 4..7) when an alpha-tested or custom shadow PS is bound
+                    // Bind Pixel Space Tables when an alpha-tested or custom shadow PS is bound
                     if (cmd.pixelShader != 0)
                     {
                         for (UINT32 space = 0; space < kMaxSpaces; ++space)
                         {
+                            const INT16 psParamIdx = currentGraphicsLayout->cbvSrvParam[1][space];
+                            if (psParamIdx < 0) continue;
+
                             BOOL psSpaceActive = false;
                             for (SIZE_T b = 0; b < cmd.constantBuffers.size(); ++b)
                             {
@@ -2564,10 +2643,11 @@ namespace Northstar
                                 }
                             }
 
-                            if (currentRootTable[4 + space] != tableStart)
+                            const UINT32 psRootParam = static_cast<UINT32>(psParamIdx);
+                            if (currentRootTable[psRootParam] != tableStart)
                             {
-                                frameCmdList->SetGraphicsRootDescriptorTable(4 + space, cbvSrvUavPool.GetGPUHandle(tableStart));
-                                currentRootTable[4 + space] = tableStart;
+                                frameCmdList->SetGraphicsRootDescriptorTable(psRootParam, cbvSrvUavPool.GetGPUHandle(tableStart));
+                                currentRootTable[psRootParam] = tableStart;
                             }
                         }
                     }
@@ -2577,23 +2657,26 @@ namespace Northstar
                     {
                         NativeHandle handle;
                         ShaderStage  stage;
-                        UINT32       rootParamBase;
+                        UINT32       stageLayoutIdx;
                     };
                     const ExtraStageBindingSpec extraStages[3] = {
-                        { gsHandle,         ShaderStage::GEOMETRY, D3D12Pipeline::kGraphicsGeometrySpaceParamBase },
-                        { cmd.hullShader,   ShaderStage::HULL,     D3D12Pipeline::kGraphicsHullSpaceParamBase     },
-                        { cmd.domainShader, ShaderStage::DOMAIN,   D3D12Pipeline::kGraphicsDomainSpaceParamBase   }
+                        { gsHandle,         ShaderStage::GEOMETRY, 2u },
+                        { cmd.hullShader,   ShaderStage::HULL,     3u },
+                        { cmd.domainShader, ShaderStage::DOMAIN,   4u }
                     };
 
                     for (UINT32 esIdx = 0; esIdx < 3; ++esIdx)
                     {
-                        const NativeHandle stageHandle   = extraStages[esIdx].handle;
-                        const ShaderStage  curStage      = extraStages[esIdx].stage;
-                        const UINT32       rootParamBase = extraStages[esIdx].rootParamBase;
+                        const NativeHandle stageHandle    = extraStages[esIdx].handle;
+                        const ShaderStage  curStage       = extraStages[esIdx].stage;
+                        const UINT32       stageLayoutIdx = extraStages[esIdx].stageLayoutIdx;
                         if (stageHandle == 0) continue;
 
                         for (UINT32 space = 0; space < kMaxSpaces; ++space)
                         {
+                            const INT16 stParamIdx = currentGraphicsLayout->cbvSrvParam[stageLayoutIdx][space];
+                            if (stParamIdx < 0) continue;
+
                             BOOL stageSpaceActive = false;
                             for (SIZE_T b = 0; b < cmd.constantBuffers.size(); ++b)
                             {
@@ -2794,7 +2877,7 @@ namespace Northstar
                                 }
                             }
 
-                            const UINT32 stageRootParam = rootParamBase + space;
+                            const UINT32 stageRootParam = static_cast<UINT32>(stParamIdx);
                             if (currentRootTable[stageRootParam] != tableStart)
                             {
                                 frameCmdList->SetGraphicsRootDescriptorTable(stageRootParam, cbvSrvUavPool.GetGPUHandle(tableStart));
@@ -2809,7 +2892,7 @@ namespace Northstar
                         continue;
                     }
 
-                    // Bind per-stage multi-space samplers (VS: 8..11, PS: 12..15, GS: 29..32, HS: 33..36, DS: 37..40) for user shadow shaders
+                    // Bind per-stage multi-space samplers across space0..15 for user shadow shaders
                     if (cmd.pixelShader != 0 || !cmd.samplers.empty())
                     {
                         const ShaderStage sampStages[5] = {
@@ -2830,16 +2913,17 @@ namespace Northstar
                         {
                             if (!stageActive[stIdx]) continue;
                             const ShaderStage st = sampStages[stIdx];
-                            const UINT32 paramBase = D3D12Pipeline::GetGraphicsStageSamplerParamBase(st);
                             for (UINT32 space = 0; space < kMaxSpaces; ++space)
                             {
+                                const INT16 sampParam = currentGraphicsLayout->samplerParam[stIdx][space];
+                                if (sampParam < 0) continue;
                                 const UINT32 targetSamplerTable = cmd.samplers.empty()
                                     ? defaultDummySamplerTableIndex
                                     : GetOrCreateSamplerTable(device, cmd.samplers, space, st);
                                 if (targetSamplerTable != UINT32_MAX && targetSamplerTable != currentSamplerTableIndex[stIdx][space])
                                 {
                                     frameCmdList->SetGraphicsRootDescriptorTable(
-                                        paramBase + space,
+                                        static_cast<UINT32>(sampParam),
                                         samplerPool.GetGPUHandle(targetSamplerTable)
                                     );
                                     currentSamplerTableIndex[stIdx][space] = targetSamplerTable;
@@ -2848,10 +2932,10 @@ namespace Northstar
                         }
                     }
 
-                    if (cmd.useGraphicsRootConstants)
+                    if (cmd.useGraphicsRootConstants && currentGraphicsLayout->rootConstantsParam >= 0)
                     {
                         frameCmdList->SetGraphicsRoot32BitConstants(
-                            D3D12Pipeline::kGraphicsRootConstantsParamIndex,
+                            static_cast<UINT32>(currentGraphicsLayout->rootConstantsParam),
                             4,
                             cmd.graphicsRootConstants,
                             0
@@ -2872,13 +2956,16 @@ namespace Northstar
                         {
                             currentVB = 0;
                             currentIB = 0;
-                            const UINT32 zeroRootConsts[4] = { 0, 0, 0, 0 };
-                            frameCmdList->SetGraphicsRoot32BitConstants(
-                                D3D12Pipeline::kGraphicsRootConstantsParamIndex,
-                                4,
-                                zeroRootConsts,
-                                0
-                            );
+                            if (currentGraphicsLayout->rootConstantsParam >= 0)
+                            {
+                                const UINT32 zeroRootConsts[4] = { 0, 0, 0, 0 };
+                                frameCmdList->SetGraphicsRoot32BitConstants(
+                                    static_cast<UINT32>(currentGraphicsLayout->rootConstantsParam),
+                                    4,
+                                    zeroRootConsts,
+                                    0
+                                );
+                            }
                         }
                         lastFrameMetrics.indirectDrawCommandsExecuted++;
                     }
@@ -2915,10 +3002,10 @@ namespace Northstar
                     }
                 }
 
-                if (currentGraphicsRootSig != pipeline.GetRootSignature())
+                if (currentGraphicsLayout != pipeline.GetDefaultGraphicsRootLayout())
                 {
-                    BindGraphicsRootSigAndFallbacks(pipeline.GetRootSignature());
-                    for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                    BindGraphicsRootSigAndFallbacks(pipeline.GetDefaultGraphicsRootLayout());
+                    for (UINT32 p = 0; p < kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                     ResetGraphicsSamplerCache(currentSamplerTableIndex);
                     currentPSO = nullptr;
                 }
@@ -2987,6 +3074,7 @@ namespace Northstar
             // 1. Initialize Device Context (discrete GPU adapter, device, command queue, upload sync)
             if (!deviceContext.Initialize())
                 return false;
+            deviceContext.SetDXILRuntimeAvailable(D3D12ResourceManager::IsDXILCompilerAvailable());
 
             ID3D12Device* device = deviceContext.GetDevice();
             ID3D12CommandQueue* queue = deviceContext.GetCommandQueue();
@@ -3424,13 +3512,15 @@ namespace Northstar
 
         UINT32 currentTableOffset = 0;
         BOOL isComputeRootSigActive = false;
+        const ComputeRootLayout* currentComputeLayout = nullptr;
         ID3D12PipelineState* currentComputePSO = nullptr;
-        UINT32 currentComputeRootTable[NorthstarD3D12::Impl::kMaxSpaces] = {
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
-        };
-        UINT32 currentComputeSamplerTable[NorthstarD3D12::Impl::kMaxSpaces] = {
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
-        };
+        UINT32 currentComputeRootTable[NorthstarD3D12::Impl::kMaxSpaces];
+        UINT32 currentComputeSamplerTable[NorthstarD3D12::Impl::kMaxSpaces];
+        for (UINT32 s = 0; s < NorthstarD3D12::Impl::kMaxSpaces; ++s)
+        {
+            currentComputeRootTable[s]    = UINT32_MAX;
+            currentComputeSamplerTable[s] = UINT32_MAX;
+        }
 
         BOOL sceneDepthCleared = false;
         if (!view.prePassComputeDispatches.empty() &&
@@ -3468,6 +3558,7 @@ namespace Northstar
                     currentTableOffset,
                     tablesUsedThisFrame,
                     isComputeRootSigActive,
+                    currentComputeLayout,
                     currentComputePSO,
                     currentComputeRootTable,
                     currentComputeSamplerTable
@@ -3497,11 +3588,12 @@ namespace Northstar
         }
 
         // Bind Graphics Root Signature & default dummy fallback tables
-        ID3D12RootSignature* currentGraphicsRootSig = nullptr;
+        const GraphicsRootLayout* currentGraphicsLayout = nullptr;
         auto bindGraphicsRootSignatureAndFallbacks = [&]() {
-            m_impl->BindGraphicsRootSigAndFallbacks();
-            currentGraphicsRootSig = m_impl->pipeline.GetRootSignature();
+            currentGraphicsLayout  = m_impl->pipeline.GetDefaultGraphicsRootLayout();
+            m_impl->BindGraphicsRootSigAndFallbacks(currentGraphicsLayout);
             isComputeRootSigActive = false;
+            currentComputeLayout   = nullptr;
         };
 
         bindGraphicsRootSignatureAndFallbacks();
@@ -3625,8 +3717,8 @@ namespace Northstar
         ID3D12PipelineState* currentPSO = nullptr;
         NativeHandle currentVB = 0;
         NativeHandle currentIB = 0;
-        UINT32 currentRootTable[D3D12Pipeline::kGraphicsRootParamCount];
-        for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+        UINT32 currentRootTable[NorthstarD3D12::Impl::kMaxRootParams];
+        for (UINT32 p = 0; p < NorthstarD3D12::Impl::kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
         UINT32 currentSamplerTableIndex[5][NorthstarD3D12::Impl::kMaxSpaces]{};
         m_impl->ResetGraphicsSamplerCache(currentSamplerTableIndex);
         const UINT32 defaultDummyUavTableIndex = (m_impl->defaultDummySpaceTableIndex != UINT32_MAX)
@@ -3687,6 +3779,24 @@ namespace Northstar
                 const auto* pIb = skipsIaBuffers ? nullptr : m_impl->resourceMgr.GetIndexBuffer(ibHandle);
                 const BOOL hasIndices = isPromotedIndirect ? true : (isVertexPullIndirect ? false : (pIb != nullptr));
 
+                IndirectRootBindingKey effIndirectKey = cmd.indirectRootKey;
+                if (isPromotedIndirect) effIndirectKey.enabled = true;
+
+                const GraphicsRootLayout* reqLayout = m_impl->pipeline.GetOrCreateGraphicsRootLayout(
+                    m_impl->deviceContext.GetDevice(),
+                    m_impl->resourceMgr,
+                    cmd.vertexShader,
+                    cmd.pixelShader,
+                    cmd.geometryShader,
+                    cmd.hullShader,
+                    cmd.domainShader,
+                    effIndirectKey);
+                if (!reqLayout || !reqLayout->rootSignature)
+                {
+                    if (cmd.indirectArgsBuffer != 0) m_impl->lastFrameMetrics.indirectCommandsRejected++;
+                    continue;
+                }
+
                 // Validate GPU-Driven Indirect Arguments & Count Buffer
                 D3D12GPUBufferResource* indirectArgBuf   = nullptr;
                 D3D12GPUBufferResource* indirectCountBuf = nullptr;
@@ -3694,12 +3804,16 @@ namespace Northstar
 
                 if (cmd.indirectArgsBuffer != 0)
                 {
+                    const UINT32 promotedStride = effIndirectKey.extended
+                        ? D3D12Pipeline::kNVGExtendedIndirectCommandByteStride
+                        : D3D12Pipeline::kNVSIndirectCommandByteStride;
                     const UINT32 argStride = isPromotedIndirect
-                        ? D3D12Pipeline::kNVSIndirectCommandByteStride
+                        ? promotedStride
                         : (hasIndices ? sizeof(GPUIndirectDrawIndexedArgs) : sizeof(GPUIndirectDrawArgs));
                     const UINT32 reqAlign = isPromotedIndirect ? 8u : 4u;
                     indirectCmdSig = isPromotedIndirect
-                        ? m_impl->pipeline.GetOrCreateIndirectCommandSignature(m_impl->deviceContext.GetDevice(), cmd.indirectRootKey)
+                        ? m_impl->pipeline.GetOrCreateIndirectCommandSignatureForLayout(
+                            m_impl->deviceContext.GetDevice(), const_cast<GraphicsRootLayout&>(*reqLayout))
                         : (hasIndices ? m_impl->pipeline.GetDrawIndexedIndirectSignature() : m_impl->pipeline.GetDrawIndirectSignature());
                     indirectArgBuf = m_impl->resourceMgr.GetGPUBuffer(cmd.indirectArgsBuffer);
 
@@ -3817,23 +3931,16 @@ namespace Northstar
                     }
                 }
 
-                // Switch Root Signature dynamically when entering/exiting promoted indirect draw commands
-                ID3D12RootSignature* reqRootSig = cmd.indirectRootKey.enabled
-                    ? m_impl->pipeline.GetOrCreateIndirectRootSignature(m_impl->deviceContext.GetDevice(), cmd.indirectRootKey)
-                    : m_impl->pipeline.GetRootSignature();
-                if (!reqRootSig)
+                // Switch Root Signature dynamically when entering/exiting promoted or multi-space layouts
+                if (reqLayout != currentGraphicsLayout || isComputeRootSigActive)
                 {
-                    if (cmd.indirectArgsBuffer != 0) m_impl->lastFrameMetrics.indirectCommandsRejected++;
-                    continue;
-                }
-                if (reqRootSig != currentGraphicsRootSig || isComputeRootSigActive)
-                {
-                    m_impl->BindGraphicsRootSigAndFallbacks(reqRootSig);
-                    for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                    m_impl->BindGraphicsRootSigAndFallbacks(reqLayout);
+                    for (UINT32 p = 0; p < NorthstarD3D12::Impl::kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                     m_impl->ResetGraphicsSamplerCache(currentSamplerTableIndex);
                     resetGraphicsUavCache(currentGraphicsUavTable);
-                    currentGraphicsRootSig = reqRootSig;
+                    currentGraphicsLayout  = reqLayout;
                     isComputeRootSigActive = false;
+                    currentComputeLayout   = nullptr;
                     currentPSO             = nullptr;
                 }
 
@@ -3861,7 +3968,7 @@ namespace Northstar
                     isShadowPass || isDepthPrepass,
                     cmd.hullShader,
                     cmd.domainShader,
-                    cmd.indirectRootKey,
+                    effIndirectKey,
                     activeRtvFormat,
                     activeDsvFormat
                 );
@@ -4033,11 +4140,15 @@ namespace Northstar
                     }
 
                     // Precompute active spaces and shared CB cache eligibility in a single pass over bindings for this stage
-                    BOOL   spaceActive[NorthstarD3D12::Impl::kMaxSpaces]        = { false, false, false, false };
-                    UINT32 cbCountInSpace[NorthstarD3D12::Impl::kMaxSpaces]     = { 0, 0, 0, 0 };
-                    UINT64 singleSharedCbId[NorthstarD3D12::Impl::kMaxSpaces]   = { 0, 0, 0, 0 };
-                    BOOL   allCbSharedInSpace[NorthstarD3D12::Impl::kMaxSpaces] = { true, true, true, true };
-                    BOOL   hasSbOrTexInSpace[NorthstarD3D12::Impl::kMaxSpaces]  = { false, false, false, false };
+                    BOOL   spaceActive[NorthstarD3D12::Impl::kMaxSpaces]{};
+                    UINT32 cbCountInSpace[NorthstarD3D12::Impl::kMaxSpaces]{};
+                    UINT64 singleSharedCbId[NorthstarD3D12::Impl::kMaxSpaces]{};
+                    BOOL   allCbSharedInSpace[NorthstarD3D12::Impl::kMaxSpaces]{};
+                    BOOL   hasSbOrTexInSpace[NorthstarD3D12::Impl::kMaxSpaces]{};
+                    for (UINT32 sp = 0; sp < NorthstarD3D12::Impl::kMaxSpaces; ++sp)
+                    {
+                        allCbSharedInSpace[sp] = true;
+                    }
 
                     if (stage == ShaderStage::VERTEX)
                     {
@@ -4098,16 +4209,9 @@ namespace Northstar
                     for (UINT32 space = 0; space < NorthstarD3D12::Impl::kMaxSpaces; ++space)
                     {
                         if (!spaceActive[space]) continue;
-
-                        const UINT32 rootParam = (stage == ShaderStage::VERTEX)
-                            ? (D3D12Pipeline::kGraphicsVertexSpaceParamBase + space)
-                            : ((stage == ShaderStage::PIXEL)
-                                ? (D3D12Pipeline::kGraphicsPixelSpaceParamBase + space)
-                                : ((stage == ShaderStage::GEOMETRY)
-                                    ? (D3D12Pipeline::kGraphicsGeometrySpaceParamBase + space)
-                                    : ((stage == ShaderStage::HULL)
-                                        ? (D3D12Pipeline::kGraphicsHullSpaceParamBase + space)
-                                        : (D3D12Pipeline::kGraphicsDomainSpaceParamBase + space))));
+                        const INT16 paramIdx = currentGraphicsLayout->cbvSrvParam[stageIdx][space];
+                        if (paramIdx < 0) continue;
+                        const UINT32 rootParam = static_cast<UINT32>(paramIdx);
 
                         // Fast path: Reuse descriptor table across tiles when a non-0 space only binds a shared ConstantBuffer
                         const BOOL canCacheSpaceTable = !(stage == ShaderStage::VERTEX && space == 0) &&
@@ -4679,6 +4783,9 @@ namespace Northstar
 
                         for (UINT32 space = 0; space < NorthstarD3D12::Impl::kMaxSpaces; ++space)
                         {
+                            const INT16 uavParamIdx = currentGraphicsLayout->uavParam[space];
+                            if (uavParamIdx < 0) continue;
+
                             BOOL uavSpaceActive = false;
                             for (SIZE_T s = 0; s < cmd.structuredBuffers.size(); ++s)
                             {
@@ -4696,7 +4803,7 @@ namespace Northstar
                                 if (defaultDummyUavTableIndex != UINT32_MAX && currentGraphicsUavTable[space] != defaultDummyUavTableIndex)
                                 {
                                     m_impl->frameCmdList->SetGraphicsRootDescriptorTable(
-                                        D3D12Pipeline::kGraphicsUAVSpaceParamBase + space,
+                                        static_cast<UINT32>(uavParamIdx),
                                         m_impl->cbvSrvUavPool.GetGPUHandle(defaultDummyUavTableIndex));
                                     currentGraphicsUavTable[space] = defaultDummyUavTableIndex;
                                 }
@@ -4762,7 +4869,7 @@ namespace Northstar
                             if (currentGraphicsUavTable[space] != uavTableStart)
                             {
                                 m_impl->frameCmdList->SetGraphicsRootDescriptorTable(
-                                    D3D12Pipeline::kGraphicsUAVSpaceParamBase + space,
+                                    static_cast<UINT32>(uavParamIdx),
                                     m_impl->cbvSrvUavPool.GetGPUHandle(uavTableStart));
                                 currentGraphicsUavTable[space] = uavTableStart;
                             }
@@ -4773,10 +4880,12 @@ namespace Northstar
                 {
                     for (UINT32 space = 0; space < NorthstarD3D12::Impl::kMaxSpaces; ++space)
                     {
+                        const INT16 uavParamIdx = currentGraphicsLayout->uavParam[space];
+                        if (uavParamIdx < 0) continue;
                         if (currentGraphicsUavTable[space] != defaultDummyUavTableIndex)
                         {
                             m_impl->frameCmdList->SetGraphicsRootDescriptorTable(
-                                D3D12Pipeline::kGraphicsUAVSpaceParamBase + space,
+                                static_cast<UINT32>(uavParamIdx),
                                 m_impl->cbvSrvUavPool.GetGPUHandle(defaultDummyUavTableIndex));
                             currentGraphicsUavTable[space] = defaultDummyUavTableIndex;
                         }
@@ -4793,7 +4902,7 @@ namespace Northstar
                     continue;
                 }
 
-                // 7. Dynamic Per-Stage Multi-Space Samplers Binding (VS: 8..11, PS: 12..15, GS: 29..32, HS: 33..36, DS: 37..40)
+                // 7. Dynamic Per-Stage Multi-Space Samplers Binding across space0..15
                 if (cmd.pixelShader != 0 || !cmd.samplers.empty())
                 {
                     const BOOL stageBound[5] = {
@@ -4806,17 +4915,18 @@ namespace Northstar
                     for (UINT32 stIdx = 0u; stIdx < 5u; ++stIdx)
                     {
                         if (!stageBound[stIdx]) continue;
-                        const ShaderStage st   = kGraphicsStageOrder[stIdx];
-                        const UINT32 paramBase = D3D12Pipeline::GetGraphicsStageSamplerParamBase(st);
+                        const ShaderStage st = kGraphicsStageOrder[stIdx];
                         for (UINT32 space = 0; space < NorthstarD3D12::Impl::kMaxSpaces; ++space)
                         {
+                            const INT16 sampParamIdx = currentGraphicsLayout->samplerParam[stIdx][space];
+                            if (sampParamIdx < 0) continue;
                             const UINT32 targetSamplerTable = cmd.samplers.empty()
                                 ? m_impl->defaultDummySamplerTableIndex
                                 : m_impl->GetOrCreateSamplerTable(device, cmd.samplers, space, st);
                             if (targetSamplerTable != UINT32_MAX && targetSamplerTable != currentSamplerTableIndex[stIdx][space])
                             {
                                 m_impl->frameCmdList->SetGraphicsRootDescriptorTable(
-                                    paramBase + space,
+                                    static_cast<UINT32>(sampParamIdx),
                                     m_impl->samplerPool.GetGPUHandle(targetSamplerTable)
                                 );
                                 currentSamplerTableIndex[stIdx][space] = targetSamplerTable;
@@ -4825,11 +4935,11 @@ namespace Northstar
                     }
                 }
 
-                // Optional Graphics Root Constants (Param 12 -> b1, space3, 4 DWORDs)
-                if (cmd.useGraphicsRootConstants)
+                // Optional Graphics Root Constants (b0, space16, 4 DWORDs)
+                if (cmd.useGraphicsRootConstants && currentGraphicsLayout->rootConstantsParam >= 0)
                 {
                     m_impl->frameCmdList->SetGraphicsRoot32BitConstants(
-                        D3D12Pipeline::kGraphicsRootConstantsParamIndex,
+                        static_cast<UINT32>(currentGraphicsLayout->rootConstantsParam),
                         4,
                         cmd.graphicsRootConstants,
                         0);
@@ -4852,13 +4962,16 @@ namespace Northstar
                         // Invalidate cached handles so subsequent direct draws rebind their own VB/IB cleanly.
                         currentVB = 0;
                         currentIB = 0;
-                        const UINT32 zeroRootConsts[4] = { 0, 0, 0, 0 };
-                        m_impl->frameCmdList->SetGraphicsRoot32BitConstants(
-                            D3D12Pipeline::kGraphicsRootConstantsParamIndex,
-                            4,
-                            zeroRootConsts,
-                            0
-                        );
+                        if (currentGraphicsLayout->rootConstantsParam >= 0)
+                        {
+                            const UINT32 zeroRootConsts[4] = { 0, 0, 0, 0 };
+                            m_impl->frameCmdList->SetGraphicsRoot32BitConstants(
+                                static_cast<UINT32>(currentGraphicsLayout->rootConstantsParam),
+                                4,
+                                zeroRootConsts,
+                                0
+                            );
+                        }
                     }
                     m_impl->lastFrameMetrics.indirectDrawCommandsExecuted++;
                 }
@@ -4905,6 +5018,7 @@ namespace Northstar
                     currentTableOffset,
                     tablesUsedThisFrame,
                     isComputeRootSigActive,
+                    currentComputeLayout,
                     currentPSO,
                     currentComputePSO,
                     currentVB,
@@ -4928,13 +5042,13 @@ namespace Northstar
             if (isComputeRootSigActive)
             {
                 bindGraphicsRootSignatureAndFallbacks();
-                for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                for (UINT32 p = 0; p < NorthstarD3D12::Impl::kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                 m_impl->ResetGraphicsSamplerCache(currentSamplerTableIndex);
                 resetGraphicsUavCache(currentGraphicsUavTable);
             }
             else
             {
-                currentGraphicsRootSig = nullptr;
+                currentGraphicsLayout = nullptr;
             }
         }
 
@@ -5051,6 +5165,7 @@ namespace Northstar
                     currentTableOffset,
                     tablesUsedThisFrame,
                     isComputeRootSigActive,
+                    currentComputeLayout,
                     currentComputePSO,
                     currentComputeRootTable,
                     currentComputeSamplerTable
@@ -5089,7 +5204,7 @@ namespace Northstar
                     if (isComputeRootSigActive)
                     {
                         bindGraphicsRootSignatureAndFallbacks();
-                        for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                        for (UINT32 p = 0; p < NorthstarD3D12::Impl::kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                         m_impl->ResetGraphicsSamplerCache(currentSamplerTableIndex);
                         resetGraphicsUavCache(currentGraphicsUavTable);
                     }
@@ -5139,7 +5254,7 @@ namespace Northstar
                 if (isComputeRootSigActive)
                 {
                     bindGraphicsRootSignatureAndFallbacks();
-                    for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+                    for (UINT32 p = 0; p < NorthstarD3D12::Impl::kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
                     m_impl->ResetGraphicsSamplerCache(currentSamplerTableIndex);
                     resetGraphicsUavCache(currentGraphicsUavTable);
                     currentPSO = nullptr;
@@ -5160,6 +5275,7 @@ namespace Northstar
                     currentTableOffset,
                     tablesUsedThisFrame,
                     isComputeRootSigActive,
+                    currentComputeLayout,
                     currentPSO,
                     currentComputePSO,
                     currentVB,
@@ -5192,9 +5308,9 @@ namespace Northstar
                 m_impl->frameCmdList->RSSetViewports(1, &viewport);
                 m_impl->frameCmdList->RSSetScissorRects(1, &scissor);
                 restoreRenderTargetStates(true);
-                currentGraphicsRootSig = nullptr;
-                currentPSO             = nullptr;
-                currentComputePSO      = nullptr;
+                currentGraphicsLayout = nullptr;
+                currentPSO            = nullptr;
+                currentComputePSO     = nullptr;
             }
         }
 
@@ -5226,6 +5342,7 @@ namespace Northstar
                     currentTableOffset,
                     tablesUsedThisFrame,
                     isComputeRootSigActive,
+                    currentComputeLayout,
                     currentComputePSO,
                     currentComputeRootTable,
                     currentComputeSamplerTable
@@ -5512,13 +5629,15 @@ namespace Northstar
         UINT32 currentTableOffset = 0;
         UINT32 tablesUsedThisFrame = 0;
         BOOL isComputeRootSigActive = false;
+        const ComputeRootLayout* currentComputeLayout = nullptr;
         ID3D12PipelineState* currentComputePSO = nullptr;
-        UINT32 currentComputeRootTable[NorthstarD3D12::Impl::kMaxSpaces] = {
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
-        };
-        UINT32 currentComputeSamplerTable[NorthstarD3D12::Impl::kMaxSpaces] = {
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
-        };
+        UINT32 currentComputeRootTable[NorthstarD3D12::Impl::kMaxSpaces];
+        UINT32 currentComputeSamplerTable[NorthstarD3D12::Impl::kMaxSpaces];
+        for (UINT32 s = 0; s < NorthstarD3D12::Impl::kMaxSpaces; ++s)
+        {
+            currentComputeRootTable[s]    = UINT32_MAX;
+            currentComputeSamplerTable[s] = UINT32_MAX;
+        }
 
         UINT32 burstStart = UINT32_MAX;
         for (SIZE_T i = 0; i < dispatches.size(); ++i)
@@ -5533,6 +5652,7 @@ namespace Northstar
                 currentTableOffset,
                 tablesUsedThisFrame,
                 isComputeRootSigActive,
+                currentComputeLayout,
                 currentComputePSO,
                 currentComputeRootTable,
                 currentComputeSamplerTable))
@@ -5691,20 +5811,22 @@ namespace Northstar
         UINT32 currentTableOffset = 0;
         UINT32 tablesUsedThisFrame = 0;
         BOOL isComputeRootSigActive = false;
+        const ComputeRootLayout* currentComputeLayout = nullptr;
         ID3D12PipelineState* currentPSO = nullptr;
         ID3D12PipelineState* currentComputePSO = nullptr;
         NativeHandle currentVB = 0;
         NativeHandle currentIB = 0;
-        UINT32 currentRootTable[D3D12Pipeline::kGraphicsRootParamCount];
-        for (UINT32 p = 0; p < D3D12Pipeline::kGraphicsRootParamCount; ++p) currentRootTable[p] = UINT32_MAX;
+        UINT32 currentRootTable[NorthstarD3D12::Impl::kMaxRootParams];
+        for (UINT32 p = 0; p < NorthstarD3D12::Impl::kMaxRootParams; ++p) currentRootTable[p] = UINT32_MAX;
         UINT32 currentSamplerTableIndex[5][NorthstarD3D12::Impl::kMaxSpaces]{};
         m_impl->ResetGraphicsSamplerCache(currentSamplerTableIndex);
-        UINT32 currentComputeRootTable[NorthstarD3D12::Impl::kMaxSpaces] = {
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
-        };
-        UINT32 currentComputeSamplerTable[NorthstarD3D12::Impl::kMaxSpaces] = {
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
-        };
+        UINT32 currentComputeRootTable[NorthstarD3D12::Impl::kMaxSpaces];
+        UINT32 currentComputeSamplerTable[NorthstarD3D12::Impl::kMaxSpaces];
+        for (UINT32 s = 0; s < NorthstarD3D12::Impl::kMaxSpaces; ++s)
+        {
+            currentComputeRootTable[s]    = UINT32_MAX;
+            currentComputeSamplerTable[s] = UINT32_MAX;
+        }
 
         if (preDispatches != nullptr && !preDispatches->empty())
         {
@@ -5721,6 +5843,7 @@ namespace Northstar
                     currentTableOffset,
                     tablesUsedThisFrame,
                     isComputeRootSigActive,
+                    currentComputeLayout,
                     currentComputePSO,
                     currentComputeRootTable,
                     currentComputeSamplerTable))
@@ -5759,6 +5882,7 @@ namespace Northstar
 
         m_impl->BindGraphicsRootSigAndFallbacks();
         isComputeRootSigActive = false;
+        currentComputeLayout   = nullptr;
 
         const Mat4 identityMat{};
         for (SIZE_T p = 0; p < passes.size(); ++p)
@@ -5773,6 +5897,7 @@ namespace Northstar
                 currentTableOffset,
                 tablesUsedThisFrame,
                 isComputeRootSigActive,
+                currentComputeLayout,
                 currentPSO,
                 currentComputePSO,
                 currentVB,
@@ -5845,6 +5970,25 @@ namespace Northstar
         m_impl->lastFrameMetrics.activeCachedPSOCount          = m_impl->pipeline.GetActiveCachedPSOCount();
         m_impl->lastFrameMetrics.retiredPSOCount               = m_impl->pipeline.GetRetiredPSOCount();
         return true;
+    }
+
+    BackendCapabilities NorthstarD3D12::GetCapabilities() const
+    {
+        if (!m_impl) return BackendCapabilities{};
+        BackendCapabilities caps = m_impl->deviceContext.GetCapabilities();
+        if (!m_impl->isInitialized)
+        {
+            caps.supportsDXILRuntime = D3D12ResourceManager::IsDXILCompilerAvailable();
+        }
+        return caps;
+    }
+
+    void NorthstarD3D12::SetRestrictedCapabilitiesOverride(BOOL enableOverride, const BackendCapabilities& restrictedCaps)
+    {
+        if (m_impl)
+        {
+            m_impl->deviceContext.SetRestrictedCapabilitiesOverride(enableOverride, restrictedCaps);
+        }
     }
 
     BOOL NorthstarD3D12::SupportsVPAndRTArrayIndexWithoutGS() const
@@ -6219,7 +6363,7 @@ namespace Northstar
     SharedHandleType NorthstarD3D12::GetTextureSharedHandleType(NativeHandle handle) const
     {
         if (!m_impl) return SharedHandleType::NONE;
-        return m_impl->resourceMgr.GetTextureSharedHandle(handle) ? SharedHandleType::WIN32_NT_HANDLE
+        return m_impl->resourceMgr.HasTextureSharedHandle(handle) ? SharedHandleType::WIN32_NT_HANDLE
                                                                   : SharedHandleType::NONE;
     }
 
@@ -6263,7 +6407,82 @@ namespace Northstar
 
     NativeHandle NorthstarD3D12::CreateShader(ShaderStage stage, const void* bytecode, SIZE_T bytecodeSize)
     {
-        return m_impl ? m_impl->resourceMgr.CreateShader(stage, bytecode, bytecodeSize) : 0;
+        if (!m_impl || !bytecode || bytecodeSize == 0) return 0;
+        BackendCapabilities caps = m_impl->deviceContext.GetCapabilities();
+        if (!m_impl->isInitialized)
+        {
+            caps.supportsDXILRuntime = D3D12ResourceManager::IsDXILCompilerAvailable();
+        }
+        const BOOL allowDXIL66 = m_impl->isInitialized
+            ? ((caps.maxShaderModel >= 0x66u) && (caps.supportsDXILRuntime != FALSE))
+            : D3D12ResourceManager::IsDXILCompilerAvailable();
+
+        if (bytecodeSize >= 4 && std::memcmp(bytecode, "DXBC", 4) == 0)
+        {
+            UINT32 reqSM        = 0x51u;
+            BOOL   reqInt64     = false;
+            BOOL   reqInt64Atom = false;
+            D3D12ResourceManager::InspectDXBCContainerCapabilities(
+                bytecode, bytecodeSize, reqSM, reqInt64, reqInt64Atom);
+            if (m_impl->isInitialized)
+            {
+                if (reqSM > caps.maxShaderModel)
+                    return 0;
+                if (reqSM >= 0x60u && !caps.supportsDXILRuntime)
+                    return 0;
+                if (reqInt64 && !caps.supportsInt64ShaderOps)
+                    return 0;
+                if (reqInt64Atom && !caps.SupportsNVGRasterAtomic64())
+                    return 0;
+            }
+            else if (reqSM >= 0x66u && !allowDXIL66)
+            {
+                return 0;
+            }
+        }
+        else
+        {
+            const char* srcChars = static_cast<const char*>(bytecode);
+            const char* u64Tag   = "uint64_t";
+            const SIZE_T tagLen  = 8u;
+            if (bytecodeSize >= tagLen)
+            {
+                const char* found = std::search(srcChars, srcChars + bytecodeSize, u64Tag, u64Tag + tagLen);
+                if (found != (srcChars + bytecodeSize))
+                {
+                    const char* atomicTag = "Interlocked";
+                    const SIZE_T atomicLen = 11u;
+                    const BOOL hasInterlocked = (bytecodeSize >= atomicLen) &&
+                        (std::search(srcChars, srcChars + bytecodeSize, atomicTag, atomicTag + atomicLen) != (srcChars + bytecodeSize));
+                    if (m_impl->isInitialized)
+                    {
+                        if (hasInterlocked && !caps.SupportsNVGRasterAtomic64())
+                            return 0;
+                        if (!(caps.maxShaderModel >= 0x60u && caps.supportsDXILRuntime && caps.supportsInt64ShaderOps))
+                            return 0;
+                    }
+                    else if (!allowDXIL66)
+                    {
+                        return 0;
+                    }
+                }
+            }
+        }
+
+        const NativeHandle handle = m_impl->resourceMgr.CreateShader(stage, bytecode, bytecodeSize, allowDXIL66);
+        if (handle != 0 && m_impl->isInitialized)
+        {
+            const D3D12ShaderResource* created = m_impl->resourceMgr.GetShader(handle);
+            if (!created ||
+                created->requiredShaderModel > caps.maxShaderModel ||
+                (created->requiresInt64Ops && !caps.supportsInt64ShaderOps) ||
+                (created->requiresInt64DescriptorHeapAtomics && !caps.SupportsNVGRasterAtomic64()))
+            {
+                m_impl->resourceMgr.DestroyShader(handle);
+                return 0;
+            }
+        }
+        return handle;
     }
 
     BOOL NorthstarD3D12::GetShaderCompiledBytecode(NativeHandle handle, std::vector<BYTE>& outBytecode) const
@@ -6274,6 +6493,15 @@ namespace Northstar
     void NorthstarD3D12::SetShaderInputLayout(NativeHandle handle, const std::vector<NSCStageIOEntry>& inputLayout)
     {
         if (m_impl) m_impl->resourceMgr.SetShaderInputLayout(handle, inputLayout);
+    }
+
+    void NorthstarD3D12::SetShaderReflectionSpaces(NativeHandle handle, const ShaderSpaceMask& spaceMask)
+    {
+        if (m_impl)
+        {
+            m_impl->pipeline.InvalidatePSOsForShader(handle, m_impl->GetSafeRetireFenceValue());
+            m_impl->resourceMgr.SetShaderReflectionSpaces(handle, spaceMask);
+        }
     }
 
     void NorthstarD3D12::DestroyShader(NativeHandle handle)
@@ -6296,6 +6524,31 @@ namespace Northstar
     {
         return m_impl ? m_impl->resourceMgr.UpdateGPUBuffer(
             m_impl->deviceContext, handle, data, byteSize, dstOffset) : false;
+    }
+
+    BOOL NorthstarD3D12::CopyGPUBufferRegion(
+        NativeHandle dstBuffer,
+        UINT64       dstOffset,
+        NativeHandle srcBuffer,
+        UINT64       srcOffset,
+        UINT64       byteSize)
+    {
+        if (!m_impl || !m_impl->isInitialized || m_impl->deviceContext.IsDeviceRemoved())
+        {
+            return false;
+        }
+        ID3D12GraphicsCommandList* activeList = (m_impl->isRecordingCmdList && m_impl->frameCmdList)
+            ? m_impl->frameCmdList.Get()
+            : nullptr;
+        return m_impl->resourceMgr.CopyGPUBufferRegion(
+            m_impl->deviceContext,
+            activeList,
+            m_impl->stateTracker,
+            dstBuffer,
+            dstOffset,
+            srcBuffer,
+            srcOffset,
+            byteSize);
     }
 
     UINT64 NorthstarD3D12::GetGPUBufferGPUVirtualAddress(NativeHandle handle) const

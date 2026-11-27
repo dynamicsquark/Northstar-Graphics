@@ -1,0 +1,796 @@
+// =====================================================================
+//  RuntimeNVGMicropolyRaster.nsl — NorthstarRuntime Internal Compute
+//  Northstar Virtual Geometry (NVG) — Unified Clean-Room Compute Software
+//  Micropolygon Rasterizer (Single Authoritative NSL Source)
+//
+//  Hardware-Capability Atomic Commit Strategies (Specialized at Compile Time):
+//    - NVG_RASTER_ATOMIC64 == 1 (ATOMIC64_SINGLE_PASS):
+//        Mode 2 commits VisPixel64 = (UInt64(depthKey32) << 32) | payload32
+//        via a single indivisible 64-bit InterlockedMax on OutVisBuffer64.
+//    - NVG_RASTER_ATOMIC64 == 0 (ATOMIC32_TWO_PASS):
+//        Mode 2 (Pass 1) commits 32-bit monotonic depthKey32 via InterlockedMax
+//        on OutAtomicDepthKey32; after an explicit GPU UAV barrier, Mode 3
+//        (Pass 2) commits payload32 via InterlockedMax on OutAtomicPayload32
+//        strictly where OutAtomicDepthKey32[px] == depthKey32, producing
+//        bit-identical visibility & coplanar tie-breaking on 32-bit hardware!
+//
+//  Guaranteed Correctness Invariants:
+//    1. 100% shared raster mathematics across both atomic strategies (vertex
+//       decode/skinning, homogeneous near-plane clipping, 16.8 fixed-point
+//       quantization, MinPixel local rebasing, branchless D3D Top-Left rule,
+//       and affine DeviceZ interpolation).
+//    2. Zero silent 64x64 pixel bounding-box truncation: pre-commit cluster
+//       validation detects any >maxSWTriangleSpanPx clipped triangle, guardband
+//       overflow, or non-finite coordinate BEFORE writing a single pixel, and
+//       atomically hands the entire cluster back to Hardware Rasterization
+//       (clearing OutSWScheduledMask & setting OutWinningClusterMask).
+//    3. Exact Gershgorin-Frobenius singular-value upper bound + skinned pose
+//       envelope in Mode 1 so sheared / non-uniform / skinned transforms never
+//       underestimate projected edge length.
+// =====================================================================
+
+#ifndef NVG_RASTER_ATOMIC64
+#define NVG_RASTER_ATOMIC64 1
+#endif
+
+STAGE COMPUTE
+
+PROPERTY NVGMicropolyParams {
+    Buffer Config {
+        Add(dispatchMode)          : UInt  = 0
+        Add(viewportWidth)         : UInt  = 1
+        Add(viewportHeight)        : UInt  = 1
+        Add(maxVisibleCapacity)    : UInt  = 0
+        Add(rawVisibleCounterIdx)  : UInt  = 3
+        Add(swClusterCap)          : UInt  = 0
+        Add(maskWordCount)         : UInt  = 0
+        Add(pageWordCount)         : UInt  = 8192
+        Add(clusterMetaCount)      : UInt  = 0
+        Add(materialTableCount)    : UInt  = 0
+        Add(bonePaletteCount)      : UInt  = 0
+        Add(skinBoundsCount)       : UInt  = 0
+        Add(isOrthographic)        : UInt  = 0
+        Add(isReversedZ)           : UInt  = 0
+        Add(forceAllEligible)      : UInt  = 0
+        Add(maxSWTriangleSpanPx)   : UInt  = 64
+        Add(cameraNearPlane)       : Float = 0.1
+        Add(lodProjScale)          : Float = 500.0
+        Add(swMaxEdgePixels)       : Float = 32.0
+        Add(cameraPosition)        : Vec3  = 0.0 0.0 0.0
+        Add(vpMatrix)              : Mat4
+    }
+
+    StructuredBuffer InPagePool {
+        Add(word) : UInt
+    }
+
+    StructuredBuffer InCompactedVisibleClusters {
+        Add(objectSlotIndex)   : UInt
+        Add(clusterId)         : UInt
+        Add(physicalPageIndex) : UInt
+        Add(clusterWordOffset) : UInt
+        Add(virtualPageId)     : UInt
+        Add(lodAndFlags)       : UInt
+        Add(geometricError)    : Float
+        Add(materialId)        : UInt
+        Add(bonePaletteOffset) : UInt
+        Add(boneCount)         : UInt
+        Add(drawBucketIndex)   : UInt
+        Add(viewDepthKey)      : Float
+    }
+
+    StructuredBuffer InBucketRanges {
+        Add(firstVisibleCluster) : UInt
+        Add(visibleClusterCount) : UInt
+        Add(maxTriangleCount)    : UInt
+        Add(bucketFlags)         : UInt
+    }
+
+    StructuredBuffer InGPUSceneObjects {
+        Add(slotIndex)            : UInt
+        Add(generation)           : UInt
+        Add(objectFlags)          : UInt
+        Add(renderObjectFlags)    : UInt
+        Add(meshId)               : UInt
+        Add(materialId)           : UInt
+        Add(lodGroupId)           : UInt
+        Add(batchGroupId)         : UInt
+        Add(vertexCount)          : UInt
+        Add(indexCount)           : UInt
+        Add(startIndex)           : UInt
+        Add(baseVertex)           : Int
+        Add(aabbMin)              : Vec3
+        Add(submeshIndex)         : UInt
+        Add(aabbMax)              : Vec3
+        Add(lodAndMaterialFlags)  : UInt
+        Add(boundingSphere)       : Vec4
+        Add(worldMatrix)          : Mat4
+        Add(prevWorldMatrix)      : Mat4
+        Add(layerMask)            : UInt
+        Add(materialTableOffset)  : UInt
+        Add(materialSlotCount)    : UInt
+        Add(skinningBoundsOffset) : UInt
+    }
+
+    StructuredBuffer InClusterMeta {
+        Add(meshId)                   : UInt
+        Add(clusterLocalIndex)        : UInt
+        Add(virtualPageId)            : UInt
+        Add(clusterWordOffsetInPage)  : UInt
+        Add(countsAndLod)             : UInt
+        Add(selfGroupIndex)           : UInt
+        Add(parentGroupIndex)         : UInt
+        Add(refinedByChildGroupStart) : UInt
+        Add(aabbMin)                  : Vec3
+        Add(selfGroupError)           : Float
+        Add(aabbMax)                  : Vec3
+        Add(parentGroupError)         : Float
+        Add(selfGroupSphere)          : Vec4
+        Add(parentGroupSphere)        : Vec4
+        Add(normalConeAxisAndSin)     : Vec4
+        Add(thinFeatureMetric)        : Float
+        Add(maxEdgeLength)            : Float
+        Add(refinedByChildGroupCount) : UInt
+        Add(clusterFlags)             : UInt
+    }
+
+    StructuredBuffer InMaterialTable {
+        Add(materialId)               : UInt
+        Add(nvgFlags)                 : UInt
+        Add(opaqueBucketIndex)        : UInt
+        Add(depthBucketIndex)         : UInt
+        Add(transparentBucketIndex)   : UInt
+        Add(shadowBucketIndex)        : UInt
+        Add(opaqueInstBucketIndex)    : UInt
+        Add(shadowInstBucketIndex)    : UInt
+        Add(maxWorldDisplacement)     : Float
+        Add(lodErrorScale)            : Float
+        Add(shadowLodErrorScale)      : Float
+        Add(compatStatus)             : UInt
+        Add(depthInstBucketIndex)     : UInt
+        Add(transInstBucketIndex)     : UInt
+        Add(skinnedOpaqueBucketIndex) : UInt
+        Add(skinnedShadowBucketIndex) : UInt
+    }
+
+    StructuredBuffer InBonePalette {
+        Add(boneMatrix) : Mat4
+    }
+
+    StructuredBuffer InSkinnedBounds {
+        Add(localDeltaMin) : Vec4
+        Add(localDeltaMax) : Vec4
+    }
+
+#if NVG_RASTER_ATOMIC64
+    RWStructuredBuffer OutVisBuffer64 {
+        Add(vis64) : UInt64
+    }
+#else
+    RWStructuredBuffer OutAtomicDepthKey32 {
+        Add(depthKey) : UInt
+    }
+
+    RWStructuredBuffer OutAtomicPayload32 {
+        Add(payload) : UInt
+    }
+#endif
+
+    RWStructuredBuffer OutSWClusterList {
+        Add(visClusterIndex) : UInt
+    }
+
+    RWStructuredBuffer OutSWScheduledMask {
+        Add(mask) : UInt
+    }
+
+    RWStructuredBuffer OutWinningClusterMask {
+        Add(mask) : UInt
+    }
+
+    RWStructuredBuffer OutQueueCounters {
+        Add(count) : UInt
+    }
+
+    RWStructuredBuffer OutTelemetry {
+        Add(word) : UInt
+    }
+}
+
+SHADER {
+#include "NorthstarLibrary/VirtualGeometry/NVGRasterMath.nsl"
+
+    groupshared Float gs_ClipX[256];
+    groupshared Float gs_ClipY[256];
+    groupshared Float gs_ClipZ[256];
+    groupshared Float gs_ClipW[256];
+    groupshared UInt  gs_CoveredAny;
+    groupshared UInt  gs_AbortToHW;
+    groupshared UInt  gs_SWTotal;
+
+    // Strategy-specialized atomic visibility pixel commit (sole strategy-divergent primitive):
+    void CommitVisPixel(UInt pxIdx, UInt depthKey32, UInt payload32, UInt passMode) {
+#if NVG_RASTER_ATOMIC64
+        UInt64 vis64  = (UInt64(depthKey32) << 32u) | UInt64(payload32);
+        UInt64 prev64 = UInt64(0u);
+        InterlockedMax(NVGMicropolyParams.OutVisBuffer64[pxIdx].vis64, vis64, prev64);
+#else
+        UInt prev32 = 0u;
+        if (passMode == 2u) {
+            InterlockedMax(NVGMicropolyParams.OutAtomicDepthKey32[pxIdx].depthKey, depthKey32, prev32);
+        } else {
+            if (NVGMicropolyParams.OutAtomicDepthKey32[pxIdx].depthKey == depthKey32) {
+                InterlockedMax(NVGMicropolyParams.OutAtomicPayload32[pxIdx].payload, payload32, prev32);
+            }
+        }
+#endif
+    }
+
+    void RasterizeSubTriUniversal(
+        Vec4       p0,
+        Vec4       p1,
+        Vec4       p2,
+        UInt       vpW,
+        UInt       vpH,
+        UInt       cullMode,
+        UInt       isRevZ,
+        UInt       payload32,
+        UInt       passMode,
+        inout UInt ioCoveredCount)
+    {
+        if (p0.w <= 0.0 || p1.w <= 0.0 || p2.w <= 0.0) {
+            return;
+        }
+        Float invW0 = 1.0 / p0.w;
+        Float invW1 = 1.0 / p1.w;
+        Float invW2 = 1.0 / p2.w;
+
+        Float fW     = Float(vpW);
+        Float fH     = Float(vpH);
+        Float scaleX =  0.5 * fW * 256.0;
+        Float scaleY = -0.5 * fH * 256.0;
+        Float biasX  =  0.5 * fW * 256.0 + 0.5;
+        Float biasY  =  0.5 * fH * 256.0 + 0.5;
+
+        Float fv0x = Floor((p0.x * invW0) * scaleX + biasX);
+        Float fv0y = Floor((p0.y * invW0) * scaleY + biasY);
+        Float z0   = p0.z * invW0;
+
+        Float fv1x = Floor((p1.x * invW1) * scaleX + biasX);
+        Float fv1y = Floor((p1.y * invW1) * scaleY + biasY);
+        Float z1   = p1.z * invW1;
+
+        Float fv2x = Floor((p2.x * invW2) * scaleX + biasX);
+        Float fv2y = Floor((p2.y * invW2) * scaleY + biasY);
+        Float z2   = p2.z * invW2;
+
+        if (!(Abs(fv0x) <= 1048576.0 && Abs(fv0y) <= 1048576.0 &&
+              Abs(fv1x) <= 1048576.0 && Abs(fv1y) <= 1048576.0 &&
+              Abs(fv2x) <= 1048576.0 && Abs(fv2y) <= 1048576.0)) {
+            return;
+        }
+
+        Int v0x = Int(fv0x); Int v0y = Int(fv0y);
+        Int v1x = Int(fv1x); Int v1y = Int(fv1y);
+        Int v2x = Int(fv2x); Int v2y = Int(fv2y);
+
+        Int e01x = v1x - v0x;
+        Int e01y = v1y - v0y;
+        Int e12x = v2x - v1x;
+        Int e12y = v2y - v1y;
+        if (Abs(e01x) > 360000 || Abs(e01y) > 360000 ||
+            Abs(e12x) > 360000 || Abs(e12y) > 360000 ||
+            Abs(v0x - v2x) > 360000 || Abs(v0y - v2y) > 360000) {
+            return;
+        }
+
+        Int areaSign = NVGComputeSubpixelAreaSign16_8(e01x, e01y, e12x, e12y);
+        if (areaSign == 0) {
+            return;
+        }
+        Bool areaNeg = (areaSign < 0);
+        if ((cullMode == 2u && areaNeg) || (cullMode == 1u && !areaNeg)) {
+            return;
+        }
+        if (areaNeg) {
+            Int   tx = v1x; v1x = v2x; v2x = tx;
+            Int   ty = v1y; v1y = v2y; v2y = ty;
+            Float tz = z1;  z1  = z2;  z2  = tz;
+            e01x = v1x - v0x;
+            e01y = v1y - v0y;
+            e12x = v2x - v1x;
+            e12y = v2y - v1y;
+        }
+        Int e20x = v0x - v2x;
+        Int e20y = v0y - v2y;
+
+        Int minVx = Min(v0x, Min(v1x, v2x));
+        Int minVy = Min(v0y, Min(v1y, v2y));
+        Int maxVx = Max(v0x, Max(v1x, v2x));
+        Int maxVy = Max(v0y, Max(v1y, v2y));
+
+        // Exact viewport sample-center bounds (ZERO silent 64x64 truncation!)
+        Int minPxX = Max((minVx + 127) >> 8, 0);
+        Int minPxY = Max((minVy + 127) >> 8, 0);
+        Int maxPxX = Min((maxVx - 128) >> 8, Int(vpW) - 1);
+        Int maxPxY = Min((maxVy - 128) >> 8, Int(vpH) - 1);
+        if (minPxX > maxPxX || minPxY > maxPxY) {
+            return;
+        }
+
+        Int baseSubX = (minPxX << 8) + 128;
+        Int baseSubY = (minPxY << 8) + 128;
+
+        Int dv1x = v1x - baseSubX;
+        Int dv1y = v1y - baseSubY;
+        Int dv2x = v2x - baseSubX;
+        Int dv2y = v2y - baseSubY;
+        Int dv0x = v0x - baseSubX;
+        Int dv0y = v0y - baseSubY;
+
+        Int tlBias0 = ((e12y < 0) || (e12y == 0 && e12x > 0)) ? 0 : 1;
+        Int tlBias1 = ((e20y < 0) || (e20y == 0 && e20x > 0)) ? 0 : 1;
+        Int tlBias2 = ((e01y < 0) || (e01y == 0 && e01x > 0)) ? 0 : 1;
+
+        Int rem0 = e12y * (dv1x & 255) - e12x * (dv1y & 255) - tlBias0;
+        Int rem1 = e20y * (dv2x & 255) - e20x * (dv2y & 255) - tlBias1;
+        Int rem2 = e01y * (dv0x & 255) - e01x * (dv0y & 255) - tlBias2;
+
+        Int cy0 = (e12y * (dv1x >> 8) - e12x * (dv1y >> 8)) + (rem0 >> 8);
+        Int cy1 = (e20y * (dv2x >> 8) - e20x * (dv2y >> 8)) + (rem1 >> 8);
+        Int cy2 = (e01y * (dv0x >> 8) - e01x * (dv0y >> 8)) + (rem2 >> 8);
+
+        Float fSub0 = Float((rem0 & 255) + tlBias0) * (1.0 / 256.0);
+        Float fSub1 = Float((rem1 & 255) + tlBias1) * (1.0 / 256.0);
+        Float fSub2 = Float((rem2 & 255) + tlBias2) * (1.0 / 256.0);
+
+        Float sumC = (Float(cy0) + fSub0) + (Float(cy1) + fSub1) + (Float(cy2) + fSub2);
+        if (sumC <= 0.0) {
+            return;
+        }
+        Float invAreaScaled = 1.0 / sumC;
+        Float dZ1           = (z1 - z0) * invAreaScaled;
+        Float dZ2           = (z2 - z0) * invAreaScaled;
+
+        Int spanX = maxPxX - minPxX;
+        if (spanX <= 4) {
+            for (Int py = minPxY; py <= maxPxY; py = py + 1) {
+                Int  cx0     = cy0;
+                Int  cx1     = cy1;
+                Int  cx2     = cy2;
+                UInt rowBase = UInt(py) * vpW;
+                for (Int px = minPxX; px <= maxPxX; px = px + 1) {
+                    if ((cx0 | cx1 | cx2) >= 0) {
+                        Float devZ = z0 + dZ1 * (Float(cx1) + fSub1) + dZ2 * (Float(cx2) + fSub2);
+                        if (devZ >= 0.0 && devZ <= 1.0) {
+                            ioCoveredCount = ioCoveredCount + 1u;
+                            UInt zBits = AsUInt(Saturate(devZ));
+                            UInt dKey  = (isRevZ != 0u) ? zBits : (~zBits);
+                            CommitVisPixel(rowBase + UInt(px), dKey, payload32, passMode);
+                        }
+                    }
+                    cx0 = cx0 - e12y;
+                    cx1 = cx1 - e20y;
+                    cx2 = cx2 - e01y;
+                }
+                cy0 = cy0 + e12x;
+                cy1 = cy1 + e20x;
+                cy2 = cy2 + e01x;
+            }
+        } else {
+            for (Int py = minPxY; py <= maxPxY; py = py + 1) {
+                Int dxStart = 0;
+                Int dxEnd   = spanX;
+
+                if (e12y == 0) {
+                    if (cy0 < 0) { dxEnd = -1; }
+                } else if (e12y > 0) {
+                    if (cy0 < 0) { dxEnd = -1; }
+                    else { dxEnd = Min(dxEnd, cy0 / e12y); }
+                } else if (cy0 < 0) {
+                    dxStart = Max(dxStart, ((-cy0) - 1) / (-e12y) + 1);
+                }
+
+                if (e20y == 0) {
+                    if (cy1 < 0) { dxEnd = -1; }
+                } else if (e20y > 0) {
+                    if (cy1 < 0) { dxEnd = -1; }
+                    else { dxEnd = Min(dxEnd, cy1 / e20y); }
+                } else if (cy1 < 0) {
+                    dxStart = Max(dxStart, ((-cy1) - 1) / (-e20y) + 1);
+                }
+
+                if (e01y == 0) {
+                    if (cy2 < 0) { dxEnd = -1; }
+                } else if (e01y > 0) {
+                    if (cy2 < 0) { dxEnd = -1; }
+                    else { dxEnd = Min(dxEnd, cy2 / e01y); }
+                } else if (cy2 < 0) {
+                    dxStart = Max(dxStart, ((-cy2) - 1) / (-e01y) + 1);
+                }
+
+                if (dxStart <= dxEnd) {
+                    Int  cx0     = cy0 - dxStart * e12y;
+                    Int  cx1     = cy1 - dxStart * e20y;
+                    Int  cx2     = cy2 - dxStart * e01y;
+                    UInt rowBase = UInt(py) * vpW;
+                    for (Int dx = dxStart; dx <= dxEnd; dx = dx + 1) {
+                        if ((cx0 | cx1 | cx2) >= 0) {
+                            Float devZ = z0 + dZ1 * (Float(cx1) + fSub1) + dZ2 * (Float(cx2) + fSub2);
+                            if (devZ >= 0.0 && devZ <= 1.0) {
+                                ioCoveredCount = ioCoveredCount + 1u;
+                                UInt zBits = AsUInt(Saturate(devZ));
+                                UInt dKey  = (isRevZ != 0u) ? zBits : (~zBits);
+                                CommitVisPixel(rowBase + UInt(minPxX + dx), dKey, payload32, passMode);
+                            }
+                        }
+                        cx0 = cx0 - e12y;
+                        cx1 = cx1 - e20y;
+                        cx2 = cx2 - e01y;
+                    }
+                }
+                cy0 = cy0 + e12x;
+                cy1 = cy1 + e20x;
+                cy2 = cy2 + e01x;
+            }
+        }
+    }
+
+    [numthreads(64, 1, 1)]
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
+        UInt mode = NVGMicropolyParams.Config.dispatchMode;
+        UInt prev = 0u;
+
+        // =================================================================
+        //  MODE 0: Clear Atomic Visibility Buffers + Bitmasks + SW Counter
+        // =================================================================
+        if (mode == 0u) {
+            UInt totalPx = NVGMicropolyParams.Config.viewportWidth * NVGMicropolyParams.Config.viewportHeight;
+            for (UInt idx = dtid.x; idx < totalPx; idx = idx + 4194240u) {
+#if NVG_RASTER_ATOMIC64
+                NVGMicropolyParams.OutVisBuffer64[idx].vis64 = UInt64(0u);
+#else
+                NVGMicropolyParams.OutAtomicDepthKey32[idx].depthKey = 0u;
+                NVGMicropolyParams.OutAtomicPayload32[idx].payload   = 0u;
+#endif
+            }
+            UInt maskWords = NVGMicropolyParams.Config.maskWordCount;
+            for (UInt mIdx = dtid.x; mIdx < maskWords; mIdx = mIdx + 4194240u) {
+                NVGMicropolyParams.OutSWScheduledMask[mIdx].mask    = 0u;
+                NVGMicropolyParams.OutWinningClusterMask[mIdx].mask = 0u;
+            }
+            if (dtid.x == 0u) {
+                NVGMicropolyParams.OutQueueCounters[20u].count = 0u;
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 1: Classify SW-Eligible Micropoly Clusters
+        // =================================================================
+        if (mode == 1u) {
+            UInt cntIdx = NVGMicropolyParams.Config.rawVisibleCounterIdx;
+            UInt visCnt = Min(NVGMicropolyParams.OutQueueCounters[cntIdx].count,
+                              NVGMicropolyParams.Config.maxVisibleCapacity);
+            // Bit 3 (8u) = SW eligible under Standard-Z; Bit 6 (64u) = SW eligible under Reversed-Z
+            UInt reqEligibleBit = (NVGMicropolyParams.Config.isReversedZ != 0u) ? 64u : 8u;
+
+            for (UInt visIdx = dtid.x; visIdx < visCnt; visIdx = visIdx + 4194240u) {
+                UInt bucket = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].drawBucketIndex;
+                UInt bFlags = NVGMicropolyParams.InBucketRanges[bucket].bucketFlags;
+                if ((bFlags & reqEligibleBit) == 0u) {
+                    continue;
+                }
+
+                UInt clusterId = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].clusterId;
+                UInt objSlot   = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].objectSlotIndex;
+                if (clusterId >= NVGMicropolyParams.Config.clusterMetaCount) {
+                    continue;
+                }
+
+                Mat4  worldMat = NVGMicropolyParams.InGPUSceneObjects[objSlot].worldMatrix;
+                Float maxScale = NVGComputeMaxWorldScaleUpperBound(worldMat);
+                if (maxScale < 0.0) {
+                    continue; // Non-finite or overflowed transform -> keep on HW path
+                }
+
+                Vec3 bMin = NVGMicropolyParams.InClusterMeta[clusterId].aabbMin;
+                Vec3 bMax = NVGMicropolyParams.InClusterMeta[clusterId].aabbMax;
+                UInt objFlags = NVGMicropolyParams.InGPUSceneObjects[objSlot].objectFlags;
+                if ((objFlags & 1024u) != 0u) {
+                    UInt sbIdx = NVGMicropolyParams.InGPUSceneObjects[objSlot].skinningBoundsOffset;
+                    if (sbIdx >= NVGMicropolyParams.Config.skinBoundsCount) {
+                        continue; // Missing skinning bounds -> conservative HW fallback
+                    }
+                    Vec4 dMin = NVGMicropolyParams.InSkinnedBounds[sbIdx].localDeltaMin;
+                    Vec4 dMax = NVGMicropolyParams.InSkinnedBounds[sbIdx].localDeltaMax;
+                    Float boneScale = dMin.w;
+                    if (!IsFinite(boneScale) || boneScale <= 0.0 || boneScale > 1.0e6) {
+                        continue;
+                    }
+                    bMin     = bMin + dMin.xyz;
+                    bMax     = bMax + dMax.xyz;
+                    maxScale = maxScale * Max(boneScale, 1.0);
+                }
+
+                Float edgeWorld = NVGMicropolyParams.InClusterMeta[clusterId].maxEdgeLength * maxScale;
+                if (!IsFinite(edgeWorld)) {
+                    continue;
+                }
+
+                Vec3  lCenter = (bMin + bMax) * 0.5;
+                Vec3  lExt    = (bMax - bMin) * 0.5;
+                Vec3  wCenter = Mul(worldMat, Vec4(lCenter, 1.0)).xyz;
+                Float wRadius = Length(lExt) * maxScale;
+
+                Float projEdgePx = 0.0;
+                if (NVGMicropolyParams.Config.isOrthographic != 0u) {
+                    projEdgePx = edgeWorld * NVGMicropolyParams.Config.lodProjScale;
+                } else {
+                    Float distNear = Max(Length(wCenter - NVGMicropolyParams.Config.cameraPosition) - wRadius,
+                                         Max(NVGMicropolyParams.Config.cameraNearPlane, 0.001));
+                    projEdgePx = (edgeWorld * NVGMicropolyParams.Config.lodProjScale) / distNear;
+                }
+                if (!IsFinite(projEdgePx)) {
+                    continue;
+                }
+
+                Float maxAllowedPx = (NVGMicropolyParams.Config.forceAllEligible != 0u)
+                    ? 512.0
+                    : NVGMicropolyParams.Config.swMaxEdgePixels;
+                if (projEdgePx <= maxAllowedPx) {
+                    UInt swSlot = 0u;
+                    InterlockedAdd(NVGMicropolyParams.OutQueueCounters[20u].count, 1u, swSlot);
+                    if (swSlot < NVGMicropolyParams.Config.swClusterCap) {
+                        NVGMicropolyParams.OutSWClusterList[swSlot].visClusterIndex = visIdx;
+                        UInt maskIdx = visIdx >> 5u;
+                        if (maskIdx < NVGMicropolyParams.Config.maskWordCount) {
+                            InterlockedOr(NVGMicropolyParams.OutSWScheduledMask[maskIdx].mask, 1u << (visIdx & 31u), prev);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 2 (Single-Pass Atomic64 / Pass 1 Depth Atomic32) &
+        //  MODE 3 (Pass 2 Payload Atomic32)
+        // =================================================================
+#if NVG_RASTER_ATOMIC64
+        if (mode != 2u) {
+            return;
+        }
+#else
+        if (mode != 2u && mode != 3u) {
+            return;
+        }
+#endif
+        if (gtid.x == 0u) {
+            gs_SWTotal = Min(NVGMicropolyParams.OutQueueCounters[20u].count, NVGMicropolyParams.Config.swClusterCap);
+        }
+        UInt  vpW             = NVGMicropolyParams.Config.viewportWidth;
+        UInt  vpH             = NVGMicropolyParams.Config.viewportHeight;
+        Bool  isOrtho         = (NVGMicropolyParams.Config.isOrthographic != 0u);
+        UInt  isRevZ          = NVGMicropolyParams.Config.isReversedZ;
+        Float wNear           = NVGMicropolyParams.Config.cameraNearPlane;
+        Mat4  vpMat           = NVGMicropolyParams.Config.vpMatrix;
+        Int   maxSpanAllowed  = (NVGMicropolyParams.Config.forceAllEligible != 0u)
+            ? 2048
+            : Int(Max(NVGMicropolyParams.Config.maxSWTriangleSpanPx, 1u));
+        GroupMemoryBarrierWithGroupSync();
+        UInt  swTotal         = gs_SWTotal;
+
+        for (UInt swIdx = gid.x; swIdx < swTotal; swIdx = swIdx + 65535u) {
+            UInt visIdx  = NVGMicropolyParams.OutSWClusterList[swIdx].visClusterIndex;
+            UInt maskIdx = visIdx >> 5u;
+            UInt maskBit = 1u << (visIdx & 31u);
+
+            if (gtid.x == 0u) {
+                Bool skipCl = (mode == 3u && maskIdx < NVGMicropolyParams.Config.maskWordCount) &&
+                              ((NVGMicropolyParams.OutSWScheduledMask[maskIdx].mask & maskBit) == 0u);
+                gs_CoveredAny = 0u;
+                gs_AbortToHW  = skipCl ? 2u : 0u;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt objSlot     = 0u;
+            UInt physPg      = 0u;
+            UInt wordOff     = 0u;
+            UInt matId       = 0u;
+            UInt boneOff     = 0u;
+            UInt boneCnt     = 0u;
+            UInt baseWord    = 0u;
+            UInt vertCount   = 0u;
+            UInt triCount    = 0u;
+            Bool hasSkin     = false;
+            Bool useIntLat   = false;
+            UInt srcStride   = 7u;
+            UInt vtxWordOff  = 0u;
+            UInt idxWordOff  = 0u;
+            UInt cullMode    = 2u;
+
+            if (gs_AbortToHW == 0u) {
+                objSlot = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].objectSlotIndex;
+                physPg  = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].physicalPageIndex;
+                wordOff = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].clusterWordOffset;
+                matId   = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].materialId;
+                boneOff = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].bonePaletteOffset;
+                boneCnt = NVGMicropolyParams.InCompactedVisibleClusters[visIdx].boneCount;
+
+                baseWord         = physPg * NVGMicropolyParams.Config.pageWordCount + wordOff;
+                UInt countsFlags = NVGMicropolyParams.InPagePool[baseWord + 14u].word;
+                UInt offsets     = NVGMicropolyParams.InPagePool[baseWord + 15u].word;
+                vertCount        = Min((countsFlags & 255u) | (((countsFlags >> 28u) & 1u) << 8u), 256u);
+                triCount         = Min((countsFlags >> 8u) & 255u, 128u);
+                UInt attrFlags   = (countsFlags >> 24u) & 255u;
+                hasSkin          = ((attrFlags & 4u) != 0u);
+                useIntLat        = ((attrFlags & 32u) != 0u);
+                srcStride        = hasSkin ? 11u : 7u;
+                vtxWordOff       = offsets & 255u;
+                idxWordOff       = (offsets >> 16u) & 65535u;
+
+                UInt h0 = NVGMicropolyParams.InPagePool[baseWord + 0u].word;
+                UInt h1 = NVGMicropolyParams.InPagePool[baseWord + 1u].word;
+                UInt h2 = NVGMicropolyParams.InPagePool[baseWord + 2u].word;
+                UInt h3 = NVGMicropolyParams.InPagePool[baseWord + 3u].word;
+                UInt h4 = NVGMicropolyParams.InPagePool[baseWord + 4u].word;
+                UInt h5 = NVGMicropolyParams.InPagePool[baseWord + 5u].word;
+
+                Mat4 worldMat = NVGMicropolyParams.InGPUSceneObjects[objSlot].worldMatrix;
+                UInt matFlags = (matId < NVGMicropolyParams.Config.materialTableCount)
+                    ? NVGMicropolyParams.InMaterialTable[matId].nvgFlags : 0u;
+                cullMode = ((matFlags & 16u) != 0u) ? 0u : (((matFlags & 1024u) != 0u) ? 1u : 2u);
+
+                // Phase 1: Cooperatively decode & transform <= 256 unique vertices into 4 KiB SOA LDS
+                for (UInt v = gtid.x; v < vertCount; v = v + 64u) {
+                    UInt vBase = baseWord + vtxWordOff + v * srcStride;
+                    UInt w0    = NVGMicropolyParams.InPagePool[vBase + 0u].word;
+                    UInt w1    = NVGMicropolyParams.InPagePool[vBase + 1u].word;
+                    UInt qxU   = w0 & 65535u;
+                    UInt qyU   = (w0 >> 16u) & 65535u;
+                    UInt qzU   = w1 & 65535u;
+
+                    Vec3 localPos = Vec3(0.0, 0.0, 0.0);
+                    if (useIntLat) {
+                        UInt lShift  = h4 & 31u;
+                        Int3 iGlobal = Int3(AsInt(h0), AsInt(h1), AsInt(h2)) +
+                                       Int3(Int(qxU << lShift), Int(qyU << lShift), Int(qzU << lShift));
+                        localPos = Vec3(Float(iGlobal.x), Float(iGlobal.y), Float(iGlobal.z)) * AsFloat(h3);
+                    } else {
+                        Vec3 posOrigin = Vec3(AsFloat(h0), AsFloat(h1), AsFloat(h2));
+                        Vec3 posExtent = Vec3(AsFloat(h3), AsFloat(h4), AsFloat(h5));
+                        localPos = posOrigin + Vec3(Float(qxU), Float(qyU), Float(qzU)) * (posExtent * (1.0 / 65535.0));
+                    }
+
+                    if (hasSkin && boneCnt > 0u && boneOff < NVGMicropolyParams.Config.bonePaletteCount) {
+                        UInt w7  = NVGMicropolyParams.InPagePool[vBase + 7u].word;
+                        UInt w8  = NVGMicropolyParams.InPagePool[vBase + 8u].word;
+                        UInt w9  = NVGMicropolyParams.InPagePool[vBase + 9u].word;
+                        UInt w10 = NVGMicropolyParams.InPagePool[vBase + 10u].word;
+                        Vec4 bw  = Vec4(
+                            Float(w9 & 65535u) * (1.0 / 65535.0),
+                            Float((w9 >> 16u) & 65535u) * (1.0 / 65535.0),
+                            Float(w10 & 65535u) * (1.0 / 65535.0),
+                            Float((w10 >> 16u) & 65535u) * (1.0 / 65535.0));
+                        Float wSum = bw.x + bw.y + bw.z + bw.w;
+                        if (wSum > 0.00001) {
+                            UInt maxLocal = Min(boneCnt - 1u, (NVGMicropolyParams.Config.bonePaletteCount - 1u) - boneOff);
+                            Vec4 nw       = bw * (1.0 / wSum);
+                            Mat4 b0 = NVGMicropolyParams.InBonePalette[boneOff + Min(w7 & 65535u, maxLocal)].boneMatrix;
+                            Mat4 b1 = NVGMicropolyParams.InBonePalette[boneOff + Min((w7 >> 16u) & 65535u, maxLocal)].boneMatrix;
+                            Mat4 b2 = NVGMicropolyParams.InBonePalette[boneOff + Min(w8 & 65535u, maxLocal)].boneMatrix;
+                            Mat4 b3 = NVGMicropolyParams.InBonePalette[boneOff + Min((w8 >> 16u) & 65535u, maxLocal)].boneMatrix;
+                            Vec4 p4 = Vec4(localPos, 1.0);
+                            localPos = (Mul(b0, p4).xyz * nw.x) + (Mul(b1, p4).xyz * nw.y) +
+                                       (Mul(b2, p4).xyz * nw.z) + (Mul(b3, p4).xyz * nw.w);
+                        }
+                    }
+
+                    Vec4 worldPos = Mul(worldMat, Vec4(localPos, 1.0));
+                    Vec4 clipPos  = Mul(vpMat, Vec4(worldPos.xyz, 1.0));
+                    if (!IsFinite(clipPos.x) || !IsFinite(clipPos.y) || !IsFinite(clipPos.z) || !IsFinite(clipPos.w)) {
+                        gs_AbortToHW = 1u;
+                        clipPos      = Vec4(0.0, 0.0, 0.0, 0.0);
+                    }
+                    gs_ClipX[v] = clipPos.x;
+                    gs_ClipY[v] = clipPos.y;
+                    gs_ClipZ[v] = clipPos.z;
+                    gs_ClipW[v] = clipPos.w;
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            // Phase 1.5 (Mode 2 Only): Cooperative Pre-Commit Span & Guardband Validation BEFORE writing any pixel!
+            if (mode == 2u && gs_AbortToHW == 0u) {
+                Bool laneNeedsAbort = false;
+                for (UInt tPass = 0u; tPass < 2u; tPass = tPass + 1u) {
+                    UInt tIdx = gtid.x + tPass * 64u;
+                    if (tIdx < triCount) {
+                        UInt packedTri = NVGMicropolyParams.InPagePool[baseWord + idxWordOff + tIdx].word;
+                        UInt i0        = packedTri & 255u;
+                        UInt i1        = (packedTri >> 8u) & 255u;
+                        UInt i2        = (packedTri >> 16u) & 255u;
+                        if (i0 < vertCount && i1 < vertCount && i2 < vertCount) {
+                            Vec4 c0 = Vec4(gs_ClipX[i0], gs_ClipY[i0], gs_ClipZ[i0], gs_ClipW[i0]);
+                            Vec4 c1 = Vec4(gs_ClipX[i1], gs_ClipY[i1], gs_ClipZ[i1], gs_ClipW[i1]);
+                            Vec4 c2 = Vec4(gs_ClipX[i2], gs_ClipY[i2], gs_ClipZ[i2], gs_ClipW[i2]);
+                            Vec4 poly[8];
+                            poly[0] = c0; poly[1] = c1; poly[2] = c2; poly[3] = c2;
+                            poly[4] = c2; poly[5] = c2; poly[6] = c2; poly[7] = c2;
+                            UInt polyCnt = NVGClipPolygonHomogeneous(
+                                c0, c1, c2, vpW, vpH, wNear, 0.00001, isOrtho,
+                                poly[0], poly[1], poly[2], poly[3], poly[4], poly[5], poly[6], poly[7]);
+                            for (UInt sub = 1u; sub + 1u < polyCnt && !laneNeedsAbort; sub = sub + 1u) {
+                                if (NVGSubTriangleRequiresHWFallback16_8(poly[0], poly[sub], poly[sub + 1u], vpW, vpH, cullMode, maxSpanAllowed)) {
+                                    laneNeedsAbort = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (laneNeedsAbort) {
+                    gs_AbortToHW = 1u;
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            UInt abortState = gs_AbortToHW;
+            if (abortState == 1u) {
+                if (mode == 2u && gtid.x == 0u) {
+                    if (maskIdx < NVGMicropolyParams.Config.maskWordCount) {
+                        InterlockedAnd(NVGMicropolyParams.OutSWScheduledMask[maskIdx].mask, ~maskBit, prev);
+                        InterlockedOr(NVGMicropolyParams.OutWinningClusterMask[maskIdx].mask, maskBit, prev);
+                    }
+                    InterlockedAdd(NVGMicropolyParams.OutTelemetry[42u].word, 1u, prev); // swFallbackToHWClusters
+                }
+            } else if (abortState == 0u) {
+                // Phase 2: Rasterize <= 128 triangles with zero silent clipping
+                UInt laneCovered = 0u;
+                for (UInt tPass = 0u; tPass < 2u; tPass = tPass + 1u) {
+                    UInt tIdx = gtid.x + tPass * 64u;
+                    if (tIdx < triCount) {
+                        UInt packedTri = NVGMicropolyParams.InPagePool[baseWord + idxWordOff + tIdx].word;
+                        UInt i0        = packedTri & 255u;
+                        UInt i1        = (packedTri >> 8u) & 255u;
+                        UInt i2        = (packedTri >> 16u) & 255u;
+                        if (i0 < vertCount && i1 < vertCount && i2 < vertCount) {
+                            Vec4 c0 = Vec4(gs_ClipX[i0], gs_ClipY[i0], gs_ClipZ[i0], gs_ClipW[i0]);
+                            Vec4 c1 = Vec4(gs_ClipX[i1], gs_ClipY[i1], gs_ClipZ[i1], gs_ClipW[i1]);
+                            Vec4 c2 = Vec4(gs_ClipX[i2], gs_ClipY[i2], gs_ClipZ[i2], gs_ClipW[i2]);
+                            Vec4 poly[8];
+                            poly[0] = c0; poly[1] = c1; poly[2] = c2; poly[3] = c2;
+                            poly[4] = c2; poly[5] = c2; poly[6] = c2; poly[7] = c2;
+                            UInt polyCnt = NVGClipPolygonHomogeneous(
+                                c0, c1, c2, vpW, vpH, wNear, 0.00001, isOrtho,
+                                poly[0], poly[1], poly[2], poly[3], poly[4], poly[5], poly[6], poly[7]);
+                            UInt payload = ((visIdx + 1u) << 8u) | (tIdx & 255u);
+                            for (UInt sub = 1u; sub + 1u < polyCnt; sub = sub + 1u) {
+                                RasterizeSubTriUniversal(poly[0], poly[sub], poly[sub + 1u], vpW, vpH, cullMode, isRevZ, payload, mode, laneCovered);
+                            }
+                        }
+                    }
+                }
+
+                if (mode == 2u && laneCovered > 0u) {
+                    InterlockedAdd(gs_CoveredAny, laneCovered, prev);
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (abortState == 0u && mode == 2u && gtid.x == 0u) {
+                InterlockedAdd(NVGMicropolyParams.OutTelemetry[40u].word, 1u, prev);           // swRasterizedClusters
+                InterlockedAdd(NVGMicropolyParams.OutTelemetry[43u].word, triCount, prev);     // swRasterizedTriangles
+                if (gs_CoveredAny > 0u) {
+                    InterlockedAdd(NVGMicropolyParams.OutTelemetry[44u].word, gs_CoveredAny, prev); // swCoveredPixels
+                }
+                // Conservative sub-pixel & silhouette-edge sliver guard: if a tiny grazing cluster covered <= 4 pixel centers
+                // in SW, mark it conservative-keep in OutWinningClusterMask so HW rasterization never drops a 1-ULP grazing edge.
+                if (gs_CoveredAny <= 4u && maskIdx < NVGMicropolyParams.Config.maskWordCount) {
+                    InterlockedOr(NVGMicropolyParams.OutWinningClusterMask[maskIdx].mask, maskBit, prev);
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+}

@@ -2202,7 +2202,8 @@ namespace Northstar
                                 UINT32 mipSlice, GPUResourceAccess uavAccess)
         {
             if (!name || pass >= PassType::COUNT) return false;
-            if (texture && texture->GetUsage() != TextureUsage::STORAGE) return false;
+            if (texture && (texture->GetUsage() != TextureUsage::STORAGE ||
+                            (mipSlice != 0xFFFFFFFFu && mipSlice >= texture->GetMipLevels()))) return false;
             BOOL modified = false;
             for (UINT8 s = 0; s < static_cast<UINT8>(GraphicsShaderSlot::COUNT); ++s)
             {
@@ -2239,7 +2240,8 @@ namespace Northstar
                                      UINT32 mipSlice, GPUResourceAccess uavAccess)
         {
             if (!group || !name || pass >= PassType::COUNT) return false;
-            if (texture && texture->GetUsage() != TextureUsage::STORAGE) return false;
+            if (texture && (texture->GetUsage() != TextureUsage::STORAGE ||
+                            (mipSlice != 0xFFFFFFFFu && mipSlice >= texture->GetMipLevels()))) return false;
             BOOL modified = false;
             for (UINT8 s = 0; s < static_cast<UINT8>(GraphicsShaderSlot::COUNT); ++s)
             {

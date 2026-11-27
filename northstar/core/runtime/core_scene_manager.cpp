@@ -111,9 +111,24 @@ namespace Northstar
 
     RenderObject* CoreSceneManager::CreateRenderObject(const RenderObjectDesc& desc)
     {
+        if (desc.materialCount > 0u && desc.materials == nullptr)
+        {
+            return nullptr;
+        }
+        if (desc.materialCount > kNVGMaxMaterialSlots)
+        {
+            return nullptr;
+        }
         RenderObject* renderObject = new RenderObject();
         renderObject->SetMesh(desc.mesh);
         renderObject->SetMaterial(desc.material);
+        if (desc.materials != nullptr && desc.materialCount > 0u)
+        {
+            for (UINT32 slot = 0u; slot < desc.materialCount; ++slot)
+            {
+                renderObject->SetMaterial(slot, desc.materials[slot]);
+            }
+        }
         renderObject->SetLODGroup(desc.lodGroup);
         renderObject->SetWorldMatrix(desc.worldMatrix);
         renderObject->SetLayerMask(desc.layerMask);
@@ -218,8 +233,8 @@ namespace Northstar
         light->SetConstantAttenuation(desc.constantAttenuation);
         light->SetLinearAttenuation(desc.linearAttenuation);
         light->SetQuadraticAttenuation(desc.quadraticAttenuation);
-        light->SetInnerConeAngle(desc.innerConeAngle);
         light->SetOuterConeAngle(desc.outerConeAngle);
+        light->SetInnerConeAngle(desc.innerConeAngle);
         if (!light->SetShadowResolution(desc.shadowResolution) ||
             !light->SetShadowSoftness(desc.shadowSoftness) ||
             !light->SetShadowBias(desc.shadowBias) ||
@@ -335,9 +350,9 @@ namespace Northstar
         }
         for (RenderObject* ro : m_renderObjects)
         {
-            if (ro && ro->GetMaterial() == destroyedMaterial)
+            if (ro)
             {
-                ro->SetMaterial(nullptr);
+                ro->ClearDestroyedMaterial(destroyedMaterial);
             }
         }
     }

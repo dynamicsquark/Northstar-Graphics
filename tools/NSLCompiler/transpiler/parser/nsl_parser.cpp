@@ -1141,12 +1141,33 @@ ExprPtr Parser::ParsePrimary(DiagnosticEngine& diag)
         Advance();
         return lit;
     }
+    if (Check(TokenKind::LIT_UINT64))
+    {
+        auto lit = std::make_unique<LiteralExpr>();
+        lit->litKind   = LiteralExpr::Kind::UInt64;
+        lit->uintValue = Current().uintValue;
+        lit->intValue  = Current().intValue;
+        lit->location  = Current().location;
+        Advance();
+        return lit;
+    }
     if (Check(TokenKind::LIT_FLOAT))
     {
         auto lit = std::make_unique<LiteralExpr>();
-        lit->location   = loc;
-        lit->litKind    = LiteralExpr::Kind::Float;
-        lit->floatValue = Current().floatValue;
+        lit->location       = loc;
+        lit->litKind        = LiteralExpr::Kind::Float;
+        lit->floatValue     = Current().floatValue;
+        lit->hasFloatSuffix = Current().hasFloatSuffix;
+        Advance();
+        return lit;
+    }
+    if (Check(TokenKind::LIT_DOUBLE))
+    {
+        auto lit = std::make_unique<LiteralExpr>();
+        lit->location       = loc;
+        lit->litKind        = LiteralExpr::Kind::Double;
+        lit->floatValue     = Current().floatValue;
+        lit->hasFloatSuffix = false;
         Advance();
         return lit;
     }

@@ -34,19 +34,34 @@ namespace Northstar
 #pragma warning(push)
 #pragma warning(disable : 4324)
 #endif
+    struct NVGPromotedCBVTemplateSpan
+    {
+        const NSL::NSCBuffer* nscBuf             = nullptr;
+        ShaderStage           stage              = ShaderStage::VERTEX;
+        UINT32                templateWordOffset = 0u;
+        UINT32                byteSize           = 0u;
+    };
+
     struct NVGDrawBucketEntry
     {
-        UINT32                 bucketIndex      = 0u;
-        Material*              material         = nullptr;
-        ShaderSet*             shaderSet        = nullptr;
-        PassType               passType         = PassType::GEOMETRY;
-        ShaderVariant          variant          = ShaderVariant::STANDARD;
-        BOOL                   isVertexPull     = false;
-        BOOL                   isTransparent    = false;
-        BOOL                   isShadowPass     = false;
-        BOOL                   isDepthPass      = false;
-        IndirectRootBindingKey indirectRootKey{};
-        NVSDrawGroupShaderBindingDesc bindingDesc{};
+        UINT32                                  bucketIndex               = 0u;
+        Material*                               material                  = nullptr;
+        ShaderSet*                              shaderSet                 = nullptr;
+        PassType                                passType                  = PassType::GEOMETRY;
+        ShaderVariant                           variant                   = ShaderVariant::STANDARD;
+        BOOL                                    isVertexPull              = false; // True only for unindexed raw Path-A
+        BOOL                                    isIndexedPull             = false; // Path-A Indexed Cluster Pull (0 VB words, unpacked IB)
+        BOOL                                    isTransparent             = false;
+        BOOL                                    isShadowPass              = false;
+        BOOL                                    isDepthPass               = false;
+        BOOL                                    isDepthCompanion          = false;
+        BOOL                                    hasRejectedCustomDepth    = false;
+        UINT32                                  depthCompanionBucketIndex = kNVGInvalidIndex;
+        UINT32                                  decodeVertexWords         = 28u;
+        UINT32                                  decodeAttrMask            = 0x1FFu;
+        IndirectRootBindingKey                  indirectRootKey{};
+        NVGDrawGroupShaderBindingDesc           bindingDesc{};
+        std::vector<NVGPromotedCBVTemplateSpan> promotedCBVSpans;
     };
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -81,11 +96,12 @@ namespace Northstar
 
         // Virtual mesh build / deserialize + residency registration
         BOOL CreateAndRegisterVirtualMesh(
-            const MeshDesc& desc,
-            UINT32          meshId,
-            NVGMeshInfo&    outInfo,
-            AABB&           outLocalBounds,
-            std::string&    outError);
+            const MeshDesc&                          desc,
+            UINT32                                   meshId,
+            NVGMeshInfo&                             outInfo,
+            AABB&                                    outLocalBounds,
+            std::string&                             outError,
+            std::shared_ptr<INVGPageStreamProvider>* outResolvedStreamProvider = nullptr);
 
         void UnregisterVirtualMesh(UINT32 meshId);
         BOOL SerializeVirtualMesh(UINT32 meshId, std::vector<BYTE>& outBlob) const;
@@ -115,7 +131,9 @@ namespace Northstar
             GPUBuffer*                gpuSceneBuffer,
             UINT32                    gpuSceneSlotCount,
             CoreRenderPipeline*       renderPipeline,
-            RenderStats&              stats);
+            RenderStats&              stats,
+            BOOL                      isFirstCameraInFrame = true,
+            BOOL                      isFinalCameraInFrame = true);
 
         // Injects independent NVS + NVG shadow caster culling, shadow-texel LOD,
         // compaction/decode, and shadow draw commands directly into NVS's LayeredDepthPassView.
@@ -146,6 +164,18 @@ namespace Northstar
         void OnSceneDestroyed(const Scene* scene);
         void OnResize();
 
+        BOOL                    SetMockCapabilitiesOverride(BOOL enableOverride, const BackendCapabilities& mockCaps);
+        BOOL                    DebugReloadRasterKernels(
+            BOOL    bypassDiskCache,
+            BYTE*   outAtomic32Bytecode,
+            UINT32  maxAtomic32Bytes,
+            UINT32* outAtomic32ActualBytes,
+            BYTE*   outAtomic64Bytecode,
+            UINT32  maxAtomic64Bytes,
+            UINT32* outAtomic64ActualBytes);
+        BackendCapabilities     GetEffectiveCapabilities() const noexcept;
+        NVGRasterAtomicStrategy ResolveActiveCameraRasterStrategy() const noexcept;
+
     private:
         struct CameraNVGContext
         {
@@ -157,16 +187,32 @@ namespace Northstar
             UINT32        lastViewportW     = 0u;
             UINT32        lastViewportH     = 0u;
             BOOL          hasValidPrevHZB   = false;
+            Mat4          prevViewMatrix    = Mat4::Identity();
+            Mat4          prevProjMatrix    = Mat4::Identity();
             Mat4          prevViewProj      = Mat4::Identity();
             Vec3          prevCameraPos     = Vec3::Zero();
             UINT64        lastSceneMutationEpoch = 0ull;
-            Vec3          lodHysteresisPos  = Vec3::Zero();
+            UINT64        lastResidencyRevision  = 0ull;
+            Vec3          lodHysteresisPos       = Vec3::Zero();
             BOOL          hasLodHysteresis  = false;
             BOOL          telemetryPending        = false;
             BOOL          hasLastTelemetry        = false;
-            UINT32        lastTelemetryWords[40]  = {};
+            UINT32        lastTelemetryWords[48]  = {};
             BOOL          usedThisFrame           = false;
             BOOL          cameraPassRanThisFrame  = false;
+            BOOL          lastUsedSplitAtomic32   = false;
+
+            // Compute Software Micropoly Rasterizer isolated resources (Decision 4C)
+            Texture*      swVisTexture            = nullptr;
+            Texture*      swDepthTexture          = nullptr;
+            UINT32        swTexWidth              = 0u;
+            UINT32        swTexHeight             = 0u;
+            GPUBuffer*    visBuffer64             = nullptr;
+            GPUBuffer*    swAtomicDepthKey32      = nullptr;
+            GPUBuffer*    swAtomicPayload32       = nullptr;
+            GPUBuffer*    swClusterList           = nullptr;
+            GPUBuffer*    swScheduledMask         = nullptr;
+            GPUBuffer*    swWinningClusterMask    = nullptr;
 
             // Autonomous dynamic GPU queue & Path-B pool capacities (2x growth on watermark/overflow)
             UINT32        dynNodeQueueCap         = 524288u;
@@ -184,6 +230,7 @@ namespace Northstar
             GPUBuffer* nodeQueueB               = nullptr;
             GPUBuffer* candidateClusters        = nullptr;
             GPUBuffer* occludedObjects          = nullptr;
+            GPUBuffer* occludedNodes            = nullptr;
             GPUBuffer* occludedClusters         = nullptr;
             GPUBuffer* rawVisibleClusters       = nullptr;
             GPUBuffer* compactedVisibleClusters = nullptr;
@@ -216,6 +263,8 @@ namespace Northstar
 
             // Dedicated shadow working buffers (so camera visible clusters stay intact across NVS shadow pass!)
             GPUBuffer* shadowPageViews          = nullptr;
+            GPUBuffer* shadowViewMasks          = nullptr;
+            GPUBuffer* shadowPageMasks          = nullptr;
             GPUBuffer* shadowRawVisible         = nullptr;
             GPUBuffer* shadowCompactedVisible   = nullptr;
             GPUBuffer* shadowBucketRanges       = nullptr;
@@ -230,6 +279,14 @@ namespace Northstar
             GPUBuffer* shadowDecodedIndexPool   = nullptr;
             GPUBuffer* shadowDecodedClusterTbl  = nullptr;
             GPUBuffer* shadowUniqueDecodeJobs   = nullptr;
+            GPUBuffer* shadowSWDepthKeyPool     = nullptr;
+            GPUBuffer* shadowSWClusterList      = nullptr;
+            GPUBuffer* shadowSWScheduledMask    = nullptr;
+            GPUBuffer* shadowSWFallbackMask     = nullptr;
+            GPUBuffer* shadowSWPageNeedsTile    = nullptr;
+            GPUBuffer* shadowSWPageTileMap      = nullptr;
+            GPUBuffer* shadowSWDirtyTileSlices  = nullptr;
+            GPUBuffer* shadowSWMergeIndirectArgs= nullptr;
 
             UINT32 frameTagCounter = 1u;
         };
@@ -258,6 +315,11 @@ namespace Northstar
             std::vector<NVSDrawGroupFieldPatch>& ioPatches,
             std::vector<UINT32>&                 ioTemplateWords);
 
+        void RefreshBucketTemplatesForView(
+            const FrameView& frameView,
+            Scene*           scene,
+            BOOL             isShadowPass);
+
         BOOL AppendHZBBuildDispatches(
             CameraNVGContext&           ctx,
             Texture*                    sceneDepthTex,
@@ -266,7 +328,8 @@ namespace Northstar
             UINT32                      vpW,
             UINT32                      vpH,
             BOOL                        isReversedZ,
-            std::vector<FramePassItem>& outItems);
+            std::vector<FramePassItem>& outItems,
+            Texture*                    swDepthTex = nullptr);
 
         BOOL AppendResidencyMaskDispatch(std::vector<FramePassItem>& outItems);
 
@@ -347,25 +410,35 @@ namespace Northstar
         // Incremental material/bucket sync cache (O(M) steady-state instead of O(N) per-frame scene scan)
         struct CachedSyncMaterialState
         {
-            const Material* material      = nullptr;
-            UINT32          matRev        = 0u;
-            UINT64          geomShaderRev = 0ull;
-            UINT64          shShaderRev   = 0ull;
-            UINT32          gpuMatId      = 0u;
+            const Material* material       = nullptr;
+            UINT32          matRev         = 0u;
+            UINT64          geomShaderRev  = 0ull;
+            UINT64          depthShaderRev = 0ull;
+            UINT64          shShaderRev    = 0ull;
+            UINT32          gpuMatId       = 0u;
         };
         const Scene*                         m_cachedSyncScene      = nullptr;
         SIZE_T                               m_cachedSyncObjCount   = 0u;
         UINT64                               m_cachedSyncSceneEpoch = ~0ull;
         std::vector<CachedSyncMaterialState> m_cachedSyncMaterials;
 
-        // Cached feature-dependent internal NVG compute kernels
-        ComputeKernel* m_kHZBBuild        = nullptr;
-        ComputeKernel* m_kResidencyMask   = nullptr;
-        ComputeKernel* m_kInstanceCull    = nullptr;
-        ComputeKernel* m_kHierarchyCull   = nullptr;
-        ComputeKernel* m_kCompactionDecode= nullptr;
-        ComputeKernel* m_kIndirectDraw    = nullptr;
-        ComputeKernel* m_kShadowCull      = nullptr;
+        // Cached feature-dependent internal NVG compute kernels & shadow SW merge shaders
+        ComputeKernel* m_kHZBBuild          = nullptr;
+        ComputeKernel* m_kResidencyMask     = nullptr;
+        ComputeKernel* m_kInstanceCull      = nullptr;
+        ComputeKernel* m_kHierarchyCull     = nullptr;
+        ComputeKernel* m_kCompactionDecode  = nullptr;
+        ComputeKernel* m_kIndirectDraw      = nullptr;
+        ComputeKernel* m_kShadowCull              = nullptr;
+        ComputeKernel* m_kShadowMicropolyRaster   = nullptr;
+        ComputeKernel* m_kMicropolyRasterAtomic64 = nullptr;
+        ComputeKernel* m_kMicropolyRasterAtomic32 = nullptr;
+        ComputeKernel* m_kDepthExport             = nullptr;
+        Shader*        m_shadowSWMergeVS          = nullptr;
+        Shader*        m_shadowSWMergeGS          = nullptr;
+        Shader*        m_shadowSWMergePS          = nullptr;
+        BOOL                m_hasMockCapsOverride = false;
+        BackendCapabilities m_mockCapabilities{};
 
         // Global per-frame material / draw-bucket / reflection tables
         std::vector<NVGMaterialGPUData>            m_materialTable;
@@ -373,10 +446,10 @@ namespace Northstar
         std::vector<NVGDrawBucketEntry>            m_shadowBuckets;
         std::vector<UINT32>                        m_cameraBucketFlags;
         std::vector<UINT32>                        m_shadowBucketFlags;
-        std::vector<NVSDrawGroupShaderBindingDesc> m_cameraBindingDescs;
+        std::vector<NVGDrawGroupShaderBindingDesc> m_cameraBindingDescs;
         std::vector<NVSDrawGroupFieldPatch>        m_cameraFieldPatches;
         std::vector<UINT32>                        m_cameraTemplateWords;
-        std::vector<NVSDrawGroupShaderBindingDesc> m_shadowBindingDescs;
+        std::vector<NVGDrawGroupShaderBindingDesc> m_shadowBindingDescs;
         std::vector<NVSDrawGroupFieldPatch>        m_shadowFieldPatches;
         std::vector<UINT32>                        m_shadowTemplateWords;
 
@@ -390,6 +463,11 @@ namespace Northstar
         GPUBuffer* m_shadowPatchesBuf       = nullptr;
         GPUBuffer* m_shadowTemplatesBuf     = nullptr;
         GPUBuffer* m_dummyCommitRecordsBuf  = nullptr;
+        GPUBuffer* m_dummySkinnedBoundsBuf  = nullptr;
+        GPUBuffer* m_dummyObjectMatSlotsBuf = nullptr;
+        GPUBuffer* m_dummyBonePaletteBuf    = nullptr;
+        GPUBuffer* m_dummySWMaskBuf         = nullptr;
+        BOOL       m_sceneHasAnimatedDeformation = false;
 
         // Shadow configuration & per-material shadow policy tracking for automatic NVS cache invalidation
         BOOL    m_hasLastShadowConfigState = false;

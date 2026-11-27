@@ -3,6 +3,7 @@
 #include "../types/northstar_types.h"
 #include "../types/northstar_math.h"
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -12,18 +13,23 @@ namespace Northstar
     //  Northstar Virtual Geometry (NVG) — Core Constants & ABI
     // =====================================================================
 
-    inline constexpr UINT32 kNVGBinaryMagic                 = 0x3147564Eu; // "NVG1"
+    inline constexpr UINT32 kNVG1BinaryMagic                = 0x3147564Eu; // "NVG1"
+    inline constexpr UINT32 kNVG2BinaryMagic                = 0x3247564Eu; // "NVG2"
+    inline constexpr UINT32 kNVGBinaryMagic                 = kNVG1BinaryMagic;
     inline constexpr UINT32 kNVGBinaryVersion               = 1u;
+    inline constexpr UINT32 kNVG2BinaryVersion              = 2u;
 
     inline constexpr UINT32 kNVGPageSizeBytes               = 32768u;      // 32 KiB physical geometry page
     inline constexpr UINT32 kNVGPageWordCount               = kNVGPageSizeBytes / sizeof(UINT32); // 8192 UINT32 words
     inline constexpr UINT32 kNVGMaxClusterTriangles         = 128u;
-    inline constexpr UINT32 kNVGMaxClusterVertices          = 128u;
+    inline constexpr UINT32 kNVG1MaxClusterVertices         = 128u;
+    inline constexpr UINT32 kNVGMaxClusterVertices          = 256u;
+    inline constexpr UINT32 kNVGMaxMaterialSlots            = 256u;
     inline constexpr UINT32 kNVGClusterHeaderWords          = 16u;         // 64 bytes
     inline constexpr UINT32 kNVGRigidVertexWords            = 7u;          // 28 bytes (4.0x vs 112B Northstar::Vertex)
     inline constexpr UINT32 kNVGSkinnedVertexWords          = 11u;         // 44 bytes (2.55x vs 112B Northstar::Vertex)
     inline constexpr UINT32 kNVGMaxLODLevels                = 16u;
-    inline constexpr UINT32 kNVGMaxBVHDepth                 = 12u;
+    inline constexpr UINT32 kNVGMaxBVHDepth                 = 16u;
     inline constexpr UINT32 kNVGInvalidIndex                = 0xFFFFFFFFu;
     inline constexpr UINT32 kNVGDefaultPhysicalPageCapacity = 2048u;       // 64 MiB initial baseline physical VRAM pool
     inline constexpr UINT32 kNVGMinPhysicalPageCapacity     = 8u;          // 256 KiB minimum pool capacity
@@ -33,6 +39,46 @@ namespace Northstar
     inline constexpr UINT32 kNVGAutoUploadRate              = 0xFFFFFFFFu; // Autonomous adaptive burst/steady upload scheduler
     inline constexpr UINT32 kNVGMaxDrawBuckets              = 256u;
     inline constexpr UINT32 kNVGMaxCommandsPerBucket        = 262144u;
+    inline constexpr UINT32 kNVGDecodedHashTableCapacity    = 262144u;     // Fixed 4 MiB power-of-2 open-addressed GPU decode table
+
+    enum NVGBucketRangeFlags : UINT32
+    {
+        NVG_BUCKET_FLAG_NONE                 = 0u,
+        NVG_BUCKET_FLAG_IA_STREAM            = 1u << 0, // Path-B GPU-decoded IA vertex + index stream
+        NVG_BUCKET_FLAG_TRANSPARENT          = 1u << 1, // Back-to-front sorted transparent bucket
+        NVG_BUCKET_FLAG_INDEXED_PULL         = 1u << 2, // Path-A Indexed Cluster Pull (0 VB words, unpacked IB + promoted cluster offset)
+        NVG_BUCKET_FLAG_SW_ELIGIBLE          = 1u << 3, // Eligible for Compute Software Micropoly Rasterization (Standard-Z LESS/LESS_EQUAL)
+        NVG_BUCKET_FLAG_SH_READS_DEPTH_BIAS  = 1u << 4, // Shadow VS applies NVS_DEPTH_BIAS_NDC / NVG_SHADOW_PAGE_DEPTH_BIAS
+        NVG_BUCKET_FLAG_SH_READS_NORMAL_BIAS = 1u << 5, // Shadow VS applies NVS_NORMAL_BIAS_WORLD / NVG_SHADOW_PAGE_NORMAL_BIAS
+        NVG_BUCKET_FLAG_SW_ELIGIBLE_REVZ     = 1u << 6  // Eligible for Compute Software Micropoly Rasterization (Reversed-Z GREATER/GREATER_EQUAL)
+    };
+
+    enum class NVGRasterAtomicStrategy : UINT8
+    {
+        AUTO                       = 0u, // Hardware-capability-driven: ATOMIC64_SINGLE_PASS when supported, else ATOMIC32_TWO_PASS
+        FORCE_ATOMIC32_TWO_PASS    = 1u, // Force universal two-pass 2x32-bit atomic commit (OutAtomicDepthKey32 + OutAtomicPayload32)
+        FORCE_ATOMIC64_SINGLE_PASS = 2u, // Force single-pass 64-bit atomic commit (explicitly rejected if GPU lacks 64-bit descriptor-heap atomics)
+        DISABLED                   = 3u, // Disable camera compute software rasterizer (HW-only baseline)
+
+        Auto                       = AUTO,
+        ForceAtomic32TwoPass       = FORCE_ATOMIC32_TWO_PASS,
+        ForceAtomic64SinglePass    = FORCE_ATOMIC64_SINGLE_PASS,
+        Disabled                   = DISABLED
+    };
+
+    inline constexpr BOOL IsValidNVGRasterAtomicStrategy(NVGRasterAtomicStrategy strategy) noexcept
+    {
+        switch (strategy)
+        {
+            case NVGRasterAtomicStrategy::AUTO:
+            case NVGRasterAtomicStrategy::FORCE_ATOMIC32_TWO_PASS:
+            case NVGRasterAtomicStrategy::FORCE_ATOMIC64_SINGLE_PASS:
+            case NVGRasterAtomicStrategy::DISABLED:
+                return true;
+            default:
+                return false;
+        }
+    }
 
     // =====================================================================
     //  High-Level User Quality & Memory Budget Presets (NVS-Aligned)
@@ -141,15 +187,11 @@ namespace Northstar
         NormalCone         = NORMAL_CONE
     };
 
-    enum class NVGExecutionPreference : UINT32
+    struct NVGSubmeshRange
     {
-        AUTO        = 0u,
-        VERTEX_PULL = 1u,
-        DECODED_IA  = 2u,
-
-        Auto        = AUTO,
-        VertexPull  = VERTEX_PULL,
-        DecodedIA   = DECODED_IA
+        UINT32 startIndex   = 0u;
+        UINT32 indexCount   = 0u;
+        UINT32 materialSlot = 0u;
     };
 
     enum class NVGCompatibilityStatus : UINT32
@@ -159,7 +201,7 @@ namespace Northstar
         REJECTED_MISSING_VARIANT         = 3u, // ShaderSet lacks required STANDARD/INSTANCED/SKINNED vertex variant
         REJECTED_MISSING_USER_BINDING    = 4u, // User Add() texture, sampler, StructuredBuffer, or GPUBuffer missing or destroyed
         REJECTED_INCOMPLETE_TESSELLATION = 5u, // ShaderSet declares only Hull or only Domain shader (both required by hardware)
-        REJECTED_ROOT_PROMOTION_LIMIT    = 7u, // Indirect shader exceeds promoted binding budget (>3 per-draw CBVs or >1 promoted SRV)
+        REJECTED_ROOT_PROMOTION_LIMIT    = 7u, // Indirect shader exceeds promoted binding budget (>8 per-draw CBVs or >2 promoted SRVs)
         REJECTED_MISSING_RT_ARRAY_IDX    = 9u, // Shadow ShaderSet lacks SV_RenderTargetArrayIndex output for NVS layered pass
         REJECTED_INVALID_MESH            = 10u,// Virtual mesh build failed or destroyed
         REJECTED_UNSUPPORTED_LAYOUT      = 11u // StructuredBuffer mixes incompatible physical domains or unrepresentable field layout
@@ -181,6 +223,7 @@ namespace Northstar
         BOOL    preserveSkinningAttributes   = true;
         BOOL    allowNonManifoldGeometry     = true;
         BOOL    generateShadowThinMetrics    = true;
+        UINT32  workerThreadCount            = 0u;     // 0 = hardware concurrency, 1 = single-threaded (bit-identical output)
     };
 
     struct NVGBuildReport
@@ -230,14 +273,13 @@ namespace Northstar
         NVGBuildReport buildReport{};
     };
 
-    // Physical bounds, LOD tuning & optional non-mandatory execution preference on Material
+    // Physical bounds & LOD tuning policy on Material
     struct NVGMaterialPolicy
     {
-        FLOAT32                maxWorldDisplacement = 0.0f;  // Conservative world-space bounds expansion for vertex displacement/skinning
-        FLOAT32                lodErrorScale        = 1.0f;  // Multiplier on screen-space error threshold (<1 = finer, >1 = coarser)
-        FLOAT32                shadowLodErrorScale  = 1.0f;  // Independent multiplier on NVS shadow texel error threshold
-        BOOL                   lockToLOD0           = false; // Locks automatic cluster LOD to LOD 0 while keeping GPU culling & paging
-        NVGExecutionPreference executionPreference  = NVGExecutionPreference::AUTO; // Optional non-mandatory execution hint
+        FLOAT32 maxWorldDisplacement = 0.0f;  // Conservative world-space bounds expansion for vertex displacement/skinning
+        FLOAT32 lodErrorScale        = 1.0f;  // Multiplier on screen-space error threshold (<1 = finer, >1 = coarser)
+        FLOAT32 shadowLodErrorScale  = 1.0f;  // Independent multiplier on NVS shadow texel error threshold
+        BOOL    lockToLOD0           = false; // Locks automatic cluster LOD to LOD 0 while keeping GPU culling & paging
     };
 
     // Engine-wide runtime NVG configuration:
@@ -262,13 +304,17 @@ namespace Northstar
         UINT32                    physicalPagePoolCapacity   = kNVGAutoPoolCapacity; // 0 = Autonomous elastic pool up to memoryBudget
         UINT32                    maxPageUploadsPerFrame     = kNVGAutoUploadRate;   // kNVGAutoUploadRate = Autonomous adaptive burst/steady scheduler
         UINT32                    minInFlightProtectFrames   = 4u;
+        BOOL                      enableSoftwareRasterizer   = true;
+        NVGRasterAtomicStrategy   swRasterAtomicStrategy     = NVGRasterAtomicStrategy::AUTO;
+        FLOAT32                   swRasterMaxEdgePixels      = 32.0f;
         NVGDebugVisualizationMode debugVisualizationMode     = NVGDebugVisualizationMode::NONE;
     };
 
     // Runtime NVG telemetry & performance statistics
     struct NVGStats
     {
-        BOOL    active                        = false;
+        BOOL                    active                        = false;
+        NVGRasterAtomicStrategy activeSWRasterStrategy        = NVGRasterAtomicStrategy::DISABLED;
         UINT32  registeredVirtualMeshCount    = 0u;
         UINT64  effectiveSceneTriangles       = 0ull; // Total source triangles across active virtualized RenderObjects in scene
         UINT32  totalVirtualPages             = 0u;
@@ -298,12 +344,18 @@ namespace Northstar
         UINT32  clustersSmallCulled           = 0u;
         UINT32  visibleOpaqueClusters         = 0u;
         UINT32  visibleTransparentClusters    = 0u;
+        UINT32  swRasterDispatches            = 0u;
+        UINT32  swRasterizedClusters          = 0u;
+        UINT32  swRasterizedTriangles         = 0u;
+        UINT32  swCoveredPixels               = 0u;
+        UINT32  swFallbackToHWClusters        = 0u;
         UINT32  decodedUniqueClusters         = 0u;
         UINT32  indirectDrawCommandsGenerated = 0u;
         UINT32  overflowDroppedClusters       = 0u;
         UINT32  shadowCastersEvaluated        = 0u;
         UINT32  shadowClustersTested          = 0u;
         UINT32  shadowClustersVisible         = 0u;
+        UINT32  shadowSWRasterizedClusters    = 0u;
         UINT32  shadowIndirectDrawsGenerated  = 0u;
         UINT32  shadowOverflowPages           = 0u;
         UINT32  shadowNodeQueueCapacity       = 0u;
@@ -315,11 +367,16 @@ namespace Northstar
         FLOAT32 gpuHZBBuildMs                 = 0.0f;
         FLOAT32 gpuCullAndLODMs               = 0.0f;
         FLOAT32 gpuDecodeAndDrawGenMs         = 0.0f;
+        FLOAT32 gpuSWRasterMs                 = 0.0f;
+        FLOAT32 gpuSWRasterPass1Ms            = 0.0f;
+        FLOAT32 gpuSWRasterPass2Ms            = 0.0f;
+        FLOAT32 gpuDepthPrepassMs             = 0.0f;
         FLOAT32 gpuGeometryRasterMs           = 0.0f;
         FLOAT32 cpuStreamingMs                = 0.0f;
 
         void ResetPerFrame()
         {
+            activeSWRasterStrategy        = NVGRasterAtomicStrategy::DISABLED;
             effectiveSceneTriangles       = 0ull;
             pageFaultsThisFrame           = 0u;
             fallbackClustersThisFrame     = 0u;
@@ -339,12 +396,18 @@ namespace Northstar
             clustersSmallCulled           = 0u;
             visibleOpaqueClusters         = 0u;
             visibleTransparentClusters    = 0u;
+            swRasterDispatches            = 0u;
+            swRasterizedClusters          = 0u;
+            swRasterizedTriangles         = 0u;
+            swCoveredPixels               = 0u;
+            swFallbackToHWClusters        = 0u;
             decodedUniqueClusters         = 0u;
             indirectDrawCommandsGenerated = 0u;
             overflowDroppedClusters       = 0u;
             shadowCastersEvaluated        = 0u;
             shadowClustersTested          = 0u;
             shadowClustersVisible         = 0u;
+            shadowSWRasterizedClusters    = 0u;
             shadowIndirectDrawsGenerated  = 0u;
             shadowOverflowPages           = 0u;
             cameraAverageLODLevel         = 0.0f;
@@ -357,6 +420,10 @@ namespace Northstar
             gpuHZBBuildMs         = 0.0f;
             gpuCullAndLODMs       = 0.0f;
             gpuDecodeAndDrawGenMs = 0.0f;
+            gpuSWRasterMs         = 0.0f;
+            gpuSWRasterPass1Ms    = 0.0f;
+            gpuSWRasterPass2Ms    = 0.0f;
+            gpuDepthPrepassMs     = 0.0f;
             gpuGeometryRasterMs   = 0.0f;
             cpuStreamingMs        = 0.0f;
         }
@@ -368,11 +435,13 @@ namespace Northstar
 
     enum NVGClusterAttributeFlags : UINT32
     {
-        NVG_CLUSTER_ATTR_NONE     = 0u,
-        NVG_CLUSTER_ATTR_UV1      = 1u << 0,
-        NVG_CLUSTER_ATTR_COLOR    = 1u << 1,
-        NVG_CLUSTER_ATTR_SKINNING = 1u << 2,
-        NVG_CLUSTER_ATTR_TANGENT  = 1u << 3
+        NVG_CLUSTER_ATTR_NONE        = 0u,
+        NVG_CLUSTER_ATTR_UV1         = 1u << 0,
+        NVG_CLUSTER_ATTR_COLOR       = 1u << 1,
+        NVG_CLUSTER_ATTR_SKINNING    = 1u << 2,
+        NVG_CLUSTER_ATTR_TANGENT     = 1u << 3,
+        NVG_CLUSTER_ATTR_VERT_BIT8   = 1u << 4, // 9th bit of vertexCount (enables 1..256 unique cluster vertices)
+        NVG_CLUSTER_ATTR_INT_LATTICE = 1u << 5  // Global 2^P integer lattice + INT32 intOrigin + lodShift encoding
     };
 
     enum NVGVirtualPageFlags : UINT32
@@ -648,8 +717,55 @@ namespace Northstar
         UINT32 shadowLODSum                = 0u;
         UINT32 reserved0                   = 0u;
         UINT32 reserved1                   = 0u;
+
+        UINT32 swRasterizedClusters        = 0u;
+        UINT32 shadowSWRasterizedClusters  = 0u;
+        UINT32 swFallbackToHWClusters      = 0u;
+        UINT32 swRasterizedTriangles       = 0u;
+
+        UINT32 swCoveredPixels             = 0u;
+        UINT32 reserved4                   = 0u;
+        UINT32 reserved5                   = 0u;
+        UINT32 reserved6                   = 0u;
     };
-    static_assert(sizeof(NVGTelemetryGPUData) == 160, "NVGTelemetryGPUData must be 160 bytes.");
+    static_assert(sizeof(NVGTelemetryGPUData) == 192, "NVGTelemetryGPUData must be 192 bytes.");
+
+    // 112 bytes (7 x 16B) — Reflection-driven indirect draw binding descriptor for NVG buckets.
+    // Supports up to 8 promoted per-draw CBVs, up to 2 promoted Root SRVs (Instance + Bone Slice),
+    // Path-A Indexed Cluster Pull (decodeVertexWords == 0), and compact IA vertex strides (12B..112B).
+    struct alignas(16) NVGDrawGroupShaderBindingDesc
+    {
+        // Row 0 (0..15)
+        UINT32 bindingFlags               = 0u; // bit 0 = valid, bit 1 = extended 144B command, bit 2 = indexed pull (null VBV)
+        UINT32 patchFirstIndex            = 0u;
+        UINT32 patchCount                 = 0u;
+        UINT32 instanceStrideBytes        = 0u;
+
+        // Row 1 (16..31): Byte sizes for Promoted CBVs 0..3
+        UINT32 cbvByteSize[4]             = { 0u, 0u, 0u, 0u };
+
+        // Row 2 (32..47): Byte sizes for Promoted CBVs 4..7
+        UINT32 cbvExtByteSize[4]          = { 0u, 0u, 0u, 0u };
+
+        // Row 3 (48..63): Template word offsets for Promoted CBVs 0..3
+        UINT32 cbvTemplateWordOffset[4]   = { 0u, 0u, 0u, 0u };
+
+        // Row 4 (64..79): Template word offsets for Promoted CBVs 4..7
+        UINT32 cbvExtTemplateWordOffset[4]= { 0u, 0u, 0u, 0u };
+
+        // Row 5 (80..95)
+        UINT32 instanceTemplateWordOffset = 0u;
+        UINT32 activeStageMask            = 0u;
+        UINT32 cbvCount                   = 0u; // 0..8
+        UINT32 srv0Mode                   = 0u; // NVSShadowIndirectSRVMode
+
+        // Row 6 (96..111)
+        UINT32 srv1Mode                   = 0u; // NVSShadowIndirectSRVMode (second promoted Root SRV when extended)
+        UINT32 decodeVertexWords          = 28u;// 0 (Indexed Pull) or 3, 6, 9, 12, 14, 16, 20, 24, 28
+        UINT32 decodeAttrMask             = 0x1FFu;
+        UINT32 drawGroupIndex             = 0u; // [0..15] bucketIndex, [16..31] optional depthCompanionBucket + 1 (0 = none)
+    };
+    static_assert(sizeof(NVGDrawGroupShaderBindingDesc) == 112, "NVGDrawGroupShaderBindingDesc must be 112 bytes.");
 
     // =====================================================================
     //  Pluggable Geometry Page Data Source Contract (Zero Disk Coupling)
@@ -668,6 +784,32 @@ namespace Northstar
             UINT32 maxBytes) const = 0;
     };
 
+    // Shared-ownership async-capable page stream provider for disk/archive/LZ4 streaming.
+    // Thread-safe for concurrent background worker reads across non-overlapping destination buffers.
+    class INVGPageStreamProvider
+    {
+    public:
+        virtual ~INVGPageStreamProvider() = default;
+
+        virtual UINT32 GetVirtualPageCount() const noexcept = 0;
+
+        // Reads raw compressed payload bytes from backing storage without decompressing on the caller thread.
+        virtual BOOL ReadCompressedPage(
+            UINT32  localPageIndex,
+            BYTE*   outCompressedBytes,
+            UINT32  maxBytes,
+            UINT32& outBytesRead,
+            UINT32& outUncompressedBytes,
+            UINT32& outCodecFlags,
+            UINT32& outExpectedCrc32c) const = 0;
+
+        // Reads and decompresses a 32 KiB physical geometry page into outPageBytes (kNVGPageSizeBytes).
+        virtual BOOL ReadDecompressedPage(
+            UINT32 localPageIndex,
+            BYTE*  outPageBytes,
+            UINT32 maxBytes) const = 0;
+    };
+
     // =====================================================================
     //  Packing Helpers
     // =====================================================================
@@ -678,10 +820,40 @@ namespace Northstar
         UINT32 lodLevel,
         UINT32 attrFlags) noexcept
     {
-        return (vertexCount & 0xFFu) |
+        const UINT32 clampedVerts = (vertexCount > kNVGMaxClusterVertices) ? kNVGMaxClusterVertices : vertexCount;
+        const UINT32 vertBit8     = ((clampedVerts >> 8u) & 1u) ? NVG_CLUSTER_ATTR_VERT_BIT8 : 0u;
+        const UINT32 mergedFlags  = (attrFlags & ~NVG_CLUSTER_ATTR_VERT_BIT8) | vertBit8;
+        return (clampedVerts & 0xFFu) |
                ((triangleCount & 0xFFu) << 8u) |
                ((lodLevel & 0xFFu) << 16u) |
-               ((attrFlags & 0xFFu) << 24u);
+               ((mergedFlags & 0xFFu) << 24u);
+    }
+
+    inline constexpr UINT32 UnpackNVGClusterVertexCount(UINT32 countsAndLod) noexcept
+    {
+        return (countsAndLod & 0xFFu) | (((countsAndLod >> 28u) & 1u) << 8u);
+    }
+
+    inline constexpr UINT32 UnpackNVGClusterTriangleCount(UINT32 countsAndLod) noexcept
+    {
+        return (countsAndLod >> 8u) & 0xFFu;
+    }
+
+    inline constexpr UINT32 PackNVGRefinedCountAndMaterialSlot(
+        UINT32 childGroupCount,
+        UINT32 materialSlot) noexcept
+    {
+        return (childGroupCount & 0xFFFFu) | ((materialSlot & 0xFFu) << 16u);
+    }
+
+    inline constexpr UINT32 UnpackNVGRefinedChildGroupCount(UINT32 packedValue) noexcept
+    {
+        return packedValue & 0xFFFFu;
+    }
+
+    inline constexpr UINT32 UnpackNVGClusterMaterialSlot(UINT32 packedValue) noexcept
+    {
+        return (packedValue >> 16u) & 0xFFu;
     }
 
     inline constexpr UINT32 PackNVGNodeChildCountAndFlags(

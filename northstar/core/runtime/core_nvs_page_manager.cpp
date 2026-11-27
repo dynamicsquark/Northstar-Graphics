@@ -1923,23 +1923,19 @@ namespace Northstar
         const UINT32 newRoot  = NextPow2AtLeast(minRootViews, std::max(oldRoot * 2u, 4096u));
         const UINT32 oldWords = oldRoot + (m_sparseDirCapacity * kNVSSparseDirStride) + 16u + m_sparseDirCapacity + m_sparseBlockCapacity;
         const UINT32 newWords = newRoot + (m_sparseDirCapacity * kNVSSparseDirStride) + 16u + m_sparseDirCapacity + m_sparseBlockCapacity;
-
-        std::vector<UINT32> oldData(oldWords, kNVSSparseUnmappedIndex);
-        if (!m_bufferManager->ReadbackGPUBufferSync(
-                m_sparsePageHierarchyBuffer,
-                oldData.data(),
-                oldWords * static_cast<UINT32>(sizeof(UINT32))))
-        {
-            m_lastError = "CoreNVSPageManager::EnsureSparseRootCapacity: failed to read back existing SparsePageHierarchy.";
-            return false;
-        }
-
-        std::vector<UINT32> newData(newWords, kNVSSparseUnmappedIndex);
-        std::memcpy(newData.data(), oldData.data(), oldRoot * sizeof(UINT32));
         const UINT32 tailWords = oldWords - oldRoot;
-        std::memcpy(newData.data() + newRoot, oldData.data() + oldRoot, tailWords * sizeof(UINT32));
 
-        if (!m_bufferManager->ResizeGPUBuffer(m_sparsePageHierarchyBuffer, newWords, newData.data()))
+        std::vector<UINT32> fillData(newWords, kNVSSparseUnmappedIndex);
+        const GPUBufferCopySpan copySpans[2] = {
+            { 0ull,                                        0ull,                                        static_cast<UINT64>(oldRoot) * sizeof(UINT32) },
+            { static_cast<UINT64>(newRoot) * sizeof(UINT32), static_cast<UINT64>(oldRoot) * sizeof(UINT32), static_cast<UINT64>(tailWords) * sizeof(UINT32) }
+        };
+        if (!m_bufferManager->ResizeGPUBufferWithSpans(
+                m_sparsePageHierarchyBuffer,
+                newWords,
+                fillData.data(),
+                copySpans,
+                2u))
         {
             m_lastError = "CoreNVSPageManager::EnsureSparseRootCapacity: failed to resize SparsePageHierarchy buffer.";
             return false;
@@ -2035,16 +2031,18 @@ namespace Northstar
             initVEntry.virtualAddressPacked = 1u << 20u;
             initVEntry.lastTouchedFrame     = 0u;
 
-            std::vector<NVSVirtualPageEntry> vptData(newVptCount, initVEntry);
-            if (!m_bufferManager->ReadbackGPUBufferSync(
+            std::vector<NVSVirtualPageEntry> vptFill(newVptCount, initVEntry);
+            const GPUBufferCopySpan vptSpan{
+                0ull,
+                0ull,
+                static_cast<UINT64>(oldVptCount) * sizeof(NVSVirtualPageEntry)
+            };
+            if (!m_bufferManager->ResizeGPUBufferWithSpans(
                     m_virtualPageTableBuffer,
-                    vptData.data(),
-                    oldVptCount * static_cast<UINT32>(sizeof(NVSVirtualPageEntry))))
-            {
-                m_lastError = "CoreNVSPageManager::EnsureSparsePoolCapacities: failed to read back VirtualPageTable.";
-                return false;
-            }
-            if (!m_bufferManager->ResizeGPUBuffer(m_virtualPageTableBuffer, newVptCount, vptData.data()))
+                    newVptCount,
+                    vptFill.data(),
+                    &vptSpan,
+                    1u))
             {
                 m_lastError = "CoreNVSPageManager::EnsureSparsePoolCapacities: failed to resize VirtualPageTable.";
                 return false;

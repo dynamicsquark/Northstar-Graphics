@@ -165,77 +165,193 @@ static bool InjectPatchConstantData(
 
 struct CoverageCallGraphAnalyzer
 {
+    static bool IsExprUInt64(
+        const NSL::Expression*                 expr,
+        const NSL::ParsedProperties&           props,
+        const std::unordered_set<std::string>& u64Locals)
+    {
+        if (!expr) return false;
+        if (const auto* lit = dynamic_cast<const NSL::LiteralExpr*>(expr))
+            return lit->litKind == NSL::LiteralExpr::Kind::UInt64;
+        if (const auto* cast = dynamic_cast<const NSL::CastExpr*>(expr))
+            return cast->typeName == "UInt64";
+        if (const auto* id = dynamic_cast<const NSL::IdentifierExpr*>(expr))
+            return u64Locals.count(id->name) > 0;
+        if (const auto* pe = dynamic_cast<const NSL::ParenExpr*>(expr))
+            return IsExprUInt64(pe->inner.get(), props, u64Locals);
+        if (const auto* be = dynamic_cast<const NSL::BinaryExpr*>(expr))
+            return IsExprUInt64(be->left.get(), props, u64Locals) || IsExprUInt64(be->right.get(), props, u64Locals);
+        if (const auto* ma = dynamic_cast<const NSL::MemberAccessExpr*>(expr))
+        {
+            if (const auto* ie = dynamic_cast<const NSL::IndexExpr*>(ma->object.get()))
+            {
+                if (const auto* gMa = dynamic_cast<const NSL::MemberAccessExpr*>(ie->object.get()))
+                {
+                    if (const auto* pId = dynamic_cast<const NSL::IdentifierExpr*>(gMa->object.get()))
+                    {
+                        const std::string qName = pId->name + "__" + gMa->member;
+                        auto it = props.byQualifiedName.find(qName);
+                        if (it != props.byQualifiedName.end())
+                        {
+                            for (const auto& ent : it->second->entries)
+                            {
+                                if (ent.name == ma->member)
+                                    return ent.typeID == NSL::DataTypeID::UINT64 || ent.typeName == "UInt64";
+                            }
+                        }
+                    }
+                }
+            }
+            if (const auto* gMa = dynamic_cast<const NSL::MemberAccessExpr*>(ma->object.get()))
+            {
+                if (const auto* pId = dynamic_cast<const NSL::IdentifierExpr*>(gMa->object.get()))
+                {
+                    const std::string qName = pId->name + "__" + gMa->member;
+                    auto it = props.byQualifiedName.find(qName);
+                    if (it != props.byQualifiedName.end())
+                    {
+                        for (const auto& ent : it->second->entries)
+                        {
+                            if (ent.name == ma->member)
+                                return ent.typeID == NSL::DataTypeID::UINT64 || ent.typeName == "UInt64";
+                        }
+                    }
+                }
+            }
+        }
+        if (const auto* ie = dynamic_cast<const NSL::IndexExpr*>(expr))
+        {
+            if (const auto* fMa = dynamic_cast<const NSL::MemberAccessExpr*>(ie->object.get()))
+            {
+                if (const auto* gMa = dynamic_cast<const NSL::MemberAccessExpr*>(fMa->object.get()))
+                {
+                    if (const auto* pId = dynamic_cast<const NSL::IdentifierExpr*>(gMa->object.get()))
+                    {
+                        const std::string qName = pId->name + "__" + gMa->member;
+                        auto it = props.byQualifiedName.find(qName);
+                        if (it != props.byQualifiedName.end())
+                        {
+                            for (const auto& ent : it->second->entries)
+                            {
+                                if (ent.name == fMa->member)
+                                    return ent.typeID == NSL::DataTypeID::UINT64 || ent.typeName == "UInt64";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     static void InspectExpr(
-        const NSL::Expression*           expr,
-        bool&                            outUsesDiscard,
-        std::unordered_set<std::string>& outCallees)
+        const NSL::Expression*                 expr,
+        const NSL::ParsedProperties&           props,
+        const std::unordered_set<std::string>& u64Locals,
+        bool&                                  outUsesDiscard,
+        bool&                                  outUsesInt64,
+        bool&                                  outUsesInt64Atomic,
+        std::unordered_set<std::string>&       outCallees)
     {
         if (!expr) return;
+
+        if (const auto* lit = dynamic_cast<const NSL::LiteralExpr*>(expr))
+        {
+            if (lit->litKind == NSL::LiteralExpr::Kind::UInt64)
+                outUsesInt64 = true;
+            return;
+        }
 
         if (const auto* ce = dynamic_cast<const NSL::CallExpr*>(expr))
         {
             if (const auto* id = dynamic_cast<const NSL::IdentifierExpr*>(ce->callee.get()))
             {
                 if (id->name == "clip" || id->name == "Clip")
+                {
                     outUsesDiscard = true;
+                }
+                else if (id->name.rfind("Interlocked", 0) == 0)
+                {
+                    for (const auto& arg : ce->args)
+                    {
+                        if (IsExprUInt64(arg.get(), props, u64Locals))
+                        {
+                            outUsesInt64       = true;
+                            outUsesInt64Atomic = true;
+                            break;
+                        }
+                    }
+                }
                 else
+                {
                     outCallees.insert(id->name);
+                }
             }
-            InspectExpr(ce->callee.get(), outUsesDiscard, outCallees);
+            InspectExpr(ce->callee.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
             for (const auto& arg : ce->args)
-                InspectExpr(arg.get(), outUsesDiscard, outCallees);
+                InspectExpr(arg.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* be = dynamic_cast<const NSL::BinaryExpr*>(expr))
         {
-            InspectExpr(be->left.get(), outUsesDiscard, outCallees);
-            InspectExpr(be->right.get(), outUsesDiscard, outCallees);
+            InspectExpr(be->left.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(be->right.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* ue = dynamic_cast<const NSL::UnaryExpr*>(expr))
         {
-            InspectExpr(ue->operand.get(), outUsesDiscard, outCallees);
+            InspectExpr(ue->operand.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* pe = dynamic_cast<const NSL::ParenExpr*>(expr))
         {
-            InspectExpr(pe->inner.get(), outUsesDiscard, outCallees);
+            InspectExpr(pe->inner.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* te = dynamic_cast<const NSL::TernaryExpr*>(expr))
         {
-            InspectExpr(te->condition.get(), outUsesDiscard, outCallees);
-            InspectExpr(te->thenExpr.get(), outUsesDiscard, outCallees);
-            InspectExpr(te->elseExpr.get(), outUsesDiscard, outCallees);
+            InspectExpr(te->condition.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(te->thenExpr.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(te->elseExpr.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* ie = dynamic_cast<const NSL::IndexExpr*>(expr))
         {
-            InspectExpr(ie->object.get(), outUsesDiscard, outCallees);
-            InspectExpr(ie->index.get(), outUsesDiscard, outCallees);
+            if (IsExprUInt64(ie, props, u64Locals))
+                outUsesInt64 = true;
+            InspectExpr(ie->object.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(ie->index.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* ma = dynamic_cast<const NSL::MemberAccessExpr*>(expr))
         {
-            InspectExpr(ma->object.get(), outUsesDiscard, outCallees);
+            if (IsExprUInt64(ma, props, u64Locals))
+                outUsesInt64 = true;
+            InspectExpr(ma->object.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* sw = dynamic_cast<const NSL::SwizzleExpr*>(expr))
         {
-            InspectExpr(sw->object.get(), outUsesDiscard, outCallees);
+            InspectExpr(sw->object.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* le = dynamic_cast<const NSL::LengthExpr*>(expr))
         {
-            InspectExpr(le->object.get(), outUsesDiscard, outCallees);
+            InspectExpr(le->object.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* cast = dynamic_cast<const NSL::CastExpr*>(expr))
         {
+            if (cast->typeName == "UInt64")
+                outUsesInt64 = true;
             for (const auto& arg : cast->args)
-                InspectExpr(arg.get(), outUsesDiscard, outCallees);
+                InspectExpr(arg.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* init = dynamic_cast<const NSL::InitializerListExpr*>(expr))
         {
             for (const auto& el : init->elements)
-                InspectExpr(el.get(), outUsesDiscard, outCallees);
+                InspectExpr(el.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
     }
 
     static void InspectStmt(
         const NSL::Statement*            stmt,
+        const NSL::ParsedProperties&     props,
+        std::unordered_set<std::string>& u64Locals,
         bool&                            outUsesDiscard,
+        bool&                            outUsesInt64,
+        bool&                            outUsesInt64Atomic,
         std::unordered_set<std::string>& outCallees)
     {
         if (!stmt) return;
@@ -246,72 +362,133 @@ struct CoverageCallGraphAnalyzer
         }
         else if (const auto* es = dynamic_cast<const NSL::ExprStmt*>(stmt))
         {
-            InspectExpr(es->expr.get(), outUsesDiscard, outCallees);
+            InspectExpr(es->expr.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* rs = dynamic_cast<const NSL::ReturnStmt*>(stmt))
         {
-            InspectExpr(rs->value.get(), outUsesDiscard, outCallees);
+            InspectExpr(rs->value.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* vd = dynamic_cast<const NSL::VarDeclStmt*>(stmt))
         {
-            InspectExpr(vd->initializer.get(), outUsesDiscard, outCallees);
+            if (vd->typeName == "UInt64")
+            {
+                outUsesInt64 = true;
+                u64Locals.insert(vd->name);
+            }
+            InspectExpr(vd->initializer.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* blk = dynamic_cast<const NSL::BlockStmt*>(stmt))
         {
+            std::unordered_set<std::string> innerU64 = u64Locals;
             for (const auto& child : blk->statements)
-                InspectStmt(child.get(), outUsesDiscard, outCallees);
+                InspectStmt(child.get(), props, innerU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* ifs = dynamic_cast<const NSL::IfStmt*>(stmt))
         {
-            InspectExpr(ifs->condition.get(), outUsesDiscard, outCallees);
-            InspectStmt(ifs->thenBranch.get(), outUsesDiscard, outCallees);
-            InspectStmt(ifs->elseBranch.get(), outUsesDiscard, outCallees);
+            InspectExpr(ifs->condition.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            std::unordered_set<std::string> thenU64 = u64Locals;
+            InspectStmt(ifs->thenBranch.get(), props, thenU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            std::unordered_set<std::string> elseU64 = u64Locals;
+            InspectStmt(ifs->elseBranch.get(), props, elseU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* fs = dynamic_cast<const NSL::ForStmt*>(stmt))
         {
-            InspectStmt(fs->init.get(), outUsesDiscard, outCallees);
-            InspectExpr(fs->condition.get(), outUsesDiscard, outCallees);
-            InspectExpr(fs->increment.get(), outUsesDiscard, outCallees);
-            InspectStmt(fs->body.get(), outUsesDiscard, outCallees);
+            std::unordered_set<std::string> forU64 = u64Locals;
+            InspectStmt(fs->init.get(), props, forU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(fs->condition.get(), props, forU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(fs->increment.get(), props, forU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectStmt(fs->body.get(), props, forU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* ws = dynamic_cast<const NSL::WhileStmt*>(stmt))
         {
-            InspectExpr(ws->condition.get(), outUsesDiscard, outCallees);
-            InspectStmt(ws->body.get(), outUsesDiscard, outCallees);
+            InspectExpr(ws->condition.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            std::unordered_set<std::string> bodyU64 = u64Locals;
+            InspectStmt(ws->body.get(), props, bodyU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* dws = dynamic_cast<const NSL::DoWhileStmt*>(stmt))
         {
-            InspectStmt(dws->body.get(), outUsesDiscard, outCallees);
-            InspectExpr(dws->condition.get(), outUsesDiscard, outCallees);
+            std::unordered_set<std::string> bodyU64 = u64Locals;
+            InspectStmt(dws->body.get(), props, bodyU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+            InspectExpr(dws->condition.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
         }
         else if (const auto* sw = dynamic_cast<const NSL::SwitchStmt*>(stmt))
         {
-            InspectExpr(sw->condition.get(), outUsesDiscard, outCallees);
+            InspectExpr(sw->condition.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
             for (const auto& sc : sw->cases)
             {
-                InspectExpr(sc.value.get(), outUsesDiscard, outCallees);
+                InspectExpr(sc.value.get(), props, u64Locals, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
+                std::unordered_set<std::string> caseU64 = u64Locals;
                 for (const auto& child : sc.statements)
-                    InspectStmt(child.get(), outUsesDiscard, outCallees);
+                    InspectStmt(child.get(), props, caseU64, outUsesDiscard, outUsesInt64, outUsesInt64Atomic, outCallees);
             }
         }
     }
 
-    static uint16_t ComputeFlags(const NSL::Program& ast)
+    static uint16_t ComputeFlags(const NSL::Program& ast, const NSL::ParsedProperties& props)
     {
         struct FnSummary
         {
-            bool                            usesDiscard = false;
+            bool                            usesDiscard     = false;
+            bool                            usesInt64       = false;
+            bool                            usesInt64Atomic = false;
             std::unordered_set<std::string> callees;
         };
+
+        bool propOrGlobalUsesInt64 = false;
+        for (const auto& grp : props.groups)
+        {
+            for (const auto& ent : grp.entries)
+            {
+                if (ent.typeID == NSL::DataTypeID::UINT64 || ent.typeName == "UInt64")
+                {
+                    propOrGlobalUsesInt64 = true;
+                    break;
+                }
+            }
+        }
+        for (const auto& st : ast.structs)
+        {
+            for (const auto& f : st.fields)
+            {
+                if (f.typeName == "UInt64")
+                {
+                    propOrGlobalUsesInt64 = true;
+                    break;
+                }
+            }
+        }
+
+        std::unordered_set<std::string> globalU64;
+        for (const auto& g : ast.globals)
+        {
+            if (g.typeName == "UInt64")
+            {
+                propOrGlobalUsesInt64 = true;
+                globalU64.insert(g.name);
+            }
+        }
 
         std::unordered_map<std::string, FnSummary> summaries;
         for (const auto& fn : ast.functions)
         {
             FnSummary s;
+            std::unordered_set<std::string> u64Locals = globalU64;
+            if (fn.returnType == "UInt64")
+                s.usesInt64 = true;
+            for (const auto& p : fn.parameters)
+            {
+                if (p.typeName == "UInt64")
+                {
+                    s.usesInt64 = true;
+                    u64Locals.insert(p.name);
+                }
+            }
             for (const auto& stmt : fn.body)
-                InspectStmt(stmt.get(), s.usesDiscard, s.callees);
-            FnSummary& dst = summaries[fn.name];
-            dst.usesDiscard = dst.usesDiscard || s.usesDiscard;
+                InspectStmt(stmt.get(), props, u64Locals, s.usesDiscard, s.usesInt64, s.usesInt64Atomic, s.callees);
+            FnSummary& dst      = summaries[fn.name];
+            dst.usesDiscard     = dst.usesDiscard || s.usesDiscard;
+            dst.usesInt64       = dst.usesInt64 || s.usesInt64;
+            dst.usesInt64Atomic = dst.usesInt64Atomic || s.usesInt64Atomic;
             dst.callees.insert(s.callees.begin(), s.callees.end());
         }
 
@@ -331,7 +508,9 @@ struct CoverageCallGraphAnalyzer
             }
         }
 
-        bool reachableDiscard = false;
+        bool reachableDiscard     = false;
+        bool reachableInt64       = propOrGlobalUsesInt64;
+        bool reachableInt64Atomic = false;
         while (!worklist.empty())
         {
             std::string curr = std::move(worklist.back());
@@ -339,11 +518,9 @@ struct CoverageCallGraphAnalyzer
 
             auto it = summaries.find(curr);
             if (it == summaries.end()) continue;
-            if (it->second.usesDiscard)
-            {
-                reachableDiscard = true;
-                break;
-            }
+            if (it->second.usesDiscard)     reachableDiscard     = true;
+            if (it->second.usesInt64)       reachableInt64       = true;
+            if (it->second.usesInt64Atomic) reachableInt64Atomic = true;
             for (const auto& callee : it->second.callees)
             {
                 if (summaries.count(callee) && visited.insert(callee).second)
@@ -352,8 +529,9 @@ struct CoverageCallGraphAnalyzer
         }
 
         uint16_t flags = NSL::NSC_FLAG_NONE;
-        if (reachableDiscard)
-            flags |= NSL::NSC_FLAG_USES_DISCARD;
+        if (reachableDiscard)     flags |= NSL::NSC_FLAG_USES_DISCARD;
+        if (reachableInt64)       flags |= NSL::NSC_FLAG_USES_INT64;
+        if (reachableInt64Atomic) flags |= (NSL::NSC_FLAG_USES_INT64 | NSL::NSC_FLAG_USES_INT64_ATOMIC);
         return flags;
     }
 };
@@ -371,6 +549,7 @@ static void PrintUsage()
               << "  --output  <file>         Output .nsc binary file path\n"
               << "  --target  <api>          Target API: hlsl11 or hlsl12 (default: hlsl11)\n"
               << "  -I, --include-dir <dir>  Add include search directory\n"
+              << "  -D, --define <NAME[=N]>  Define integer preprocessor macro\n"
               << "  --verbose                Verbose pipeline output\n"
               << "  --emit-text <file>       Also emit human-readable .nslt debug output\n"
               << "  --version                Print version and exit\n\n"
@@ -389,7 +568,40 @@ int main(int argc, char* argv[])
     std::string                             targetAPI = "hlsl11";
     std::string                             textOutput;
     std::vector<std::filesystem::path>      includeDirs;
+    std::vector<std::pair<std::string, int64_t>> cliDefines;
     bool                                    verbose   = false;
+
+    auto parseCliDefineSpec = [&](const std::string& spec) -> bool
+    {
+        if (spec.empty()) return false;
+        const size_t eq = spec.find('=');
+        const std::string name = (eq == std::string::npos) ? spec : spec.substr(0, eq);
+        if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_'))
+            return false;
+        for (char ch : name)
+        {
+            if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_'))
+                return false;
+        }
+        int64_t val = 1;
+        if (eq != std::string::npos)
+        {
+            const std::string valStr = spec.substr(eq + 1);
+            if (valStr.empty()) return false;
+            try
+            {
+                size_t idx = 0;
+                val = std::stoll(valStr, &idx, 0);
+                if (idx != valStr.size()) return false;
+            }
+            catch (...)
+            {
+                return false;
+            }
+        }
+        cliDefines.emplace_back(name, val);
+        return true;
+    };
 
     // ==================== CLI argument parsing ====================
     for (int i = 1; i < argc; ++i)
@@ -422,6 +634,29 @@ int main(int argc, char* argv[])
                 return 1;
             }
             includeDirs.push_back(argv[++i]);
+        }
+        else if (arg == "-D" || arg == "--define")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "error: Option '" << arg << "' requires a NAME[=INT] argument.\n";
+                return 1;
+            }
+            const std::string defSpec = argv[++i];
+            if (!parseCliDefineSpec(defSpec))
+            {
+                std::cerr << "error: Invalid macro definition '" << defSpec << "'. Expected NAME or NAME=INT.\n";
+                return 1;
+            }
+        }
+        else if (arg.size() > 2 && arg[0] == '-' && arg[1] == 'D')
+        {
+            const std::string defSpec = arg.substr(2);
+            if (!parseCliDefineSpec(defSpec))
+            {
+                std::cerr << "error: Invalid macro definition '" << defSpec << "'. Expected -DNAME or -DNAME=INT.\n";
+                return 1;
+            }
         }
         else if (arg == "--target")
         {
@@ -530,6 +765,10 @@ int main(int argc, char* argv[])
         for (const auto& incDir : includeDirs)
         {
             preprocessor.AddIncludeDirectory(incDir);
+        }
+        for (const auto& defKv : cliDefines)
+        {
+            preprocessor.DefineMacro(defKv.first, defKv.second);
         }
 
         std::string processedSource = preprocessor.Process(source, baseDir, fileName, diag);
@@ -856,7 +1095,15 @@ int main(int argc, char* argv[])
         }
 
         NSL::TargetAPI apiEnum = targetApiEnum;
-        const uint16_t coverageFlags = CoverageCallGraphAnalyzer::ComputeFlags(ast);
+        const uint16_t coverageFlags = CoverageCallGraphAnalyzer::ComputeFlags(ast, parsedProps);
+
+        if (apiEnum == NSL::TargetAPI::HLSL11 && (coverageFlags & NSL::NSC_FLAG_USES_INT64_ATOMIC) != 0)
+        {
+            std::cerr << "error: '" << inputFile
+                      << "' uses 64-bit integer atomic intrinsics, which require '--target hlsl12' "
+                         "(Shader Model 6.6 DXIL); target 'hlsl11' (SM 5.0) is unsupported.\n";
+            return 2;
+        }
 
         uint32_t numThreadsX = 0;
         uint32_t numThreadsY = 0;

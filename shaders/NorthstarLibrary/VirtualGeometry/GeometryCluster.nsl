@@ -75,6 +75,10 @@ LIBRARY
     {
         Vec3 posOrigin;
         Vec3 posExtent;
+        Int3 intOrigin;
+        Float posScale;
+        UInt lodShift;
+        Bool useIntLattice;
         Vec2 uv0Origin;
         Vec2 uv0Extent;
         Vec2 uv1Origin;
@@ -82,6 +86,7 @@ LIBRARY
         UInt vertexCount;
         UInt triangleCount;
         UInt lodLevel;
+        UInt materialSlot;
         UInt attrFlags;
         UInt vertexWordOffset;
         UInt indexWordOffset;
@@ -97,6 +102,11 @@ LIBRARY
     UInt NVGGetDrawBucketId()
     {
         return NVGResources.Params.NVG_DRAW_BUCKET_ID;
+    }
+
+    UInt NVGGetVisibleClusterCount()
+    {
+        return NVGResources.Params.NVG_VISIBLE_CLUSTER_COUNT;
     }
 
     UInt NVGGetVisibleClusterOffset()
@@ -269,14 +279,19 @@ LIBRARY
 
         NVGClusterHeader h;
         h.pageBaseWord = baseWord;
-        h.posOrigin = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 0u)),
-            AsFloat(NVGReadPageWord(baseWord + 1u)),
-            AsFloat(NVGReadPageWord(baseWord + 2u)));
-        h.posExtent = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 3u)),
-            AsFloat(NVGReadPageWord(baseWord + 4u)),
-            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        UInt w0 = NVGReadPageWord(baseWord + 0u);
+        UInt w1 = NVGReadPageWord(baseWord + 1u);
+        UInt w2 = NVGReadPageWord(baseWord + 2u);
+        UInt w3 = NVGReadPageWord(baseWord + 3u);
+        UInt w4 = NVGReadPageWord(baseWord + 4u);
+        UInt w5 = NVGReadPageWord(baseWord + 5u);
+
+        h.posOrigin = Vec3(AsFloat(w0), AsFloat(w1), AsFloat(w2));
+        h.posExtent = Vec3(AsFloat(w3), AsFloat(w4), AsFloat(w5));
+        h.intOrigin = Int3(AsInt(w0), AsInt(w1), AsInt(w2));
+        h.posScale  = AsFloat(w3);
+        h.lodShift  = w4 & 31u;
+
         h.uv0Origin = Vec2(
             AsFloat(NVGReadPageWord(baseWord + 6u)),
             AsFloat(NVGReadPageWord(baseWord + 7u)));
@@ -291,25 +306,46 @@ LIBRARY
             AsFloat(NVGReadPageWord(baseWord + 13u)));
 
         UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
-        h.vertexCount       = countsAndFlags & 255u;
+        h.vertexCount       = (countsAndFlags & 255u) | (((countsAndFlags >> 28u) & 1u) << 8u);
         h.triangleCount     = (countsAndFlags >> 8u) & 255u;
         h.lodLevel          = (countsAndFlags >> 16u) & 255u;
         h.attrFlags         = (countsAndFlags >> 24u) & 255u;
+        h.useIntLattice     = ((h.attrFlags & 32u) != 0u);
 
         UInt offsets        = NVGReadPageWord(baseWord + 15u);
-        h.vertexWordOffset  = offsets & 65535u;
+        h.vertexWordOffset  = offsets & 255u;
+        h.materialSlot      = (offsets >> 8u) & 255u;
         h.indexWordOffset   = (offsets >> 16u) & 65535u;
         h.vertexStrideWords = ((h.attrFlags & 4u) != 0u) ? 11u : 7u;
         return h;
     }
 
+    Bool NVGIsClusterIndexedDraw()
+    {
+        UInt invalidIdx = NVGInvalidIndex();
+        UInt bucketId   = NVGResources.Params.NVG_DRAW_BUCKET_ID;
+        if (bucketId == invalidIdx)
+        {
+            return false;
+        }
+        return (NVGResources.BucketRanges[bucketId].NVG_BUCKET_FLAGS & 5u) != 0u;
+    }
+
     Bool NVGIsVertexActiveInCluster(NVGClusterHeader header, UInt vertexId)
     {
+        if (NVGIsClusterIndexedDraw())
+        {
+            return vertexId < header.vertexCount;
+        }
         return vertexId < (header.triangleCount * 3u);
     }
 
     UInt NVGLoadClusterVertexIndex(NVGClusterHeader header, UInt vertexId)
     {
+        if (NVGIsClusterIndexedDraw())
+        {
+            return vertexId;
+        }
         UInt triIdx    = vertexId / 3u;
         UInt cornerIdx = vertexId - triIdx * 3u;
         UInt packedTri = NVGReadPageWord(header.pageBaseWord + header.indexWordOffset + triIdx);

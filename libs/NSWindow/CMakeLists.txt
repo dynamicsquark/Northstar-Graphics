@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NSWindow VERSION 0.6.0 LANGUAGES CXX)
+project(NSWindow VERSION 0.7.0 LANGUAGES CXX)
 
 set(NS_WINDOW_SOURCES)
 if(WIN32)

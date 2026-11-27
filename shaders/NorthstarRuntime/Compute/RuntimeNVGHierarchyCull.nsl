@@ -33,6 +33,9 @@ PROPERTY NVGHierarchyCullParams {
         Add(maxCandidateCapacity)    : UInt  = 262144
         Add(maxVisibleCapacity)      : UInt  = 262144
         Add(maxOccludedClusterCap)   : UInt  = 262144
+        Add(maxOccludedNodeCap)      : UInt  = 262144
+        Add(skinBoundsCount)         : UInt  = 0
+        Add(isPhase2Pass)            : UInt  = 0
         Add(bvhNodeCount)            : UInt  = 0
         Add(clusterMetaCount)        : UInt  = 0
         Add(clusterGroupCount)       : UInt  = 0
@@ -57,7 +60,11 @@ PROPERTY NVGHierarchyCullParams {
         Add(lodCameraPos)            : Vec3
         Add(phase2ResetMode)         : UInt  = 0
         Add(cameraForward)           : Vec3
-        Add(reserved0)               : UInt  = 0
+        Add(objectMatSlotTableCount) : UInt  = 0
+        Add(passKind)                : UInt  = 0
+        Add(reserved1)               : UInt  = 0
+        Add(reserved2)               : UInt  = 0
+        Add(reserved3)               : UInt  = 0
         Add(frustumPlane0)           : Vec4
         Add(frustumPlane1)           : Vec4
         Add(frustumPlane2)           : Vec4
@@ -86,9 +93,14 @@ PROPERTY NVGHierarchyCullParams {
         Add(aabbMin)             : Vec3
         Add(submeshIndex)        : UInt
         Add(aabbMax)             : Vec3
-        Add(lodAndMaterialFlags) : UInt
-        Add(boundingSphere)      : Vec4
-        Add(worldMatrix)         : Mat4
+        Add(lodAndMaterialFlags)  : UInt
+        Add(boundingSphere)       : Vec4
+        Add(worldMatrix)          : Mat4
+        Add(prevWorldMatrix)      : Mat4
+        Add(layerMask)            : UInt
+        Add(materialTableOffset)  : UInt
+        Add(materialSlotCount)    : UInt
+        Add(skinningBoundsOffset) : UInt
     }
     StructuredBuffer InMaterialTable {
         Add(materialId)               : UInt
@@ -107,6 +119,9 @@ PROPERTY NVGHierarchyCullParams {
         Add(transInstBucketIndex)     : UInt
         Add(skinnedOpaqueBucketIndex) : UInt
         Add(skinnedShadowBucketIndex) : UInt
+    }
+    StructuredBuffer InObjectMaterialSlots {
+        Add(materialId) : UInt
     }
     StructuredBuffer InBVHNodes {
         Add(boundsMin)          : Vec3
@@ -160,6 +175,10 @@ PROPERTY NVGHierarchyCullParams {
     StructuredBuffer InGroupActiveMask {
         Add(active) : UInt
     }
+    StructuredBuffer InSkinnedBounds {
+        Add(localDeltaMin) : Vec4
+        Add(localDeltaMax) : Vec4
+    }
     StructuredBuffer InNodeQueue {
         Add(objectSlotIndex) : UInt
         Add(nodeOrClusterId) : UInt
@@ -167,6 +186,12 @@ PROPERTY NVGHierarchyCullParams {
         Add(auxData)         : UInt
     }
     RWStructuredBuffer OutNodeQueue {
+        Add(objectSlotIndex) : UInt
+        Add(nodeOrClusterId) : UInt
+        Add(drawBucketHint)  : UInt
+        Add(auxData)         : UInt
+    }
+    RWStructuredBuffer OutOccludedNodes {
         Add(objectSlotIndex) : UInt
         Add(nodeOrClusterId) : UInt
         Add(drawBucketHint)  : UInt
@@ -489,21 +514,238 @@ SHADER {
         InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[36u].word, lodLevel, prev); // cameraLODSum
     }
 
+    void ResolveSkinnedObjectEnvelope(
+        UInt      objSlot,
+        UInt      objFlags,
+        out Vec3  outDeltaMin,
+        out Vec3  outDeltaMax,
+        out Vec3  outSphereMidShift,
+        out Float outSphereRadiusAdd,
+        out Float outBoneScale)
+    {
+        outDeltaMin        = Vec3(0.0, 0.0, 0.0);
+        outDeltaMax        = Vec3(0.0, 0.0, 0.0);
+        outSphereMidShift  = Vec3(0.0, 0.0, 0.0);
+        outSphereRadiusAdd = 0.0;
+        outBoneScale       = 1.0;
+        if ((objFlags & 1024u) != 0u) {
+            UInt sbIdx = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].skinningBoundsOffset;
+            if (sbIdx < NVGHierarchyCullParams.Config.skinBoundsCount) {
+                Vec4 dMin = NVGHierarchyCullParams.InSkinnedBounds[sbIdx].localDeltaMin;
+                Vec4 dMax = NVGHierarchyCullParams.InSkinnedBounds[sbIdx].localDeltaMax;
+                outDeltaMin        = dMin.xyz;
+                outDeltaMax        = dMax.xyz;
+                outSphereMidShift  = (dMin.xyz + dMax.xyz) * 0.5;
+                outSphereRadiusAdd = Length((dMax.xyz - dMin.xyz) * 0.5);
+                outBoneScale       = Max(dMin.w, 1.0);
+            }
+        }
+    }
+
+    UInt ResolveHierarchyBucketForMaterial(UInt matId, UInt objFlags, UInt passKind) {
+        UInt invalidIdx = ~0u;
+        if (matId == 0u || matId >= NVGHierarchyCullParams.Config.materialTableCount) {
+            return invalidIdx;
+        }
+        UInt matFlags = NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags;
+        if ((matFlags & 1u) == 0u) {
+            return invalidIdx;
+        }
+        Bool isTrans   = ((matFlags & 32u) != 0u);
+        Bool isSkinned = ((objFlags & 1024u) != 0u);
+        if (passKind == 1u) {
+            if (isTrans || (matFlags & 512u) == 0u) {
+                return invalidIdx;
+            }
+            if (isSkinned) {
+                UInt sdb = NVGHierarchyCullParams.InMaterialTable[matId].depthInstBucketIndex;
+                return (sdb != invalidIdx) ? sdb : NVGHierarchyCullParams.InMaterialTable[matId].skinnedOpaqueBucketIndex;
+            }
+            return NVGHierarchyCullParams.InMaterialTable[matId].depthBucketIndex;
+        }
+        if (passKind == 2u) {
+            if (isTrans) {
+                return invalidIdx;
+            }
+            return isSkinned
+                ? NVGHierarchyCullParams.InMaterialTable[matId].skinnedOpaqueBucketIndex
+                : NVGHierarchyCullParams.InMaterialTable[matId].opaqueBucketIndex;
+        }
+        if (isTrans) {
+            return isSkinned
+                ? NVGHierarchyCullParams.InMaterialTable[matId].transInstBucketIndex
+                : NVGHierarchyCullParams.InMaterialTable[matId].transparentBucketIndex;
+        }
+        return isSkinned
+            ? NVGHierarchyCullParams.InMaterialTable[matId].skinnedOpaqueBucketIndex
+            : NVGHierarchyCullParams.InMaterialTable[matId].opaqueBucketIndex;
+    }
+
+    void ResolveHierarchyNodeMaterialEnvelope(
+        UInt      objSlot,
+        out Float outDisp,
+        out Float outLodScale,
+        out Bool  outLockLod0)
+    {
+        outDisp     = 0.0;
+        outLodScale = 1.0;
+        outLockLod0 = false;
+        UInt matId      = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialId;
+        UInt matSlotCnt = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialSlotCount;
+        UInt matTabOff  = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialTableOffset;
+        if (matSlotCnt <= 1u) {
+            if (matId > 0u && matId < NVGHierarchyCullParams.Config.materialTableCount) {
+                outDisp     = Max(NVGHierarchyCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+                outLodScale = Max(NVGHierarchyCullParams.InMaterialTable[matId].lodErrorScale, 0.001);
+                outLockLod0 = ((NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags & 64u) != 0u);
+            }
+            return;
+        }
+        Float minScale    = 1.0e9;
+        Bool  foundAny    = false;
+        UInt  clampedCnt  = Min(matSlotCnt, 256u);
+        for (UInt ms = 0u; ms < clampedCnt; ms = ms + 1u) {
+            UInt smId = ((matTabOff + ms) < NVGHierarchyCullParams.Config.objectMatSlotTableCount)
+                ? NVGHierarchyCullParams.InObjectMaterialSlots[matTabOff + ms].materialId
+                : ((ms == 0u) ? matId : 0u);
+            if (smId > 0u && smId < NVGHierarchyCullParams.Config.materialTableCount) {
+                UInt mf = NVGHierarchyCullParams.InMaterialTable[smId].nvgFlags;
+                if ((mf & 1u) != 0u) {
+                    foundAny = true;
+                    outDisp  = Max(outDisp, Max(NVGHierarchyCullParams.InMaterialTable[smId].maxWorldDisplacement, 0.0));
+                    minScale = Min(minScale, Max(NVGHierarchyCullParams.InMaterialTable[smId].lodErrorScale, 0.001));
+                    if ((mf & 64u) != 0u) {
+                        outLockLod0 = true;
+                    }
+                }
+            }
+        }
+        if (foundAny) {
+            outLodScale = minScale;
+        }
+    }
+
+    Bool ResolveHierarchyClusterMaterial(
+        UInt      objSlot,
+        UInt      objFlags,
+        UInt      clusterId,
+        UInt      fallbackBucket,
+        out UInt  outMatId,
+        out UInt  outBucketIdx,
+        out UInt  outMatFlags,
+        out Float outDisp,
+        out Float outLodScale)
+    {
+        UInt invalidIdx = ~0u;
+        outMatId     = 0u;
+        outBucketIdx = invalidIdx;
+        outMatFlags  = 0u;
+        outDisp      = 0.0;
+        outLodScale  = 1.0;
+
+        UInt cMatSlot   = (NVGHierarchyCullParams.InClusterMeta[clusterId].refinedByChildGroupCount >> 16u) & 255u;
+        UInt matSlotCnt = Max(NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialSlotCount, 1u);
+        if (cMatSlot >= matSlotCnt) {
+            return false;
+        }
+        UInt baseMatId = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialId;
+        UInt matId     = baseMatId;
+        if (matSlotCnt > 1u) {
+            UInt matTabOff = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialTableOffset;
+            matId = ((matTabOff + cMatSlot) < NVGHierarchyCullParams.Config.objectMatSlotTableCount)
+                ? NVGHierarchyCullParams.InObjectMaterialSlots[matTabOff + cMatSlot].materialId
+                : ((cMatSlot == 0u) ? baseMatId : 0u);
+        }
+        if (matId == 0u || matId >= NVGHierarchyCullParams.Config.materialTableCount) {
+            return false;
+        }
+        UInt bIdx = (matSlotCnt <= 1u && cMatSlot == 0u && fallbackBucket != invalidIdx)
+            ? fallbackBucket
+            : ResolveHierarchyBucketForMaterial(matId, objFlags, NVGHierarchyCullParams.Config.passKind);
+        if (bIdx == invalidIdx) {
+            return false;
+        }
+        outMatId     = matId;
+        outBucketIdx = bIdx;
+        outMatFlags  = NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags;
+        outDisp      = Max(NVGHierarchyCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
+        outLodScale  = Max(NVGHierarchyCullParams.InMaterialTable[matId].lodErrorScale, 0.001);
+        return ((outMatFlags & 1u) != 0u);
+    }
+
     [numthreads(64, 1, 1)]
-    void Main(UInt3 dtid : DISPATCH_THREAD_ID) {
-        UInt tid        = dtid.x;
+    void Main(UInt3 dtid : DISPATCH_THREAD_ID, UInt3 gtid : GROUP_THREAD_ID, UInt3 gid : GROUP_ID) {
         UInt mode       = NVGHierarchyCullParams.Config.dispatchMode;
         UInt invalidIdx = ~0u;
         UInt prev       = 0u;
 
         // =================================================================
-        //  MODE 0: Coarse-to-Fine BVH Traversal Step (Grid-Stride Unlimited)
+        //  MODE 3: Phase-2 Disoccluded Inner BVH4 Node Recovery
+        // =================================================================
+        if (mode == 3u) {
+            UInt occNodeCnt = Min(NVGHierarchyCullParams.OutQueueCounters[16u].count,
+                                  NVGHierarchyCullParams.Config.maxOccludedNodeCap);
+            for (UInt curIdx = dtid.x; curIdx < occNodeCnt; curIdx = curIdx + 4194240u) {
+                UInt objSlot   = NVGHierarchyCullParams.OutOccludedNodes[curIdx].objectSlotIndex;
+                UInt nodeId    = NVGHierarchyCullParams.OutOccludedNodes[curIdx].nodeOrClusterId;
+                UInt bucketIdx = NVGHierarchyCullParams.OutOccludedNodes[curIdx].drawBucketHint;
+                UInt auxFlags  = NVGHierarchyCullParams.OutOccludedNodes[curIdx].auxData;
+                if (nodeId >= NVGHierarchyCullParams.Config.bvhNodeCount) {
+                    continue;
+                }
+
+                Mat4  worldMat   = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].worldMatrix;
+                UInt  objFlags   = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].objectFlags;
+                Float disp       = 0.0;
+                Float unusedLodS = 1.0;
+                Bool  unusedLock = false;
+                ResolveHierarchyNodeMaterialEnvelope(objSlot, disp, unusedLodS, unusedLock);
+
+                Vec3 skMin; Vec3 skMax; Vec3 skMid; Float skRad; Float skScale;
+                ResolveSkinnedObjectEnvelope(objSlot, objFlags, skMin, skMax, skMid, skRad, skScale);
+
+                Vec3 wMin = Vec3(0.0, 0.0, 0.0);
+                Vec3 wMax = Vec3(0.0, 0.0, 0.0);
+                TransformLocalAABBToWorld(
+                    worldMat,
+                    NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMin + skMin,
+                    NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMax + skMax,
+                    disp, wMin, wMax);
+
+                if (!TestWorldAABBOccludedByHZB(wMin, wMax, NVGHierarchyCullParams.Config.currViewProj)) {
+                    UInt dstIdx = 0u;
+                    InterlockedAdd(NVGHierarchyCullParams.OutQueueCounters[0u].count, 1u, dstIdx);
+                    if (dstIdx < NVGHierarchyCullParams.Config.maxNodeQueueCapacity) {
+                        NVGHierarchyCullParams.OutNodeQueue[dstIdx].objectSlotIndex = objSlot;
+                        NVGHierarchyCullParams.OutNodeQueue[dstIdx].nodeOrClusterId = nodeId;
+                        NVGHierarchyCullParams.OutNodeQueue[dstIdx].drawBucketHint  = bucketIdx;
+                        NVGHierarchyCullParams.OutNodeQueue[dstIdx].auxData         = auxFlags | 2u; // NVG_VIS_FLAG_DISOCCLUDED
+                    } else {
+                        InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[15u].word, 1u, prev);
+                    }
+                }
+            }
+            return;
+        }
+
+        // =================================================================
+        //  MODE 0: 4-Wide BVH4 Cooperative Traversal (16 Parent Nodes x 4 Lanes = 64 Threads)
+        //          with Inner-Node PrevHZB Occlusion Culling & Subtree LOD Pruning
         // =================================================================
         if (mode == 0u) {
-            UInt srcCounter = NVGHierarchyCullParams.Config.srcCounterIndex;
-            UInt srcCount   = Min(NVGHierarchyCullParams.OutQueueCounters[srcCounter].count,
-                                  NVGHierarchyCullParams.Config.maxNodeQueueCapacity);
-            for (UInt itemIdx = dtid.x; itemIdx < srcCount; itemIdx = itemIdx + 4194240u) {
+            UInt srcCounter    = NVGHierarchyCullParams.Config.srcCounterIndex;
+            UInt srcCount      = Min(NVGHierarchyCullParams.OutQueueCounters[srcCounter].count,
+                                     NVGHierarchyCullParams.Config.maxNodeQueueCapacity);
+            UInt parentInGroup = gtid.x >> 2u;
+            UInt laneInNode    = gtid.x & 3u;
+            Bool isPhase2Step  = (NVGHierarchyCullParams.Config.isPhase2Pass != 0u);
+
+            for (UInt baseItem = gid.x * 16u; baseItem < srcCount; baseItem = baseItem + 1048560u) {
+                UInt itemIdx = baseItem + parentInGroup;
+                if (itemIdx >= srcCount) {
+                    continue;
+                }
+
                 UInt objSlot   = NVGHierarchyCullParams.InNodeQueue[itemIdx].objectSlotIndex;
                 UInt nodeId    = NVGHierarchyCullParams.InNodeQueue[itemIdx].nodeOrClusterId;
                 UInt bucketIdx = NVGHierarchyCullParams.InNodeQueue[itemIdx].drawBucketHint;
@@ -513,23 +755,19 @@ SHADER {
                     continue;
                 }
 
-                Mat4 worldMat = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].worldMatrix;
-                UInt objFlags = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].objectFlags;
-                UInt matId    = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialId;
-
-                Float disp = 0.0;
+                Mat4  worldMat    = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].worldMatrix;
+                UInt  objFlags    = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].objectFlags;
+                Float disp        = 0.0;
                 Float matLodScale = 1.0;
-                UInt  matFlags = 0u;
-                if (matId < NVGHierarchyCullParams.Config.materialTableCount) {
-                    disp        = Max(NVGHierarchyCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
-                    matLodScale = Max(NVGHierarchyCullParams.InMaterialTable[matId].lodErrorScale, 0.001);
-                    matFlags    = NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags;
-                }
+                Bool  lockLod0    = false;
+                ResolveHierarchyNodeMaterialEnvelope(objSlot, disp, matLodScale, lockLod0);
 
-                Vec3 nMin = NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMin;
-                Vec3 nMax = NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMax;
+                Vec3 skMin; Vec3 skMax; Vec3 skMid; Float skRad; Float skScale;
+                ResolveSkinnedObjectEnvelope(objSlot, objFlags, skMin, skMax, skMid, skRad, skScale);
 
-                // Frustum cull BVH node AABB (GPU_SCENE_OBJ_FRUSTUM_CULL = 1 << 5 = 32)
+                Vec3 nMin = NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMin + skMin;
+                Vec3 nMax = NVGHierarchyCullParams.InBVHNodes[nodeId].boundsMax + skMax;
+
                 if ((objFlags & 32u) != 0u) {
                     Vec3 wMin = Vec3(0.0, 0.0, 0.0);
                     Vec3 wMax = Vec3(0.0, 0.0, 0.0);
@@ -539,14 +777,13 @@ SHADER {
                     }
                 }
 
-                // Conservative LOD early-out: if EVERY cluster in subtree has parentGroupError <= threshold,
-                // no cluster in this subtree can possibly pass the parent cut (unless lockToLOD0 is set).
-                Bool  lockLod0 = ((matFlags & 64u) != 0u);
-                Float maxScale = GetWorldMaxAxisScale(worldMat);
+                Float maxScale = GetWorldMaxAxisScale(worldMat) * skScale;
                 Float thresh   = Max(NVGHierarchyCullParams.Config.maxScreenErrorPixels * matLodScale, 0.001);
                 if (!lockLod0) {
+                    Vec4 nodeSph = NVGHierarchyCullParams.InBVHNodes[nodeId].lodSphere;
+                    Vec4 adjNodeSph = Vec4(nodeSph.xyz + skMid, nodeSph.w + skRad);
                     Float maxParentProj = ComputeProjectedErrorPixels(
-                        NVGHierarchyCullParams.InBVHNodes[nodeId].lodSphere,
+                        adjNodeSph,
                         NVGHierarchyCullParams.InBVHNodes[nodeId].maxParentError,
                         worldMat, maxScale);
                     if (maxParentProj <= thresh) {
@@ -563,17 +800,25 @@ SHADER {
                     UInt clampedLeafCnt = Min(childCount, 16u);
                     UInt passMask       = 0u;
                     UInt passCnt        = 0u;
-                    for (UInt c = 0u; c < clampedLeafCnt; c = c + 1u) {
+                    for (UInt c = laneInNode; c < clampedLeafCnt; c = c + 4u) {
                         UInt cid = childStart + c;
                         if (cid >= NVGHierarchyCullParams.Config.clusterMetaCount) {
                             continue;
                         }
-                        if (!lockLod0) {
+                        UInt  clMatId = 0u; UInt clBucket = invalidIdx; UInt clMatFlags = 0u;
+                        Float clDisp  = 0.0; Float clLodScale = 1.0;
+                        if (!ResolveHierarchyClusterMaterial(objSlot, objFlags, cid, bucketIdx, clMatId, clBucket, clMatFlags, clDisp, clLodScale)) {
+                            continue;
+                        }
+                        Bool  clLock0  = ((clMatFlags & 64u) != 0u);
+                        Float clThresh = Max(NVGHierarchyCullParams.Config.maxScreenErrorPixels * clLodScale, 0.001);
+                        if (!clLock0) {
+                            Vec4 pSph = NVGHierarchyCullParams.InClusterMeta[cid].parentGroupSphere;
                             Float pProj = ComputeProjectedErrorPixels(
-                                NVGHierarchyCullParams.InClusterMeta[cid].parentGroupSphere,
+                                Vec4(pSph.xyz + skMid, pSph.w + skRad),
                                 NVGHierarchyCullParams.InClusterMeta[cid].parentGroupError,
                                 worldMat, maxScale);
-                            if (pProj <= thresh) {
+                            if (pProj <= clThresh) {
                                 continue;
                             }
                         }
@@ -581,14 +826,15 @@ SHADER {
                         Bool grpAct  = (selfGrp < NVGHierarchyCullParams.Config.clusterGroupCount) &&
                                        (NVGHierarchyCullParams.InGroupActiveMask[selfGrp].active != 0u);
                         if (grpAct) {
-                            UInt chGrpCnt = NVGHierarchyCullParams.InClusterMeta[cid].refinedByChildGroupCount;
+                            UInt chGrpCnt = NVGHierarchyCullParams.InClusterMeta[cid].refinedByChildGroupCount & 65535u;
                             if (chGrpCnt > 0u) {
                                 UInt  cLod = (NVGHierarchyCullParams.InClusterMeta[cid].countsAndLod >> 16u) & 255u;
+                                Vec4  sSph = NVGHierarchyCullParams.InClusterMeta[cid].selfGroupSphere;
                                 Float sProj = ComputeProjectedErrorPixels(
-                                    NVGHierarchyCullParams.InClusterMeta[cid].selfGroupSphere,
+                                    Vec4(sSph.xyz + skMid, sSph.w + skRad),
                                     NVGHierarchyCullParams.InClusterMeta[cid].selfGroupError,
                                     worldMat, maxScale);
-                                Bool wantsRef = lockLod0 ? (cLod > 0u) : (sProj > thresh);
+                                Bool wantsRef = clLock0 ? (cLod > 0u) : (sProj > clThresh);
                                 if (wantsRef) {
                                     UInt chGrpId = NVGHierarchyCullParams.InClusterMeta[cid].refinedByChildGroupStart;
                                     Bool chAct   = (chGrpId < NVGHierarchyCullParams.Config.clusterGroupCount);
@@ -602,13 +848,11 @@ SHADER {
                                         }
                                     }
                                     if (chAct) {
-                                        // Finer child group(s) are already active in the cut -> skip ancestor before queueing!
                                         continue;
                                     }
                                 }
                             }
                         } else {
-                            // Non-resident cluster: skip if already resident-flagged or outside camera frustum
                             UInt sVP = NVGHierarchyCullParams.InClusterMeta[cid].virtualPageId;
                             if (sVP >= NVGHierarchyCullParams.Config.virtualPageCount ||
                                 (NVGHierarchyCullParams.InVirtualPageTable[sVP].stateAndFlags & 1u) != 0u) {
@@ -619,9 +863,9 @@ SHADER {
                                 Vec3 cMax = Vec3(0.0, 0.0, 0.0);
                                 TransformLocalAABBToWorld(
                                     worldMat,
-                                    NVGHierarchyCullParams.InClusterMeta[cid].aabbMin,
-                                    NVGHierarchyCullParams.InClusterMeta[cid].aabbMax,
-                                    disp, cMin, cMax);
+                                    NVGHierarchyCullParams.InClusterMeta[cid].aabbMin + skMin,
+                                    NVGHierarchyCullParams.InClusterMeta[cid].aabbMax + skMax,
+                                    clDisp, cMin, cMax);
                                 if (!TestWorldAABBFrustum(cMin, cMax)) {
                                     continue;
                                 }
@@ -640,7 +884,7 @@ SHADER {
                             InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[15u].word, dropped, prev);
                         }
                         UInt localOut = 0u;
-                        for (UInt c = 0u; c < clampedLeafCnt; c = c + 1u) {
+                        for (UInt c = laneInNode; c < clampedLeafCnt; c = c + 4u) {
                             if ((passMask & (1u << c)) != 0u) {
                                 UInt wIdx = baseDst + localOut;
                                 localOut  = localOut + 1u;
@@ -657,32 +901,63 @@ SHADER {
                     UInt clampedChildCnt = Min(childCount, 16u);
                     UInt childMask       = 0u;
                     UInt childPassCnt    = 0u;
-                    for (UInt c = 0u; c < clampedChildCnt; c = c + 1u) {
+                    for (UInt c = laneInNode; c < clampedChildCnt; c = c + 4u) {
                         UInt childNodeId = childStart + c;
                         if (childNodeId >= NVGHierarchyCullParams.Config.bvhNodeCount) {
                             continue;
                         }
+                        Vec3 cwMin = Vec3(0.0, 0.0, 0.0);
+                        Vec3 cwMax = Vec3(0.0, 0.0, 0.0);
+                        TransformLocalAABBToWorld(
+                            worldMat,
+                            NVGHierarchyCullParams.InBVHNodes[childNodeId].boundsMin + skMin,
+                            NVGHierarchyCullParams.InBVHNodes[childNodeId].boundsMax + skMax,
+                            disp, cwMin, cwMax);
+
                         if ((objFlags & 32u) != 0u) {
-                            Vec3 cwMin = Vec3(0.0, 0.0, 0.0);
-                            Vec3 cwMax = Vec3(0.0, 0.0, 0.0);
-                            TransformLocalAABBToWorld(
-                                worldMat,
-                                NVGHierarchyCullParams.InBVHNodes[childNodeId].boundsMin,
-                                NVGHierarchyCullParams.InBVHNodes[childNodeId].boundsMax,
-                                disp, cwMin, cwMax);
                             if (!TestWorldAABBFrustum(cwMin, cwMax)) {
                                 continue;
                             }
                         }
                         if (!lockLod0) {
+                            Vec4 chSph = NVGHierarchyCullParams.InBVHNodes[childNodeId].lodSphere;
                             Float chProj = ComputeProjectedErrorPixels(
-                                NVGHierarchyCullParams.InBVHNodes[childNodeId].lodSphere,
+                                Vec4(chSph.xyz + skMid, chSph.w + skRad),
                                 NVGHierarchyCullParams.InBVHNodes[childNodeId].maxParentError,
                                 worldMat, maxScale);
                             if (chProj <= thresh) {
                                 continue;
                             }
                         }
+
+                        // Inner-Node HZB Occlusion Culling (Phase-1 PrevHZB -> OutOccludedNodes; Phase-2 CurrHZB prune)
+                        if (NVGHierarchyCullParams.Config.enableHZBOcclusion != 0u && (auxFlags & 8u) == 0u) {
+                            if (!isPhase2Step) {
+                                if (NVGHierarchyCullParams.Config.hasPrevHZB != 0u) {
+                                    if (TestWorldAABBOccludedByHZB(cwMin, cwMax, NVGHierarchyCullParams.Config.prevViewProj)) {
+                                        if (NVGHierarchyCullParams.Config.enableTwoPhase != 0u) {
+                                            UInt occNodeDst = 0u;
+                                            InterlockedAdd(NVGHierarchyCullParams.OutQueueCounters[16u].count, 1u, occNodeDst);
+                                            if (occNodeDst < NVGHierarchyCullParams.Config.maxOccludedNodeCap) {
+                                                NVGHierarchyCullParams.OutOccludedNodes[occNodeDst].objectSlotIndex = objSlot;
+                                                NVGHierarchyCullParams.OutOccludedNodes[occNodeDst].nodeOrClusterId = childNodeId;
+                                                NVGHierarchyCullParams.OutOccludedNodes[occNodeDst].drawBucketHint  = bucketIdx;
+                                                NVGHierarchyCullParams.OutOccludedNodes[occNodeDst].auxData         = auxFlags;
+                                                continue;
+                                            }
+                                            // Queue full: conservatively fall through to Phase-1 traversal (zero disocclusion holes!)
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (TestWorldAABBOccludedByHZB(cwMin, cwMax, NVGHierarchyCullParams.Config.currViewProj)) {
+                                    continue;
+                                }
+                            }
+                        }
+
                         childMask    = childMask | (1u << c);
                         childPassCnt = childPassCnt + 1u;
                     }
@@ -697,7 +972,7 @@ SHADER {
                             InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[15u].word, dropped, prev);
                         }
                         UInt localOut = 0u;
-                        for (UInt c = 0u; c < clampedChildCnt; c = c + 1u) {
+                        for (UInt c = laneInNode; c < clampedChildCnt; c = c + 4u) {
                             if ((childMask & (1u << c)) != 0u) {
                                 UInt wIdx = baseDst + localOut;
                                 localOut  = localOut + 1u;
@@ -744,16 +1019,17 @@ SHADER {
             Mat4 worldMat = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].worldMatrix;
             UInt objFlags = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].objectFlags;
             UInt batchGrp = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].batchGroupId;
-            UInt matId    = NVGHierarchyCullParams.InGPUSceneObjects[objSlot].materialId;
 
+            UInt  matId       = 0u;
+            UInt  clBucketIdx = invalidIdx;
+            UInt  matFlags    = 0u;
             Float disp        = 0.0;
             Float matLodScale = 1.0;
-            UInt  matFlags    = 0u;
-            if (matId < NVGHierarchyCullParams.Config.materialTableCount) {
-                disp        = Max(NVGHierarchyCullParams.InMaterialTable[matId].maxWorldDisplacement, 0.0);
-                matLodScale = Max(NVGHierarchyCullParams.InMaterialTable[matId].lodErrorScale, 0.001);
-                matFlags    = NVGHierarchyCullParams.InMaterialTable[matId].nvgFlags;
+            if (!ResolveHierarchyClusterMaterial(objSlot, objFlags, clusterId, bucketIdx, matId, clBucketIdx, matFlags, disp, matLodScale)) {
+                continue;
             }
+            bucketIdx = clBucketIdx;
+            auxFlags  = (auxFlags & (~8u)) | (((matFlags & 32u) != 0u) ? 8u : 0u);
 
             UInt selfGroup   = NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupIndex;
             UInt countsLod   = NVGHierarchyCullParams.InClusterMeta[clusterId].countsAndLod;
@@ -761,15 +1037,19 @@ SHADER {
             UInt selfVP      = NVGHierarchyCullParams.InClusterMeta[clusterId].virtualPageId;
             UInt wordOff     = NVGHierarchyCullParams.InClusterMeta[clusterId].clusterWordOffsetInPage;
             UInt childGrpId  = NVGHierarchyCullParams.InClusterMeta[clusterId].refinedByChildGroupStart;
-            UInt childGrpCnt = NVGHierarchyCullParams.InClusterMeta[clusterId].refinedByChildGroupCount;
+            UInt childGrpCnt = NVGHierarchyCullParams.InClusterMeta[clusterId].refinedByChildGroupCount & 65535u;
+
+            Vec3 skMin; Vec3 skMax; Vec3 skMid; Float skRad; Float skScale;
+            ResolveSkinnedObjectEnvelope(objSlot, objFlags, skMin, skMax, skMid, skRad, skScale);
 
             // 1. Watertight Residency Check: own group active-chain MUST be 1 to emit geometry.
             //    Symmetric priority formula [262144 .. 802815] guarantees missing faults and resident keepPrio
             //    produce bit-identical priorities for the same DAG cut error (zero 4-frame ping-pong thrashing!).
-            Float maxScale   = GetWorldMaxAxisScale(worldMat);
+            Float maxScale   = GetWorldMaxAxisScale(worldMat) * skScale;
             Float threshold  = Max(NVGHierarchyCullParams.Config.maxScreenErrorPixels * matLodScale, 0.001);
+            Vec4  pSphMeta   = NVGHierarchyCullParams.InClusterMeta[clusterId].parentGroupSphere;
             Float parentProj = ComputeProjectedErrorPixels(
-                NVGHierarchyCullParams.InClusterMeta[clusterId].parentGroupSphere,
+                Vec4(pSphMeta.xyz + skMid, pSphMeta.w + skRad),
                 NVGHierarchyCullParams.InClusterMeta[clusterId].parentGroupError,
                 worldMat, maxScale);
             Bool lockLod0     = ((matFlags & 64u) != 0u);
@@ -790,8 +1070,8 @@ SHADER {
                             Vec3 cMax = Vec3(0.0, 0.0, 0.0);
                             TransformLocalAABBToWorld(
                                 worldMat,
-                                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMin,
-                                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMax,
+                                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMin + skMin,
+                                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMax + skMax,
                                 disp, cMin, cMax);
                             inView = TestWorldAABBFrustum(cMin, cMax);
                         }
@@ -817,8 +1097,9 @@ SHADER {
                 continue;
             }
 
+            Vec4  sSphMeta = NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupSphere;
             Float selfProj = ComputeProjectedErrorPixels(
-                NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupSphere,
+                Vec4(sSphMeta.xyz + skMid, sSphMeta.w + skRad),
                 NVGHierarchyCullParams.InClusterMeta[clusterId].selfGroupError,
                 worldMat, maxScale);
 
@@ -876,16 +1157,17 @@ SHADER {
                 continue;
             }
 
-            // 3. Transform Cluster AABB to World Space
+            // 3. Transform Cluster AABB to World Space (including conservative skinned pose envelope)
             Vec3 wMin = Vec3(0.0, 0.0, 0.0);
             Vec3 wMax = Vec3(0.0, 0.0, 0.0);
             TransformLocalAABBToWorld(
                 worldMat,
-                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMin,
-                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMax,
+                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMin + skMin,
+                NVGHierarchyCullParams.InClusterMeta[clusterId].aabbMax + skMax,
                 disp, wMin, wMax);
 
             // 4. Cluster Frustum Cull (GPU_SCENE_OBJ_FRUSTUM_CULL = 1 << 5 = 32)
+            Bool isPhase2Traversal = isPhase2 || (NVGHierarchyCullParams.Config.isPhase2Pass != 0u);
             if (!isPhase2 && (objFlags & 32u) != 0u) {
                 if (!TestWorldAABBFrustum(wMin, wMax)) {
                     InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[4u].word, 1u, prev); // clustersFrustumCulled
@@ -893,14 +1175,18 @@ SHADER {
                 }
             }
 
-            // 5. Conservative Backface Normal Cone Culling (perspective, opaque/non-two-sided, zero displacement)
-            Bool isTwoSided = ((matFlags & 16u) != 0u);
+            // 5. Conservative Backface Normal Cone Culling (perspective, non-skinned, opaque/non-two-sided, zero displacement)
+            //    Uses exact cofactor singular-value distortion bound sin(theta') = (sigmaMax(C) / ||C * axis||) * tan(theta)
+            //    and disables cone culling whenever cos(theta) <= 0.01 or sin(theta') >= 0.995 (theta' >= 84.3 deg).
+            Bool isTwoSided  = ((matFlags & 16u) != 0u);
             Bool isFrontCull = ((matFlags & 1024u) != 0u);
-            Vec4 cone = NVGHierarchyCullParams.InClusterMeta[clusterId].normalConeAxisAndSin;
+            Bool isSkinned   = ((objFlags & 1024u) != 0u);
+            Vec4 cone        = NVGHierarchyCullParams.InClusterMeta[clusterId].normalConeAxisAndSin;
             if (!isPhase2 &&
                 NVGHierarchyCullParams.Config.enableConeCulling != 0u &&
                 NVGHierarchyCullParams.Config.isOrthographic == 0u &&
                 !isTwoSided &&
+                !isSkinned &&
                 disp <= 0.00001 &&
                 cone.w >= 0.0 && cone.w < 0.995)
             {
@@ -916,23 +1202,31 @@ SHADER {
                     Vec3 r0 = Cross(c1, c2);
                     Vec3 r1 = Cross(c2, c0);
                     Vec3 r2 = Cross(c0, c1);
-                    Float det = Dot(c0, r0);
+                    Float det    = Dot(c0, r0);
                     Float absDet = Abs(det);
-                    Vec3 wAxis = r0 * cone.x + r1 * cone.y + r2 * cone.z;
-                    Float axLen = Length(wAxis);
+                    Vec3  wAxis  = r0 * cone.x + r1 * cone.y + r2 * cone.z;
+                    Float axLen  = Length(wAxis);
                     if (axLen > 0.00001 && absDet > 0.00000001) {
                         wAxis = wAxis / axLen;
                         if (isFrontCull) {
                             wAxis = -wAxis;
                         }
-                        Float maxC = Max(Length(c0), Max(Length(c1), Length(c2)));
-                        Float maxR = Max(Length(r0), Max(Length(r1), Length(r2)));
-                        Float aniso = Max((maxC * maxR) / absDet, 1.0);
-                        Float sinCone = cone.w;
-                        if (aniso > 1.001) {
-                            Float cosCone  = Sqrt(Max(1.0 - sinCone * sinCone, 0.0));
-                            Float scaledS  = aniso * sinCone;
-                            sinCone        = scaledS / Sqrt(Max(cosCone * cosCone + scaledS * scaledS, 0.00000001));
+                        Float r0Sq        = Dot(r0, r0);
+                        Float r1Sq        = Dot(r1, r1);
+                        Float r2Sq        = Dot(r2, r2);
+                        Float maxRSq      = Max(r0Sq, Max(r1Sq, r2Sq));
+                        Float minRSq      = Min(r0Sq, Min(r1Sq, r2Sq));
+                        Float offDiagR    = Abs(Dot(r0, r1)) + Abs(Dot(r0, r2)) + Abs(Dot(r1, r2));
+                        Bool  isIsotropic = (offDiagR <= (0.0001 * maxRSq)) && ((maxRSq - minRSq) <= (0.001 * maxRSq));
+                        Float sinCone     = cone.w;
+                        Float cosCone     = Sqrt(Max(1.0 - sinCone * sinCone, 0.0));
+                        if (cosCone <= 0.01) {
+                            sinCone = 1.0;
+                        } else if (!isIsotropic) {
+                            Float sigmaMaxC = (offDiagR > (0.0001 * maxRSq))
+                                ? Sqrt(Max(r0Sq + r1Sq + r2Sq, 1.0e-12))
+                                : Sqrt(Max(maxRSq, 1.0e-12));
+                            sinCone = (sigmaMaxC / axLen) * (sinCone / cosCone);
                         }
                         if (sinCone < 0.995 && Dot(viewDir, wAxis) < -(sinCone + (wRad / dist) + 0.001)) {
                             InterlockedAdd(NVGHierarchyCullParams.OutTelemetry[5u].word, 1u, prev); // clustersConeCulled
@@ -951,7 +1245,7 @@ SHADER {
             // 7. HZB Occlusion Culling (Phase 1 vs prev-HZB, Phase 2 vs current-HZB)
             Bool isTrans = ((visFlags & 8u) != 0u);
             if (NVGHierarchyCullParams.Config.enableHZBOcclusion != 0u && !isTrans) {
-                if (!isPhase2) {
+                if (!isPhase2Traversal) {
                     if (NVGHierarchyCullParams.Config.hasPrevHZB != 0u) {
                         if (TestWorldAABBOccludedByHZB(wMin, wMax, NVGHierarchyCullParams.Config.prevViewProj)) {
                             if (NVGHierarchyCullParams.Config.enableTwoPhase != 0u) {
@@ -973,7 +1267,7 @@ SHADER {
                         }
                     }
                 } else {
-                    // Phase 2: Re-test previously occluded cluster against current-frame HZB
+                    // Phase 2 (both Mode 1 disoccluded subtrees & Mode 2 disoccluded clusters): re-test vs current-frame HZB
                     if (TestWorldAABBOccludedByHZB(wMin, wMax, NVGHierarchyCullParams.Config.currViewProj)) {
                         continue;
                     }

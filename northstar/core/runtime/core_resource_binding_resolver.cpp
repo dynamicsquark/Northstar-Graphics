@@ -49,7 +49,8 @@ namespace Northstar
             UINT16                        slot) noexcept
         {
             if (!key || !key->enabled) return false;
-            for (UINT8 i = 0u; i < key->cbvCount && i < 3u; ++i)
+            const UINT8 maxCbv = key->extended ? 8u : 3u;
+            for (UINT8 i = 0u; i < key->cbvCount && i < maxCbv; ++i)
             {
                 if (key->cbvStage[i] == stage &&
                     key->cbvSpace[i] == space &&
@@ -67,8 +68,17 @@ namespace Northstar
             UINT16                        space,
             UINT16                        slot) noexcept
         {
-            if (!key || !key->enabled || !key->hasPromotedSRV) return false;
-            return (key->srvStage == stage && key->srvSpace == space && key->srvSlot == slot);
+            if (!key || !key->enabled) return false;
+            const UINT8 effSrv = (key->srvCount > 0u) ? key->srvCount : (key->hasPromotedSRV ? 1u : 0u);
+            if (effSrv >= 1u && key->srvStage == stage && key->srvSpace == space && key->srvSlot == slot)
+            {
+                return true;
+            }
+            if (key->extended && effSrv >= 2u && key->srv2Stage == stage && key->srv2Space == space && key->srv2Slot == slot)
+            {
+                return true;
+            }
+            return false;
         }
 
         inline BOOL IsDomainGPUBacked(EngineResourceDomain domain) noexcept
@@ -122,6 +132,9 @@ namespace Northstar
             { "INV_VIEW_MATRIX",       EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu, 64u, 0u, false, false, false },
             { "INV_PROJECTION_MATRIX", EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu, 64u, 0u, false, false, false },
             { "INV_VP_MATRIX",         EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu, 64u, 0u, false, false, false },
+            { "PREV_VIEW_MATRIX",       EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu, 64u, 0u, false, false, false },
+            { "PREV_PROJECTION_MATRIX", EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu, 64u, 0u, false, false, false },
+            { "PREV_VP_MATRIX",         EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu, 64u, 0u, false, false, false },
             { "NEAR_PLANE",            EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu,  4u, 0u, false, false, false },
             { "FAR_PLANE",             EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu,  4u, 0u, false, false, false },
             { "CAMERA_FOV",            EngineResourceDomain::USER_ONLY, EXEC_CTX_CAMERA_VIEW, 0xFFFFFFFFu,  4u, 0u, false, false, false },
@@ -129,6 +142,7 @@ namespace Northstar
 
             // ==================== Transform & Object Identity (CBuffer) ====================
             { "WORLD_MATRIX",          EngineResourceDomain::USER_ONLY, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 64u, 0u, false, false, true },
+            { "PREV_WORLD_MATRIX",     EngineResourceDomain::USER_ONLY, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 64u, 0u, false, false, true },
             { "NORMAL_MATRIX",         EngineResourceDomain::USER_ONLY, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 48u, 0u, false, false, true },
             { "MVP_MATRIX",            EngineResourceDomain::USER_ONLY, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 64u, 0u, false, false, true },
             { "INV_WORLD_MATRIX",      EngineResourceDomain::USER_ONLY, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 64u, 0u, false, false, true },
@@ -175,6 +189,7 @@ namespace Northstar
 
             // ==================== NVG Draw & Telemetry Metadata (CBuffer) ====================
             { "NVG_DRAW_BUCKET_ID",           EngineResourceDomain::USER_ONLY, EXEC_CTX_CLUSTER,                0xFFFFFFFFu, 4u, 0u, true,  false, true  },
+            { "NVG_DRAW_CONTEXT_ID",          EngineResourceDomain::USER_ONLY, EXEC_CTX_CLUSTER,                0xFFFFFFFFu, 4u, 0u, true,  false, true  },
             { "NVG_VISIBLE_CLUSTER_COUNT",    EngineResourceDomain::USER_ONLY, EXEC_CTX_CLUSTER,                0xFFFFFFFFu, 4u, 0u, true,  false, true  },
             { "NVG_VISIBLE_CLUSTER_OFFSET",   EngineResourceDomain::USER_ONLY, EXEC_CTX_CLUSTER,                0xFFFFFFFFu, 4u, 0u, true,  false, true  },
             { "NVG_DEBUG_MODE",               EngineResourceDomain::USER_ONLY, EXEC_CTX_FRAME | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 4u, 0u, false, false, false },
@@ -183,9 +198,10 @@ namespace Northstar
             { "NVG_PAGE_WORD_COUNT",          EngineResourceDomain::USER_ONLY, EXEC_CTX_FRAME | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 4u, 0u, false, false, false },
 
             // ==================== Skinning & Instance StructuredBuffers ====================
-            { "GLOBAL_BONE_MATRIX",    EngineResourceDomain::GLOBAL_BONE_PALETTE,   EXEC_CTX_SCENE | EXEC_CTX_FRAME, 0u, 64u, 64u, false, false, false },
-            { "BONE_MATRIX",           EngineResourceDomain::PER_OBJECT_BONE_SLICE, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0u, 64u, 64u, false, false, true },
-            { "INSTANCE_WORLD_MATRIX", EngineResourceDomain::INSTANCES,             EXEC_CTX_INSTANCE | EXEC_CTX_CLUSTER, 0u, 64u, 0u, false, false, true },
+            { "GLOBAL_BONE_MATRIX",         EngineResourceDomain::GLOBAL_BONE_PALETTE,   EXEC_CTX_SCENE | EXEC_CTX_FRAME, 0u, 64u, 64u, false, false, false },
+            { "BONE_MATRIX",                EngineResourceDomain::PER_OBJECT_BONE_SLICE, EXEC_CTX_RENDER_OBJECT | EXEC_CTX_CLUSTER, 0u, 64u, 64u, false, false, true },
+            { "INSTANCE_WORLD_MATRIX",      EngineResourceDomain::INSTANCES,             EXEC_CTX_INSTANCE | EXEC_CTX_CLUSTER, 0u, 64u, 0u, false, false, true },
+            { "INSTANCE_PREV_WORLD_MATRIX", EngineResourceDomain::INSTANCES,             EXEC_CTX_INSTANCE | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 64u, 0u, false, false, true },
             { "INSTANCE_ID_VALUE",     EngineResourceDomain::INSTANCES,             EXEC_CTX_INSTANCE | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 4u, 0u, false, false, true },
             { "INSTANCE_CUSTOM_DATA",  EngineResourceDomain::INSTANCES,             EXEC_CTX_INSTANCE | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 4u, 0u, false, false, true },
             { "INSTANCE_BONE_OFFSET",  EngineResourceDomain::INSTANCE_SKINNING,     EXEC_CTX_INSTANCE | EXEC_CTX_CLUSTER, 0xFFFFFFFFu, 4u, 0u, false, false, true },
@@ -293,8 +309,13 @@ namespace Northstar
             { "NVG_OBJ_SUBMESH_INDEX",      EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, submeshIndex)),        4u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
             { "NVG_OBJ_AABB_MAX",           EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, aabbMax)),            12u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
             { "NVG_OBJ_LOD_MATERIAL_FLAGS", EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, lodAndMaterialFlags)), 4u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
-            { "NVG_OBJ_BOUNDING_SPHERE",    EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, boundingSphere)),     16u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
-            { "NVG_OBJ_WORLD_MATRIX",       EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, worldMatrix)),        64u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_BOUNDING_SPHERE",       EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, boundingSphere)),       16u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_WORLD_MATRIX",          EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, worldMatrix)),          64u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_PREV_WORLD_MATRIX",     EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, prevWorldMatrix)),      64u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_LAYER_MASK",            EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, layerMask)),             4u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_MATERIAL_TABLE_OFFSET", EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, materialTableOffset)),   4u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_MATERIAL_SLOT_COUNT",   EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, materialSlotCount)),     4u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
+            { "NVG_OBJ_SKIN_BOUNDS_OFFSET",    EngineResourceDomain::GPU_SCENE_OBJECTS, EXEC_CTX_SCENE | EXEC_CTX_FRAME, static_cast<UINT32>(offsetof(GPUSceneObjectData, skinningBoundsOffset)),  4u, static_cast<UINT32>(sizeof(GPUSceneObjectData)), false, false, false },
 
             // ==================== NVG Shadow Page Views (80B — NVG + Shadow Pass Only) ====================
             { "NVG_SHADOW_PAGE_VP_MATRIX",   EngineResourceDomain::NVG_SHADOW_PAGE_VIEWS, EXEC_CTX_CLUSTER | EXEC_CTX_SHADOW_PAGE, static_cast<UINT32>(offsetof(NVGShadowPageViewGPUData, worldToPageClip)),   64u, static_cast<UINT32>(sizeof(NVGShadowPageViewGPUData)), true, true, false },
@@ -849,6 +870,7 @@ namespace Northstar
             {
                 const std::string& pName = GetFieldPropertyName(f);
                 if (pName == "INSTANCE_WORLD_MATRIX" ||
+                    pName == "INSTANCE_PREV_WORLD_MATRIX" ||
                     pName == "INSTANCE_ID_VALUE" ||
                     pName == "INSTANCE_CUSTOM_DATA")
                 {
@@ -1123,6 +1145,7 @@ namespace Northstar
     {
         const UINT32 sem = MapPropertyNameToPatchSemantic(propertyName);
         return (sem == NVS_PATCH_WORLD_MATRIX ||
+                sem == NVS_PATCH_PREV_WORLD_MATRIX ||
                 sem == NVS_PATCH_INV_WORLD_MATRIX ||
                 sem == NVS_PATCH_NORMAL_MATRIX ||
                 sem == NVS_PATCH_MVP_MATRIX ||
@@ -1130,6 +1153,7 @@ namespace Northstar
                 sem == NVS_PATCH_BONE_COUNT ||
                 sem == NVS_PATCH_SKINNING_REVISION ||
                 sem == NVS_PATCH_NVG_DRAW_BUCKET_ID ||
+                sem == NVS_PATCH_NVG_DRAW_CONTEXT_ID ||
                 sem == NVS_PATCH_NVG_VISIBLE_CLUSTER_COUNT ||
                 sem == NVS_PATCH_NVG_VISIBLE_CLUSTER_OFFSET ||
                 sem == NVS_PATCH_GPU_SCENE_OBJECT_SLOT);
@@ -1138,19 +1162,23 @@ namespace Northstar
     BOOL CoreResourceBindingResolver::IsCBufferFieldShadowPageDynamic(const std::string& propertyName)
     {
         const UINT32 sem = MapPropertyNameToPatchSemantic(propertyName);
-        return (sem != NVS_PATCH_SEMANTIC_NONE);
+        return (sem != NVS_PATCH_SEMANTIC_NONE && !IsNVSInstancePatchSemantic(sem));
     }
 
     UINT32 CoreResourceBindingResolver::MapPropertyNameToPatchSemantic(const std::string& name)
     {
         if (name == "WORLD_MATRIX")                 return NVS_PATCH_WORLD_MATRIX;
+        if (name == "PREV_WORLD_MATRIX")            return NVS_PATCH_PREV_WORLD_MATRIX;
         if (name == "INV_WORLD_MATRIX")             return NVS_PATCH_INV_WORLD_MATRIX;
         if (name == "NORMAL_MATRIX")                return NVS_PATCH_NORMAL_MATRIX;
         if (name == "VIEW_MATRIX")                  return NVS_PATCH_VIEW_MATRIX;
+        if (name == "PREV_VIEW_MATRIX")             return NVS_PATCH_PREV_VIEW_MATRIX;
         if (name == "INV_VIEW_MATRIX")              return NVS_PATCH_INV_VIEW_MATRIX;
         if (name == "PROJECTION_MATRIX")            return NVS_PATCH_PROJECTION_MATRIX;
+        if (name == "PREV_PROJECTION_MATRIX")       return NVS_PATCH_PREV_PROJECTION_MATRIX;
         if (name == "INV_PROJECTION_MATRIX")        return NVS_PATCH_INV_PROJECTION_MATRIX;
         if (name == "VP_MATRIX")                    return NVS_PATCH_VP_MATRIX;
+        if (name == "PREV_VP_MATRIX")               return NVS_PATCH_PREV_VP_MATRIX;
         if (name == "INV_VP_MATRIX")                return NVS_PATCH_INV_VP_MATRIX;
         if (name == "MVP_MATRIX")                   return NVS_PATCH_MVP_MATRIX;
         if (name == "CAMERA_POSITION")              return NVS_PATCH_CAMERA_POSITION;
@@ -1170,10 +1198,12 @@ namespace Northstar
         if (name == "CAMERA_FOV")                   return NVS_PATCH_CAMERA_FOV;
         if (name == "CAMERA_ASPECT")                return NVS_PATCH_CAMERA_ASPECT;
         if (name == "NVG_DRAW_BUCKET_ID")           return NVS_PATCH_NVG_DRAW_BUCKET_ID;
+        if (name == "NVG_DRAW_CONTEXT_ID")          return NVS_PATCH_NVG_DRAW_CONTEXT_ID;
         if (name == "NVG_VISIBLE_CLUSTER_COUNT")    return NVS_PATCH_NVG_VISIBLE_CLUSTER_COUNT;
         if (name == "NVG_VISIBLE_CLUSTER_OFFSET")   return NVS_PATCH_NVG_VISIBLE_CLUSTER_OFFSET;
         if (name == "GPU_SCENE_OBJECT_SLOT")        return NVS_PATCH_GPU_SCENE_OBJECT_SLOT;
         if (name == "INSTANCE_WORLD_MATRIX")        return NVS_PATCH_INSTANCE_WORLD_MATRIX;
+        if (name == "INSTANCE_PREV_WORLD_MATRIX")   return NVS_PATCH_INSTANCE_PREV_WORLD_MATRIX;
         if (name == "INSTANCE_ID_VALUE" || name == "INSTANCE_ID") return NVS_PATCH_INSTANCE_ID;
         if (name == "INSTANCE_CUSTOM_DATA")         return NVS_PATCH_INSTANCE_CUSTOM_DATA;
         if (name == "INSTANCE_BONE_OFFSET" || name == "INSTANCE_BONE_PALETTE_OFFSET") return NVS_PATCH_INSTANCE_BONE_OFFSET;
@@ -1183,6 +1213,7 @@ namespace Northstar
 
     BOOL CoreResourceBindingResolver::DoesShaderRequireEngineSkinning(const ShaderReflection& refl)
     {
+        BOOL hasDynamicSkinGuard = false;
         for (const auto& buf : refl.buffers)
         {
             for (const auto& f : buf.fields)
@@ -1195,19 +1226,39 @@ namespace Northstar
                 {
                     return true;
                 }
+                if (pName == "GEOMETRY_MODE")
+                {
+                    hasDynamicSkinGuard = true;
+                }
             }
         }
         for (const auto& sb : refl.structuredBuffers)
         {
-            if (sb.name == "NVGResources__BonePalette") continue;
             for (const auto& f : sb.fields)
             {
                 if (!f.isGet) continue;
                 const std::string& pName = GetFieldPropertyName(f);
-                if (pName == "GLOBAL_BONE_MATRIX" ||
-                    pName == "BONE_MATRIX" ||
+                if (pName == "NVG_VIS_BONE_COUNT" ||
+                    pName == "NVG_VIS_BONE_OFFSET" ||
+                    pName == "NVG_OBJ_RENDER_FLAGS")
+                {
+                    hasDynamicSkinGuard = true;
+                }
+            }
+        }
+        for (const auto& sb : refl.structuredBuffers)
+        {
+            for (const auto& f : sb.fields)
+            {
+                if (!f.isGet) continue;
+                const std::string& pName = GetFieldPropertyName(f);
+                if (pName == "BONE_MATRIX" ||
                     pName == "INSTANCE_BONE_OFFSET" ||
                     pName == "INSTANCE_BONE_COUNT")
+                {
+                    return true;
+                }
+                if (pName == "GLOBAL_BONE_MATRIX" && !hasDynamicSkinGuard)
                 {
                     return true;
                 }
@@ -1228,7 +1279,6 @@ namespace Northstar
         }
         for (const auto& sb : refl.structuredBuffers)
         {
-            if (sb.name == "NVGResources__BonePalette") continue;
             for (const auto& f : sb.fields)
             {
                 if (!f.isGet) continue;
@@ -1266,6 +1316,10 @@ namespace Northstar
         if (propName == "WORLD_MATRIX")
         {
             copyBytes(&worldMat, sizeof(Mat4));
+        }
+        else if (propName == "PREV_WORLD_MATRIX")
+        {
+            copyBytes(&ctx.prevWorldMatrix, sizeof(Mat4));
         }
         else if (propName == "NORMAL_MATRIX")
         {
@@ -1332,7 +1386,22 @@ namespace Northstar
         }
         else if (propName == "INV_VP_MATRIX")
         {
-            const Mat4 m = frame ? frame->camera.viewProjectionMatrix.Inverted() : Mat4::Identity();
+            const Mat4 m = frame ? frame->camera.invViewProjectionMatrix : Mat4::Identity();
+            copyBytes(&m, sizeof(Mat4));
+        }
+        else if (propName == "PREV_VIEW_MATRIX")
+        {
+            const Mat4 m = frame ? frame->camera.prevViewMatrix : Mat4::Identity();
+            copyBytes(&m, sizeof(Mat4));
+        }
+        else if (propName == "PREV_PROJECTION_MATRIX")
+        {
+            const Mat4 m = frame ? frame->camera.prevProjectionMatrix : Mat4::Identity();
+            copyBytes(&m, sizeof(Mat4));
+        }
+        else if (propName == "PREV_VP_MATRIX")
+        {
+            const Mat4 m = frame ? frame->camera.prevViewProjectionMatrix : Mat4::Identity();
             copyBytes(&m, sizeof(Mat4));
         }
         else if (propName == "VIEW_MATRIX")
@@ -1561,6 +1630,12 @@ namespace Northstar
             const UINT32 v = clusterCtx ? ctx.nvgDrawBucketId : kNVGInvalidIndex;
             copyBytes(&v, sizeof(UINT32));
         }
+        else if (propName == "NVG_DRAW_CONTEXT_ID")
+        {
+            const BOOL clusterCtx = ((ctx.executionContextMask & EXEC_CTX_CLUSTER) != 0u);
+            const UINT32 v = clusterCtx ? ctx.nvgDrawContextId : kNVGInvalidIndex;
+            copyBytes(&v, sizeof(UINT32));
+        }
         else if (propName == "NVG_VISIBLE_CLUSTER_COUNT")
         {
             const BOOL clusterCtx = ((ctx.executionContextMask & EXEC_CTX_CLUSTER) != 0u);
@@ -1782,6 +1857,7 @@ namespace Northstar
         const UINT32 canonicalStride = plan.canonicalSrcStride;
 
         const BOOL isClusterCtx = ((ctx.executionContextMask & EXEC_CTX_CLUSTER) != 0u);
+        const BOOL isComputeCtx = ((ctx.executionContextMask & EXEC_CTX_COMPUTE_DISPATCH) != 0u);
         const BOOL isShadowCtx  = ((ctx.executionContextMask & EXEC_CTX_SHADOW_PAGE) != 0u);
 
         switch (plan.domain)
@@ -1797,7 +1873,7 @@ namespace Northstar
                 break;
 
             case EngineResourceDomain::NVG_PAGE_POOL:
-                if (isClusterCtx)
+                if (isClusterCtx || isComputeCtx)
                 {
                     srcHandle    = (ctx.nvgPagePoolBuffer != 0) ? ctx.nvgPagePoolBuffer : (frame ? frame->nvgPagePoolBuffer : 0);
                     srcElemCount = (ctx.nvgPagePoolWords > 0u) ? ctx.nvgPagePoolWords : (frame ? frame->nvgPagePoolWordCount : 0u);
@@ -1806,7 +1882,7 @@ namespace Northstar
                 break;
 
             case EngineResourceDomain::NVG_BUCKET_RANGES:
-                if (isClusterCtx)
+                if (isClusterCtx || isComputeCtx)
                 {
                     srcHandle    = (ctx.nvgBucketRangesBuffer != 0) ? ctx.nvgBucketRangesBuffer : (frame ? frame->nvgBucketRangesBuffer : 0);
                     srcElemCount = (ctx.nvgBucketRangesCount > 0u) ? ctx.nvgBucketRangesCount : (frame ? frame->nvgBucketRangesCount : 0u);
@@ -1815,7 +1891,7 @@ namespace Northstar
                 break;
 
             case EngineResourceDomain::NVG_VISIBLE_CLUSTERS:
-                if (isClusterCtx)
+                if (isClusterCtx || isComputeCtx)
                 {
                     srcHandle    = (ctx.nvgVisibleClustersBuf != 0) ? ctx.nvgVisibleClustersBuf : (frame ? frame->nvgVisibleClustersBuffer : 0);
                     srcElemCount = (ctx.nvgVisibleClustersCnt > 0u) ? ctx.nvgVisibleClustersCnt : (frame ? frame->nvgVisibleClustersCount : 0u);
@@ -2126,7 +2202,6 @@ namespace Northstar
         for (const auto& nscBuf : refl.buffers)
         {
             if (nscBuf.binding == 0xFFFF || nscBuf.set >= 16u || nscBuf.totalSize == 0u) continue;
-            if (nscBuf.set == 3u && nscBuf.binding == 1u) continue; // Reserved for graphics root constants
             if (IsPromotedCBVSlot(ctx.promotedRootKey, stage, nscBuf.set, nscBuf.binding)) continue;
 
             NativeConstantBufferBinding cb{};
@@ -2236,6 +2311,20 @@ namespace Northstar
                     {
                         tb.nullViewType = TextureType::TEXTURE_2D_ARRAY;
                         tb.nullFormat   = TextureFormat::R32_FLOAT;
+                    }
+                }
+                else if (nscTex.propertyName == "NVG_VISIBILITY_BUFFER")
+                {
+                    if (isShadowPass)
+                    {
+                        if (outDiagnostic) *outDiagnostic = "Cannot bind NVG_VISIBILITY_BUFFER during PassType::SHADOW.";
+                        return false;
+                    }
+                    tb.texture = frame ? frame->nvgVisibilityTexture : 0;
+                    if (tb.texture == 0)
+                    {
+                        tb.nullViewType = TextureType::TEXTURE_2D;
+                        tb.nullFormat   = TextureFormat::RG32_UINT;
                     }
                 }
                 else

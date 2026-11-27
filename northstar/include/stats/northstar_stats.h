@@ -37,6 +37,7 @@ namespace Northstar
         FLOAT32 gpuDepthPrepassMs          = 0.0f;
         FLOAT32 gpuGeometryPassMs          = 0.0f;
         UINT32  depthPrepassDrawCalls      = 0;
+        UINT32  depthPrepassTriangles      = 0;
         UINT32  logicalTileCount           = 0;
         UINT32  physicalTileCount          = 0;
         UINT32  renderedTileCount          = 0;
@@ -108,6 +109,7 @@ namespace Northstar
             gpuDepthPrepassMs          = 0.0f;
             gpuGeometryPassMs          = 0.0f;
             depthPrepassDrawCalls      = 0;
+            depthPrepassTriangles      = 0;
             logicalTileCount           = 0;
             physicalTileCount          = 0;
             renderedTileCount          = 0;

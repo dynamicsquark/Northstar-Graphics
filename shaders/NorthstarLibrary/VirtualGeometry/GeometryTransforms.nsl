@@ -52,7 +52,7 @@ LIBRARY
                                        0.0, 1.0, 0.0, 0.0,
                                        0.0, 0.0, 1.0, 0.0,
                                        0.0, 0.0, 0.0, 1.0);
-            v.physicalPageSlice = 0u;
+            v.physicalPageSlice = ~0u;
             v.depthBiasNdc      = 0.0;
             v.normalBiasWorld   = 0.0;
             v.texelWorldSize    = 0.0;

@@ -39,17 +39,24 @@ namespace Northstar
         NVG_COMPACTION_DECODE     = 12,
         NVG_INDIRECT_DRAW_BUILD   = 13,
         NVG_SHADOW_CULL           = 14,
-        REFLECTION_MATERIALIZE    = 15,
+        REFLECTION_MATERIALIZE         = 15,
+        NVG_MICROPOLY_RASTER_ATOMIC64  = 16,
+        NVG_MICROPOLY_RASTER_ATOMIC32  = 17,
+        NVG_DEPTH_EXPORT               = 18,
+        NVG_SHADOW_MICROPOLY_RASTER    = 19,
         COUNT
     };
 
     // Built-in engine-internal non-compute (graphics/depth) shader identifiers.
-    // Strictly limited to engine-owned physical slice clear helpers; user Depth Prepass
+    // Strictly limited to engine-owned physical slice clear/merge helpers; user Depth Prepass
     // and NVS Shadow Rasterization execute user-owned ShaderSets exclusively.
     enum class InternalShaderId : UINT32
     {
         LAYERED_DEPTH_CLEAR_VS = 0,
         LAYERED_DEPTH_PASS_GS  = 1,
+        NVG_SHADOW_SW_MERGE_VS = 2,
+        NVG_SHADOW_SW_MERGE_GS = 3,
+        NVG_SHADOW_SW_MERGE_PS = 4,
         COUNT
     };
 
@@ -115,6 +122,8 @@ namespace Northstar
 
         // Loads a FEATURE_DEPENDENT compute kernel on demand if not already loaded.
         ComputeKernel* AcquireFeatureKernel(const std::string& idName);
+        ComputeKernel* ReloadFeatureKernel(const std::string& idName, BOOL bypassDiskCache = false);
+        BOOL           RecompileLoadedNativeShaders(BOOL bypassDiskCache = false);
         Shader*        AcquireFeatureGraphicsShader(const std::string& idName);
 
         // Static helper that resolves the directory containing the NorthstarCore shared module itself.
@@ -143,7 +152,7 @@ namespace Northstar
                                      std::filesystem::path& outFilePath,
                                      std::string& outError) const;
 
-        BOOL LoadEntry(LoadedInternalComputeEntry& entry, std::string& outError);
+        BOOL LoadEntry(LoadedInternalComputeEntry& entry, std::string& outError, BOOL bypassDiskCache = false);
         BOOL LoadGraphicsEntry(LoadedInternalGraphicsEntry& entry, std::string& outError);
         void ReleaseLoadedResources();
 

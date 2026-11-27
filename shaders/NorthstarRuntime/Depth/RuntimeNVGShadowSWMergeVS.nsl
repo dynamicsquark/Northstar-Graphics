@@ -1,0 +1,61 @@
+// =====================================================================
+//  RuntimeNVGShadowSWMergeVS.nsl — NorthstarRuntime Internal Depth VS
+//  GPU-driven fullscreen triangle vertex shader for merging Compute SW
+//  128x128 atomic shadow tiles into NVS D32_FLOAT physical array slices.
+// =====================================================================
+
+STAGE VERTEX
+
+PROPERTY ShadowSWMergeVSParams {
+    Buffer Config {
+        Add(maxArrayLayers) : UInt = 2048
+        Add(maxSWTiles)     : UInt = 512
+    }
+    StructuredBuffer DirtySWTiles {
+        Add(sliceIndex) : UInt
+    }
+}
+
+INPUT_LAYOUT {
+    Get(VERTEX_ID)
+    Get(INSTANCE_ID)
+}
+
+OUTPUT_LAYOUT {
+    Add(CLIP_POSITION)
+    Add(UV0)
+    Add(RENDER_TARGET_ARRAY_INDEX)
+}
+
+SHADER {
+    STAGE_OUTPUT Main(STAGE_INPUT input) {
+        STAGE_OUTPUT o;
+        UInt vid = input.VERTEX_ID;
+        UInt iid = input.INSTANCE_ID;
+
+        Float x = -1.0;
+        Float y = -1.0;
+        if (vid == 1u) {
+            x = -1.0;
+            y = 3.0;
+        } else if (vid == 2u) {
+            x = 3.0;
+            y = -1.0;
+        }
+
+        if (iid < ShadowSWMergeVSParams.Config.maxSWTiles) {
+            UInt sliceIdx = ShadowSWMergeVSParams.DirtySWTiles[iid].sliceIndex;
+            if (sliceIdx < ShadowSWMergeVSParams.Config.maxArrayLayers) {
+                o.CLIP_POSITION             = Vec4(x, y, 0.5, 1.0);
+                o.UV0                       = Vec2(Float(iid) + 0.25, 0.0);
+                o.RENDER_TARGET_ARRAY_INDEX = sliceIdx;
+                return o;
+            }
+        }
+
+        o.CLIP_POSITION             = Vec4(-10.0, -10.0, 2.0, 1.0);
+        o.UV0                       = Vec2(0.0, 0.0);
+        o.RENDER_TARGET_ARRAY_INDEX = 0u;
+        return o;
+    }
+}

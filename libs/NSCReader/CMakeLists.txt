@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NSCReader VERSION 0.6.0 LANGUAGES CXX)
+project(NSCReader VERSION 0.7.0 LANGUAGES CXX)
 
 add_library(NSCReader STATIC
     src/nsc_reader.cpp

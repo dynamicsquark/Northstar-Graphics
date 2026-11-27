@@ -78,10 +78,9 @@ SHADER
         o.UV0            = v.uv0;
         o.UV1            = v.uv0;
 
-        if (NVGGetDebugMode() != 0u)
+        if (NVGIsDebugModeActive())
         {
-            NVGVisibleCluster dbgVc = NVGLoadVisibleCluster(input.INSTANCE_ID);
-            o.COLOR = Vec4(NVGComputeDebugColor(dbgVc, worldNrm), 1.0);
+            o.COLOR = Vec4(NVGApplyDebugColor(v.color.rgb, input.INSTANCE_ID, worldNrm), 1.0);
         }
         else
         {

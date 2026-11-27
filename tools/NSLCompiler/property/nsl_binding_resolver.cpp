@@ -53,27 +53,11 @@ namespace
         }
         return false;
     }
-    inline uint16_t NextAvailableCBVSlot(
-        uint16_t    space,
-        uint16_t    cursor,
-        bool        reserveGraphicsRootConstSlot) noexcept
-    {
-        uint16_t slot = cursor;
-        // D3D12 graphics root signature reserves (b1, space3) for 32-bit root constants.
-        if (reserveGraphicsRootConstSlot && space == 3u && slot == 1u)
-        {
-            slot = 2u;
-        }
-        return slot;
-    }
-
     inline bool AllocateSingleSlot(
         uint16_t                                       preferredSpace,
         uint16_t                                       spaceCount,
         uint16_t                                       maxPerSpace,
         std::array<uint16_t, BindingResolver::kMaxSpaces>& cursors,
-        bool                                           isCBV,
-        bool                                           reserveGraphicsRootConstSlot,
         uint16_t&                                      outSpace,
         uint16_t&                                      outSlot) noexcept
     {
@@ -81,9 +65,7 @@ namespace
         for (uint16_t attempt = 0u; attempt < spaceCount; ++attempt)
         {
             const uint16_t s = static_cast<uint16_t>((startSpace + attempt) % spaceCount);
-            const uint16_t candidate = isCBV
-                ? NextAvailableCBVSlot(s, cursors[s], reserveGraphicsRootConstSlot)
-                : cursors[s];
+            const uint16_t candidate = cursors[s];
             if (candidate < maxPerSpace)
             {
                 outSpace   = s;
@@ -131,13 +113,12 @@ bool BindingResolver::Resolve(
     ShaderStage       stage,
     DiagnosticEngine& diag)
 {
-    const bool     useMultiSpace                = (targetAPI == TargetAPI::HLSL12);
-    const uint16_t physicalSpaceCount           = useMultiSpace ? kMaxSpaces : 1u;
-    const bool     reserveGraphicsRootConstSlot = useMultiSpace && (stage != ShaderStage::COMPUTE);
+    (void)stage;
+    const bool     useMultiSpace      = (targetAPI == TargetAPI::HLSL12);
+    const uint16_t physicalSpaceCount = useMultiSpace ? kMaxSpaces : 1u;
 
     // Map each logical PROPERTY block name to a deterministic preferred physical space.
-    // Blocks 0..3 prefer space0..space3 on HLSL12 (preserving locality for existing shaders);
-    // blocks 4+ seamlessly pack into space0..space3 without any artificial block-count limit.
+    // Blocks 0..15 prefer space0..space15 on HLSL12; blocks 16+ wrap across space0..space15.
     std::unordered_map<std::string, uint16_t> blockToPreferredSpace;
     for (size_t i = 0; i < props.blocks.size(); ++i)
     {
@@ -146,14 +127,12 @@ bool BindingResolver::Resolve(
             : 0u;
     }
 
-    std::array<uint16_t, kMaxSpaces> nextCBV     = { 0u, 0u, 0u, 0u };
-    std::array<uint16_t, kMaxSpaces> nextSRV     = { 0u, 0u, 0u, 0u };
-    std::array<uint16_t, kMaxSpaces> nextSampler = { 0u, 0u, 0u, 0u };
-    std::array<uint16_t, kMaxSpaces> nextUAV     = { 0u, 0u, 0u, 0u };
+    std::array<uint16_t, kMaxSpaces> nextCBV{};
+    std::array<uint16_t, kMaxSpaces> nextSRV{};
+    std::array<uint16_t, kMaxSpaces> nextSampler{};
+    std::array<uint16_t, kMaxSpaces> nextUAV{};
 
-    const uint32_t maxTotalCBVs = useMultiSpace
-        ? (reserveGraphicsRootConstSlot ? (kMaxSpaces * kMaxCBVBindings - 1u) : (kMaxSpaces * kMaxCBVBindings))
-        : kMaxCBVBindings;
+    const uint32_t maxTotalCBVs     = static_cast<uint32_t>(physicalSpaceCount) * kMaxCBVBindings;
     const uint32_t maxTotalSRVs     = static_cast<uint32_t>(physicalSpaceCount) * kMaxSRVBindings;
     const uint32_t maxTotalSamplers = static_cast<uint32_t>(physicalSpaceCount) * kMaxSamplerBindings;
     const uint32_t maxTotalUAVs     = static_cast<uint32_t>(physicalSpaceCount) * kMaxUAVBindings;
@@ -179,8 +158,6 @@ bool BindingResolver::Resolve(
                         physicalSpaceCount,
                         kMaxCBVBindings,
                         nextCBV,
-                        true,
-                        reserveGraphicsRootConstSlot,
                         assignedSpace,
                         assignedSlot))
                 {
@@ -315,8 +292,6 @@ bool BindingResolver::Resolve(
                         physicalSpaceCount,
                         kMaxSRVBindings,
                         nextSRV,
-                        false,
-                        false,
                         assignedSpace,
                         assignedSlot))
                 {
@@ -342,8 +317,6 @@ bool BindingResolver::Resolve(
                         physicalSpaceCount,
                         kMaxUAVBindings,
                         nextUAV,
-                        false,
-                        false,
                         assignedSpace,
                         assignedSlot))
                 {

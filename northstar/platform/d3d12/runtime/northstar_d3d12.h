@@ -91,11 +91,18 @@ namespace Northstar
         NativeHandle CreateShader(ShaderStage stage, const void* bytecode, SIZE_T bytecodeSize) override;
         BOOL         GetShaderCompiledBytecode(NativeHandle handle, std::vector<BYTE>& outBytecode) const override;
         void         SetShaderInputLayout(NativeHandle handle, const std::vector<NSCStageIOEntry>& inputLayout) override;
+        void         SetShaderReflectionSpaces(NativeHandle handle, const ShaderSpaceMask& spaceMask) override;
         void         DestroyShader(NativeHandle handle)                                         override;
 
         // ==================== PERSISTENT GPU BUFFER MANAGEMENT ====================
         NativeHandle CreateGPUBuffer(const GPUBufferDesc& desc) override;
         BOOL         UpdateGPUBuffer(NativeHandle handle, const void* data, UINT32 byteSize, UINT32 dstOffset = 0) override;
+        BOOL         CopyGPUBufferRegion(
+            NativeHandle dstBuffer,
+            UINT64       dstOffset,
+            NativeHandle srcBuffer,
+            UINT64       srcOffset,
+            UINT64       byteSize) override;
         UINT64       GetGPUBufferGPUVirtualAddress(NativeHandle handle) const override;
         BOOL         RequestGPUBufferReadback(NativeHandle handle, UINT32 srcOffset = 0, UINT32 byteSize = 0) override;
         BOOL         TryGetGPUBufferReadbackData(NativeHandle handle, void* outData, UINT32 byteSize) override;
@@ -116,6 +123,8 @@ namespace Northstar
             UINT32       byteSize) override;
 
         // ==================== HARDWARE CAPABILITIES & FALLBACK DIAGNOSTICS ====================
+        BackendCapabilities GetCapabilities() const override;
+        void SetRestrictedCapabilitiesOverride(BOOL enableOverride, const BackendCapabilities& restrictedCaps) override;
         BOOL SupportsVPAndRTArrayIndexWithoutGS() const override;
         void SetForceLayeredDepthFallback(BOOL forceFallback) override;
         BOOL IsForceLayeredDepthFallback() const override;

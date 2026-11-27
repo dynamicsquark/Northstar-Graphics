@@ -7,24 +7,6 @@
 namespace Northstar
 {
     class Scene;
-    class RenderObject;
-
-    // Intrusive per-Scene membership & O(1) dirty-tracking link stored on RenderObject.
-    // The primary link is inline (zero heap allocation for the 99.9% single-scene case).
-    struct SceneObjectLink
-    {
-        Scene*         scene                 = nullptr;
-        GPUSceneHandle gpuHandle             = {};
-        UINT32         pendingDirtyFlags     = 0u;
-        UINT32         dirtyListIndex        = 0xFFFFFFFFu;
-        UINT32         batchGroupId          = 0u;
-        UINT32         batchSubmeshIndex     = 0u;
-        UINT32         batchStartIndex       = 0u;
-        UINT32         batchIndexCount       = 0u;
-        UINT32         skinningPaletteOffset = 0u;
-        UINT32         skinningBoneCount     = 0u;
-        void (*onDirtyThunk)(Scene*, RenderObject*, SceneObjectLink&) = nullptr;
-    };
 
     // Fills ENGINE_PROPERTIES (Transform & Skinning source) at draw:
     //   WORLD_MATRIX -> m_worldMatrix
@@ -33,11 +15,57 @@ namespace Northstar
     class RenderObject
     {
     public:
+        // Intrusive per-Scene membership & O(1) dirty-tracking link stored on RenderObject.
+        // The primary link is inline (zero heap allocation for the 99.9% single-scene case).
+        struct SceneObjectLink
+        {
+            Scene*         scene                 = nullptr;
+            GPUSceneHandle gpuHandle             = {};
+            UINT32         pendingDirtyFlags     = 0u;
+            UINT32         dirtyListIndex        = 0xFFFFFFFFu;
+            UINT32         batchGroupId          = 0u;
+            UINT32         batchSubmeshIndex     = 0u;
+            UINT32         batchStartIndex       = 0u;
+            UINT32         batchIndexCount       = 0u;
+            UINT32         skinningPaletteOffset = 0u;
+            UINT32         skinningBoneCount     = 0u;
+            Mat4           prevWorldMatrix       = Mat4::Identity();
+            BOOL           hasPrevWorldMatrix    = false;
+            void (*onDirtyThunk)(Scene*, RenderObject*, SceneObjectLink&) = nullptr;
+        };
+
         // ==================== GETTERS ====================
         Mesh*              GetMesh()                                    const { return m_mesh;        }
         Material*          GetMaterial()                                const { return m_material;    }
+        Material*          GetMaterial(UINT32 slot)                     const
+        {
+            if (slot == 0u) return m_material;
+            return (slot < m_materials.size()) ? m_materials[slot] : nullptr;
+        }
+        UINT32             GetMaterialSlotCount()                       const
+        {
+            if (!m_materials.empty()) return static_cast<UINT32>(m_materials.size());
+            return (m_material != nullptr) ? 1u : 0u;
+        }
         LODGroup*          GetLODGroup()                                const { return m_lodGroup;    }
         const Mat4&        GetWorldMatrix()                             const { return m_worldMatrix; } // WORLD_MATRIX
+        const Mat4&        GetPrevWorldMatrix(const Scene* scene = nullptr) const
+        {
+            if (!scene)
+            {
+                if (m_primaryLink.scene != nullptr && m_primaryLink.hasPrevWorldMatrix)
+                    return m_primaryLink.prevWorldMatrix;
+                if (!m_extraLinks.empty() && m_extraLinks.front().hasPrevWorldMatrix)
+                    return m_extraLinks.front().prevWorldMatrix;
+                return m_worldMatrix;
+            }
+            if (const SceneObjectLink* link = FindSceneLink(scene))
+            {
+                if (link->hasPrevWorldMatrix)
+                    return link->prevWorldMatrix;
+            }
+            return m_worldMatrix;
+        }
         const AABB&        GetWorldAABB()                               const { return m_worldAABB;   }
         UINT32             GetLayerMask()                               const { return m_layerMask;   }
         RenderObjectFlags  GetFlags()                                   const { return m_flags;       }
@@ -101,7 +129,59 @@ namespace Northstar
         void SetMaterial(Material* material)
         {
             m_material = material;
+            if (!m_materials.empty())
+            {
+                m_materials[0] = material;
+            }
             MarkGPUSceneDirty(GPU_SCENE_DIRTY_MATERIAL);
+        }
+
+        BOOL SetMaterial(UINT32 slot, Material* material)
+        {
+            if (slot >= kNVGMaxMaterialSlots)
+            {
+                return false;
+            }
+            if (slot == 0u)
+            {
+                SetMaterial(material);
+                return true;
+            }
+            if (slot >= m_materials.size())
+            {
+                if (material == nullptr)
+                {
+                    return true;
+                }
+                m_materials.resize(static_cast<SIZE_T>(slot) + 1u, nullptr);
+                m_materials[0] = m_material;
+            }
+            m_materials[slot] = material;
+            MarkGPUSceneDirty(GPU_SCENE_DIRTY_MATERIAL);
+            return true;
+        }
+
+        void ClearDestroyedMaterial(const Material* destroyedMaterial)
+        {
+            if (!destroyedMaterial) return;
+            BOOL modified = false;
+            if (m_material == destroyedMaterial)
+            {
+                m_material = nullptr;
+                modified   = true;
+            }
+            for (auto& slotMat : m_materials)
+            {
+                if (slotMat == destroyedMaterial)
+                {
+                    slotMat  = nullptr;
+                    modified = true;
+                }
+            }
+            if (modified)
+            {
+                MarkGPUSceneDirty(GPU_SCENE_DIRTY_MATERIAL);
+            }
         }
 
         void SetLODGroup(LODGroup* lodGroup)
@@ -430,9 +510,10 @@ namespace Northstar
 
         RenderObject() = default;
 
-        Mesh*              m_mesh                                       = nullptr;
-        Material*          m_material                                   = nullptr;
-        LODGroup*          m_lodGroup                                   = nullptr;
+        Mesh*                  m_mesh                                       = nullptr;
+        Material*              m_material                                   = nullptr;
+        std::vector<Material*> m_materials                                  = {};
+        LODGroup*              m_lodGroup                                   = nullptr;
         Mat4               m_worldMatrix                                = Mat4::Identity();
         AABB               m_worldAABB                                  = {};
         UINT32             m_layerMask                                  = 0x00000001u;
@@ -448,4 +529,6 @@ namespace Northstar
         SceneObjectLink    m_primaryLink                                = {};
         std::vector<SceneObjectLink> m_extraLinks;
     };
+
+    using SceneObjectLink = RenderObject::SceneObjectLink;
 }

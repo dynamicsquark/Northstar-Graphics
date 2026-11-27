@@ -27,11 +27,12 @@ namespace NSL
 
     struct LiteralExpr : Expression
     {
-        enum class Kind { Int, UInt, Float, Bool, String } litKind = Kind::Int;
-        int64_t     intValue    = 0;
-        uint64_t    uintValue   = 0;
-        double      floatValue  = 0.0;
-        bool        boolValue   = false;
+        enum class Kind { Int, UInt, UInt64, Float, Double, Bool, String } litKind = Kind::Int;
+        int64_t     intValue       = 0;
+        uint64_t    uintValue      = 0;
+        double      floatValue     = 0.0;
+        bool        hasFloatSuffix = false;
+        bool        boolValue      = false;
         std::string strValue;
     };
 

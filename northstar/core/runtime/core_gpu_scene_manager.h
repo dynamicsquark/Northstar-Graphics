@@ -24,12 +24,20 @@ namespace Northstar
         LODGroup*     boundLODGroup           = nullptr;
         UINT32        boundLODGroupRevision   = 0u;
         UINT32        boundSkinningRevision   = 0u;
-        UINT32        skinningPaletteOffset   = 0u;
-        UINT32        skinningPaletteCapacity = 0u;
-        UINT32        skinningBoneCount       = 0u;
-        BOOL          skinningPoseDirty       = false;
+        UINT32        skinningPaletteOffset       = 0u;
+        UINT32        skinningPaletteCapacity     = 0u;
+        UINT32        skinningBoneCount           = 0u;
+        UINT32        skinningBoundsSlot          = 0xFFFFFFFFu;
+        UINT32        materialSlotOffset          = 0u;
+        UINT32        materialSlotCapacity        = 0u;
+        UINT32        boundMultiMaterialHash      = 0u;
+        BOOL          skinningPoseDirty           = false;
         BOOL          trackedVirtual          = false;
         BOOL          trackedMaterialKernel   = false;
+        BOOL          hasPrevWorldMatrix      = false;
+        BOOL          pendingPrevTransformCatchup = false;
+        Mat4          lastFrameWorldMatrix    = Mat4::Identity();
+        UINT64        lastTransformFrame      = 0ull;
     };
 
     struct GPUSceneWatchedMesh
@@ -75,6 +83,7 @@ namespace Northstar
         std::vector<GPUSceneSlotEntry>     slots;
         std::vector<UINT32>                freeSlots;
         std::vector<UINT32>                dirtySlotIndices;
+        std::vector<UINT32>                prevTransformCatchupSlots;
         std::vector<GPUSceneUploadRange>   lastUploadRanges;
         std::vector<GPUSceneWatchedMesh>                 watchedMeshes;
         std::vector<GPUSceneWatchedMaterial>             watchedMaterials;
@@ -92,6 +101,22 @@ namespace Northstar
         GPUBuffer*                                       activeSkinningBuffer                       = nullptr;
         std::vector<Mat4>                                cpuSkinningPalette;
         std::vector<SkinningPaletteFreeRange>            skinningFreeRanges;
+
+        GPUBuffer*                                       skinningBoundsRingBuffers[kSkinningRingCount]    = { nullptr, nullptr, nullptr };
+        UINT32                                           skinningBoundsRingCapacities[kSkinningRingCount] = { 0u, 0u, 0u };
+        BOOL                                             skinningBoundsRingDirty[kSkinningRingCount]      = { false, false, false };
+        UINT32                                           skinningBoundsRingIndex                          = 0u;
+        GPUBuffer*                                       activeSkinningBoundsBuffer                       = nullptr;
+        std::vector<GPUSceneSkinningBoundsData>          cpuSkinningBounds;
+        std::vector<UINT32>                              skinningBoundsFreeSlots;
+
+        GPUBuffer*                                       materialSlotRingBuffers[kSkinningRingCount]      = { nullptr, nullptr, nullptr };
+        UINT32                                           materialSlotRingCapacities[kSkinningRingCount]   = { 0u, 0u, 0u };
+        BOOL                                             materialSlotRingDirty[kSkinningRingCount]        = { false, false, false };
+        UINT32                                           materialSlotRingIndex                            = 0u;
+        GPUBuffer*                                       activeMaterialSlotBuffer                         = nullptr;
+        std::vector<UINT32>                              cpuMaterialSlotTable;
+        std::vector<SkinningPaletteFreeRange>            materialSlotFreeRanges;
     };
 
     class CoreGPUSceneManager

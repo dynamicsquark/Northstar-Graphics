@@ -1,10 +1,13 @@
 #pragma once
 
 #include "nsl_error.h"
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // =====================================================================
 //  NSL Preprocessor
@@ -36,8 +39,12 @@ namespace NSL
         // Add an include search directory (e.g. from -I / --include-dir).
         void AddIncludeDirectory(const std::filesystem::path& dir);
 
+        // Define or override an integer preprocessor macro (e.g. from -D NAME=VALUE).
+        void DefineMacro(const std::string& name, int64_t value = 1);
+        void ClearMacroDefines();
+
         // Process source text rooted at baseDir.
-        // Returns the merged source with all #includes resolved.
+        // Returns the merged source with all #includes and conditional directives resolved.
         // On error, diagnostics are reported and an empty string is returned.
         std::string Process(
             const std::string&  source,
@@ -57,6 +64,13 @@ namespace NSL
             DiagnosticEngine&   diag,
             int                 depth
         );
+
+        bool EvaluateIfExpression(
+            std::string_view  expr,
+            uint32_t          lineNum,
+            DiagnosticEngine& diag,
+            int64_t&          outValue
+        ) const;
 
         bool TryCanonicalize(
             const std::filesystem::path& path,
@@ -83,8 +97,10 @@ namespace NSL
 
         // Active ancestry detects real cycles; emitted paths implement
         // include-once behavior for valid diamond include graphs.
-        std::unordered_set<std::string> m_activeIncludes;
-        std::unordered_set<std::string> m_emittedIncludes;
+        std::unordered_set<std::string>          m_activeIncludes;
+        std::unordered_set<std::string>          m_emittedIncludes;
+        std::unordered_map<std::string, int64_t> m_cliMacros;
+        std::unordered_map<std::string, int64_t> m_activeMacros;
     };
 
 } // namespace NSL

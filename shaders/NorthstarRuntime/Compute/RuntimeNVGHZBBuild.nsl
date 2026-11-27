@@ -24,9 +24,11 @@ PROPERTY NVGHZBBuildParams {
         Add(isReversedZ)  : UInt  = 0
         Add(srcOffsetX)   : UInt  = 0
         Add(srcOffsetY)   : UInt  = 0
+        Add(hasSWDepth)   : UInt  = 0
     }
     Texture2D InTextures {
         Add(SrcDepth)
+        Add(SrcSWDepth)
     }
     RWTexture2D OutTextures {
         Add(DstHZB) : Float
@@ -67,10 +69,19 @@ SHADER {
             if (x1 - x0 > 4u) { x1 = x0 + 4u; }
             if (y1 - y0 > 4u) { y1 = y0 + 4u; }
 
+            UInt hasSW = NVGHZBBuildParams.Config.hasSWDepth;
             Float d = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(offX + x0), Int(offY + y0), 0)).x;
+            if (hasSW != 0u) {
+                Float sw0 = NVGHZBBuildParams.InTextures.SrcSWDepth.Load(Int3(Int(x0), Int(y0), 0)).x;
+                d = (isReversedZ != 0u) ? Max(d, sw0) : Min(d, sw0);
+            }
             for (UInt sy = y0; sy < y1; sy = sy + 1u) {
                 for (UInt sx = x0; sx < x1; sx = sx + 1u) {
                     Float sampleD = NVGHZBBuildParams.InTextures.SrcDepth.Load(Int3(Int(offX + sx), Int(offY + sy), 0)).x;
+                    if (hasSW != 0u) {
+                        Float swS = NVGHZBBuildParams.InTextures.SrcSWDepth.Load(Int3(Int(sx), Int(sy), 0)).x;
+                        sampleD = (isReversedZ != 0u) ? Max(sampleD, swS) : Min(sampleD, swS);
+                    }
                     d = CombineConservativeDepth(d, sampleD, isReversedZ);
                 }
             }

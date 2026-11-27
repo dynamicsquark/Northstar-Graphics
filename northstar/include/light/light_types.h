@@ -9,11 +9,9 @@ namespace Northstar
     {
         ENABLED     = 1 << 0,
         CAST_SHADOW = 1 << 1,
-        VOLUMETRIC  = 1 << 2,
 
         Enabled     = ENABLED,
-        CastShadow  = CAST_SHADOW,
-        Volumetric  = VOLUMETRIC
+        CastShadow  = CAST_SHADOW
     };
 
     enum class LightShadowResolution : UINT16

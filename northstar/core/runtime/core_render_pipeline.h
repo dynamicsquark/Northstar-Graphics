@@ -15,6 +15,7 @@
 #include "../../include/shadow/nvs_virtual_shadow_types.h"
 #include "internal_resource_manager.h"
 #include "core_resource_binding_resolver.h"
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Northstar
@@ -66,6 +67,8 @@ namespace Northstar
 
         void SetResourceMaterializer(CoreGPUResourceMaterializer* materializer) { m_resourceMaterializer = materializer; }
         CoreGPUResourceMaterializer* GetResourceMaterializer() const { return m_resourceMaterializer; }
+        void OnCameraDestroyed(const Camera* camera) { if (camera) m_cameraHistory.erase(camera); }
+        void ResetCameraHistory() { m_cameraHistory.clear(); }
 
         void BuildFrameView(Scene* scene, Camera* camera, const NativeRenderTarget& defaultRenderTarget,
                             RenderStats& stats, FrameView& outView,
@@ -87,11 +90,12 @@ namespace Northstar
                               DrawCommand& outCmd, ShaderVariant overrideVertexVariant = ShaderVariant::COUNT,
                               const InternalResourceManager* internalResources = nullptr,
                               std::vector<ComputeDispatchCommand>* outPreDrawDispatches = nullptr,
-                              const Scene* scene = nullptr);
+                              const Scene* scene = nullptr,
+                              UINT32 submeshIndex = 0xFFFFFFFFu);
 
     private:
         void ApplyNVSSamplingPhase(Scene* scene, FrameView& ioView, const FrameNVSSamplingContext* nvsContext);
-        void BuildCameraData(Camera* camera, const NativeRenderTarget& defaultRenderTarget, FrameCameraData& outCamera);
+        void BuildCameraData(Camera* camera, const NativeRenderTarget& defaultRenderTarget, UINT64 frameIndex, FrameCameraData& outCamera);
         void BuildEnvironmentData(Scene* scene, FrameEnvironmentData& outEnv);
         void BuildDirectionalLightData(Scene* scene, BOOL& outHasDirLight, FrameLightData& outDirLight, const std::vector<LightNVSViewAssignment>* nvsAssignments = nullptr);
         void BuildLightsData(Scene* scene, std::vector<FrameLightData>& outLights, const std::vector<LightNVSViewAssignment>* nvsAssignments = nullptr);
@@ -117,9 +121,22 @@ namespace Northstar
             const FrameView&                frameView,
             NativeStructuredBufferBinding&  ioSbb);
 
-        CoreGPUResourceMaterializer*           m_resourceMaterializer   = nullptr;
-        UINT64                                 m_nextLightsDataRevision = 0u;
-        UINT64                                 m_nextSharedSbDataId     = 0u;
-        std::vector<CachedEngineLightsSBEntry> m_cachedLightsPayloads;
+        struct CameraHistoryEntry
+        {
+            Mat4   prevView = Mat4::Identity();
+            Mat4   prevProj = Mat4::Identity();
+            Mat4   prevVP   = Mat4::Identity();
+            Mat4   lastView = Mat4::Identity();
+            Mat4   lastProj = Mat4::Identity();
+            Mat4   lastVP   = Mat4::Identity();
+            UINT64 lastFrame = 0ull;
+            BOOL   initialized = false;
+        };
+
+        CoreGPUResourceMaterializer*                          m_resourceMaterializer   = nullptr;
+        UINT64                                                m_nextLightsDataRevision = 0u;
+        UINT64                                                m_nextSharedSbDataId     = 0u;
+        std::vector<CachedEngineLightsSBEntry>                m_cachedLightsPayloads;
+        std::unordered_map<const Camera*, CameraHistoryEntry> m_cameraHistory;
     };
 }

@@ -52,7 +52,7 @@ namespace Northstar
         inline NVSShadowPatchSemantic MapCBufferFieldToNVSPatchSemantic(const std::string& propName)
         {
             const UINT32 sem = CoreResourceBindingResolver::MapPropertyNameToPatchSemantic(propName);
-            if (sem >= NVS_PATCH_INSTANCE_WORLD_MATRIX)
+            if (IsNVSInstancePatchSemantic(sem))
             {
                 return NVS_PATCH_SEMANTIC_NONE;
             }
@@ -67,7 +67,7 @@ namespace Northstar
             {
                 const UINT32 sem = CoreResourceBindingResolver::MapPropertyNameToPatchSemantic(
                     f.propertyName.empty() ? f.name : f.propertyName);
-                if (sem >= NVS_PATCH_INSTANCE_WORLD_MATRIX)
+                if (IsNVSInstancePatchSemantic(sem))
                 {
                     return static_cast<NVSShadowPatchSemantic>(sem);
                 }
@@ -100,9 +100,7 @@ namespace Northstar
 
             if (outRequiresSkinning)
             {
-                if ((plan.domain == EngineResourceDomain::GLOBAL_BONE_PALETTE &&
-                     nscSb.name != "NVGResources__BonePalette") ||
-                    plan.domain == EngineResourceDomain::PER_OBJECT_BONE_SLICE ||
+                if (plan.domain == EngineResourceDomain::PER_OBJECT_BONE_SLICE ||
                     plan.domain == EngineResourceDomain::INSTANCE_SKINNING ||
                     plan.hasInstanceSkinFields)
                 {
@@ -584,28 +582,23 @@ namespace Northstar
             }
 
             const ShaderReflection& refl = stShader->GetReflection();
+            if (CoreResourceBindingResolver::DoesShaderRequireEngineSkinning(refl))
+            {
+                outRequiresSkinningData = true;
+            }
 
             for (const auto& b : refl.buffers)
             {
-                if (b.binding == 0xFFFF || b.set >= 4u || (b.set == 3u && b.binding == 1u) || b.totalSize == 0) continue;
+                if (b.binding == 0xFFFF || b.set >= 16u || b.totalSize == 0) continue;
                 if (DoesCBufferRequirePerDrawPromotion(b))
                 {
                     promotedCBVCount++;
-                }
-                for (const auto& f : b.fields)
-                {
-                    if (f.isGet && (f.propertyName == "BONE_PALETTE_OFFSET" ||
-                                    f.propertyName == "BONE_COUNT" ||
-                                    f.propertyName == "SKINNING_REVISION"))
-                    {
-                        outRequiresSkinningData = true;
-                    }
                 }
             }
 
             for (const auto& nscTex : refl.textures)
             {
-                if (nscTex.binding == 0xFFFF || nscTex.set >= 4u) continue;
+                if (nscTex.binding == 0xFFFF || nscTex.set >= 16u) continue;
                 if (nscTex.IsEngineProvided())
                 {
                     // Engine-owned NVS_SHADOW_MAP cannot be sampled as SRV during PassType::SHADOW DSV rasterization
@@ -632,7 +625,7 @@ namespace Northstar
 
             for (const auto& nscSamp : refl.samplers)
             {
-                if (nscSamp.binding == 0xFFFF || nscSamp.set >= 4u) continue;
+                if (nscSamp.binding == 0xFFFF || nscSamp.set >= 16u) continue;
                 if (nscSamp.IsEngineProvided()) return false;
                 BOOL foundSamp = false;
                 auto checkSamp = [&](const ShaderStageProps& sp) {
@@ -656,7 +649,7 @@ namespace Northstar
 
             for (const auto& nscSb : refl.structuredBuffers)
             {
-                if (nscSb.binding == 0xFFFF || nscSb.set >= 4u || nscSb.stride == 0) continue;
+                if (nscSb.binding == 0xFFFF || nscSb.set >= 16u || nscSb.stride == 0) continue;
                 const ShadowStructuredBufferRole role = ClassifyShadowStructuredBuffer(nscSb, sType, &outRequiresSkinningData);
                 if (role == ShadowStructuredBufferRole::INVALID_LAYOUT)
                 {
@@ -787,7 +780,7 @@ namespace Northstar
 
             for (const auto& nscBuf : refl.buffers)
             {
-                if (nscBuf.binding == 0xFFFF || nscBuf.set >= 4u || (nscBuf.set == 3u && nscBuf.binding == 1u) || nscBuf.totalSize == 0) continue;
+                if (nscBuf.binding == 0xFFFF || nscBuf.set >= 16u || nscBuf.totalSize == 0) continue;
                 bool hasNonGetField = false;
                 for (const auto& f : nscBuf.fields)
                 {
@@ -846,7 +839,7 @@ namespace Northstar
 
             for (const auto& nscTex : refl.textures)
             {
-                if (nscTex.binding == 0xFFFF || nscTex.set >= 4u || nscTex.IsEngineProvided()) continue;
+                if (nscTex.binding == 0xFFFF || nscTex.set >= 16u || nscTex.IsEngineProvided()) continue;
                 hasUserBind = true;
                 NativeHandle texHandle = 0;
                 auto findTex = [&](const ShaderStageProps& sp) {
@@ -869,7 +862,7 @@ namespace Northstar
 
             for (const auto& nscSamp : refl.samplers)
             {
-                if (nscSamp.binding == 0xFFFF || nscSamp.set >= 4u || nscSamp.IsEngineProvided()) continue;
+                if (nscSamp.binding == 0xFFFF || nscSamp.set >= 16u || nscSamp.IsEngineProvided()) continue;
                 hasUserBind = true;
                 NativeHandle sampHandle = 0;
                 auto findSamp = [&](const ShaderStageProps& sp) {
@@ -965,7 +958,7 @@ namespace Northstar
         // 1. ConstantBuffers (non-promoted user Add() values + scene-level Get() values)
         for (const auto& nscBuf : refl.buffers)
         {
-            if (nscBuf.binding == 0xFFFF || nscBuf.set >= 4u || (nscBuf.set == 3u && nscBuf.binding == 1u) || nscBuf.totalSize == 0) continue;
+            if (nscBuf.binding == 0xFFFF || nscBuf.set >= 16u || nscBuf.totalSize == 0) continue;
 
             NativeConstantBufferBinding cb{};
             cb.slotIndex     = nscBuf.binding;
@@ -981,7 +974,7 @@ namespace Northstar
         // 2. User Add() Textures
         for (const auto& nscTex : refl.textures)
         {
-            if (nscTex.binding == 0xFFFF || nscTex.set >= 4u || nscTex.IsEngineProvided()) continue;
+            if (nscTex.binding == 0xFFFF || nscTex.set >= 16u || nscTex.IsEngineProvided()) continue;
 
             NativeTextureBinding tb{};
             tb.slotIndex     = nscTex.binding;
@@ -1018,7 +1011,7 @@ namespace Northstar
         // 3. User Add() Samplers
         for (const auto& nscSamp : refl.samplers)
         {
-            if (nscSamp.binding == 0xFFFF || nscSamp.set >= 4u) continue;
+            if (nscSamp.binding == 0xFFFF || nscSamp.set >= 16u) continue;
             if (nscSamp.IsEngineProvided())
             {
                 return false;
@@ -1059,7 +1052,7 @@ namespace Northstar
         // 4. StructuredBuffers (GPUScene LIVE, NVG-only CST Null SRV on STANDARD casters, and User Add() SBs)
         for (const auto& nscSb : refl.structuredBuffers)
         {
-            if (nscSb.binding == 0xFFFF || nscSb.set >= 4u || nscSb.stride == 0) continue;
+            if (nscSb.binding == 0xFFFF || nscSb.set >= 16u || nscSb.stride == 0) continue;
             const ShadowStructuredBufferRole role = ClassifyShadowStructuredBuffer(nscSb, stage);
             if (role == ShadowStructuredBufferRole::INVALID_LAYOUT)
             {
@@ -1264,7 +1257,7 @@ namespace Northstar
 
                 for (const auto& nscBuf : refl.buffers)
                 {
-                    if (nscBuf.binding == 0xFFFF || nscBuf.set >= 4u || (nscBuf.set == 3u && nscBuf.binding == 1u) || nscBuf.totalSize == 0) continue;
+                    if (nscBuf.binding == 0xFFFF || nscBuf.set >= 16u || nscBuf.totalSize == 0) continue;
                     if (!DoesCBufferRequirePerDrawPromotion(nscBuf)) continue;
                     if (promotedCBVs >= kNVSMaxPromotedIndirectCBVs) continue;
 
@@ -1580,7 +1573,7 @@ namespace Northstar
                             bsb.stride       = bonePaletteBuf->GetStride();
                             bsb.byteSize     = bonePaletteBuf->GetByteSize();
                         }
-                        else if (nscSb.name == "NVGResources__BonePalette")
+                        else if (!reqSkinning)
                         {
                             bsb.buffer       = 0;
                             bsb.elementCount = 0u;

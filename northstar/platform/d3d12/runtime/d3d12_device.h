@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_common.h"
+#include "platform/northstar_backend.h"
 #include <string>
 #include <functional>
 
@@ -43,11 +44,46 @@ namespace Northstar
         UINT64              GetFrameFenceValue()        const { return m_frameFenceValue; }
         void                IncrementFrameFenceValue() { m_frameFenceValue++; }
 
-        BOOL                IsInitialized()     const { return m_device != nullptr; }
-        BOOL                SupportsVPAndRTArrayIndexWithoutGS() const { return m_supportsVPAndRTArrayIndexWithoutGS; }
+        BOOL                        IsInitialized()     const { return m_device != nullptr; }
+        BOOL                        SupportsVPAndRTArrayIndexWithoutGS() const { return m_supportsVPAndRTArrayIndexWithoutGS; }
+        const BackendCapabilities&  GetCapabilities()   const { return m_hasRestrictedCaps ? m_restrictedCaps : m_capabilities; }
+        void                        SetDXILRuntimeAvailable(BOOL available) noexcept
+        {
+            m_capabilities.supportsDXILRuntime = available;
+            if (m_hasRestrictedCaps)
+            {
+                m_restrictedCaps.supportsDXILRuntime = m_restrictedCaps.supportsDXILRuntime && available;
+            }
+        }
+        void                        SetRestrictedCapabilitiesOverride(BOOL enableOverride, const BackendCapabilities& reqCaps) noexcept
+        {
+            if (!enableOverride)
+            {
+                m_hasRestrictedCaps = false;
+                m_restrictedCaps    = BackendCapabilities{};
+                return;
+            }
+            BackendCapabilities c{};
+            c.maxFeatureLevel                     = (reqCaps.maxFeatureLevel < m_capabilities.maxFeatureLevel) ? reqCaps.maxFeatureLevel : m_capabilities.maxFeatureLevel;
+            c.maxShaderModel                      = (reqCaps.maxShaderModel  < m_capabilities.maxShaderModel)  ? reqCaps.maxShaderModel  : m_capabilities.maxShaderModel;
+            c.minWaveLaneCount                    = reqCaps.supportsWaveOps ? m_capabilities.minWaveLaneCount : 0u;
+            c.maxWaveLaneCount                    = reqCaps.supportsWaveOps ? m_capabilities.maxWaveLaneCount : 0u;
+            c.supportsWaveOps                     = reqCaps.supportsWaveOps                     && m_capabilities.supportsWaveOps;
+            c.supportsInt64ShaderOps              = reqCaps.supportsInt64ShaderOps              && m_capabilities.supportsInt64ShaderOps;
+            c.supportsAtomicInt64OnTypedResource  = reqCaps.supportsAtomicInt64OnTypedResource  && m_capabilities.supportsAtomicInt64OnTypedResource;
+            c.supportsAtomicInt64OnGroupShared    = reqCaps.supportsAtomicInt64OnGroupShared    && m_capabilities.supportsAtomicInt64OnGroupShared;
+            c.supportsAtomicInt64OnDescriptorHeap = reqCaps.supportsAtomicInt64OnDescriptorHeap && m_capabilities.supportsAtomicInt64OnDescriptorHeap;
+            c.supportsTypedUAVLoadR32Uint         = reqCaps.supportsTypedUAVLoadR32Uint         && m_capabilities.supportsTypedUAVLoadR32Uint;
+            c.supportsTypedUAVLoadRG32Uint        = reqCaps.supportsTypedUAVLoadRG32Uint        && m_capabilities.supportsTypedUAVLoadRG32Uint;
+            c.supportsVPAndRTArrayIndexWithoutGS  = reqCaps.supportsVPAndRTArrayIndexWithoutGS  && m_capabilities.supportsVPAndRTArrayIndexWithoutGS;
+            c.supportsDXILRuntime                 = reqCaps.supportsDXILRuntime                 && m_capabilities.supportsDXILRuntime;
+            m_restrictedCaps                      = c;
+            m_hasRestrictedCaps                   = true;
+        }
 
     private:
         BOOL SelectAdapter();
+        void QueryDeviceCapabilities();
 
     private:
         ComPtr<ID3D12Debug>               m_debugController;
@@ -57,6 +93,10 @@ namespace Northstar
         BOOL                              m_debugLayerActive  = false;
         BOOL                              m_gbvActive         = false;
         BOOL                              m_supportsVPAndRTArrayIndexWithoutGS = false;
+        D3D_FEATURE_LEVEL                 m_activeFeatureLevel                 = D3D_FEATURE_LEVEL_11_0;
+        BackendCapabilities               m_capabilities{};
+        BackendCapabilities               m_restrictedCaps{};
+        BOOL                              m_hasRestrictedCaps                  = false;
         BOOL                              m_deviceRemoved                      = false;
         HRESULT                           m_deviceRemovedReason                = S_OK;
         ComPtr<IDXGIFactory4>             m_factory;

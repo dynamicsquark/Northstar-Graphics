@@ -62,6 +62,18 @@ static bool PackScalarTokensToBytes(
         return true;
     }
 
+    if (typeID == DataTypeID::UINT64)
+    {
+        const uint32_t count = elemSize / 8u;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            uint64_t val = 0ull;
+            try { val = std::stoull(tokenAt(i), nullptr, 0); } catch (...) {}
+            std::memcpy(dst + (i * 8u), &val, 8u);
+        }
+        return true;
+    }
+
     if (typeID == DataTypeID::MAT3 && elemSize == 48u && (tokens.size() - std::min(tokenStart, tokens.size())) >= 9u)
     {
         for (uint32_t r = 0; r < 3u; ++r)
@@ -173,7 +185,7 @@ static bool ParseDefaultValueToData(
                                       : (typeID == DataTypeID::MAT4) ? 64u
                                                                      : dti->size;
             const uint32_t elemStride = (elemCbSize + 15u) & ~15u;
-            const uint32_t scalarsPerElem = (typeID == DataTypeID::DOUBLE) ? 1u
+            const uint32_t scalarsPerElem = (typeID == DataTypeID::DOUBLE || typeID == DataTypeID::UINT64) ? 1u
                                           : (typeID == DataTypeID::MAT3)   ? 9u
                                           : (typeID == DataTypeID::MAT4)   ? 16u
                                                                            : (dti->size / 4u);

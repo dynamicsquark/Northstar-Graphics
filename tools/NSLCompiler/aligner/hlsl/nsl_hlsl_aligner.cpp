@@ -35,7 +35,7 @@ uint32_t HLSLAligner::CBufferAlign(uint32_t currentOffset, uint32_t fieldSize, D
     if (fieldSize == 0 || currentOffset > kMaxLayoutSize)
         return currentOffset;
 
-    if (id == DataTypeID::DOUBLE)
+    if (id == DataTypeID::DOUBLE || id == DataTypeID::UINT64)
     {
         if (currentOffset > kMaxLayoutSize - 7u) return currentOffset;
         return (currentOffset + 7u) & ~7u;
@@ -545,7 +545,8 @@ uint32_t HLSLAligner::GetTightFieldAlignment(
 {
     if (depth >= 64) return 4u;
 
-    if (typeID == DataTypeID::DOUBLE || typeName == "Double")
+    if (typeID == DataTypeID::DOUBLE || typeID == DataTypeID::UINT64 ||
+        typeName == "Double" || typeName == "UInt64")
         return 8u;
 
     if (typeID != DataTypeID::UNKNOWN || FindDataType(typeName) != nullptr)

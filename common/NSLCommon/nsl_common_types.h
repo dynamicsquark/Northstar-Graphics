@@ -98,6 +98,7 @@ namespace NSL
         UINT    = 9,
         BOOL    = 15,
         DOUBLE  = 16,
+        UINT64  = 19,
 
         // Float vectors
         VEC2    = 2,
@@ -234,6 +235,7 @@ namespace NSL
             { DataTypeID::UINT,   "UInt",   4  },
             { DataTypeID::BOOL,   "Bool",   4  },
             { DataTypeID::DOUBLE, "Double", 8  },
+            { DataTypeID::UINT64, "UInt64", 8  },
 
             // Float vectors
             { DataTypeID::VEC2,   "Vec2",   8  },

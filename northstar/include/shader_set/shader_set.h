@@ -247,8 +247,7 @@ namespace Northstar
             return false;
         }
 
-        // ==================== METADATA & NATIVE HANDLE ====================
-        NativeHandle       GetNativePipelineHandle() const { return m_nativePipelineHandle; }
+        // ==================== METADATA ====================
         UINT64             GetStateRevision()        const { return m_stateRevision; }
         const std::string& GetName()                 const { return m_name; }
 
@@ -259,8 +258,6 @@ namespace Northstar
         friend class NorthstarEngine;
         friend class NorthstarCore;
         friend class CoreShaderManager;
-
-        void SetNativePipelineHandle(NativeHandle handle) { m_nativePipelineHandle = handle; ++m_stateRevision; }
 
         void OnShaderDestroyed(Shader* destroyedShader)
         {
@@ -302,7 +299,6 @@ namespace Northstar
         // Compute pipeline slot
         Shader*      m_computeShader                                            = nullptr;
 
-        NativeHandle m_nativePipelineHandle = 0;
         UINT64       m_stateRevision        = 1u;
         std::string  m_name;
     };

@@ -192,13 +192,24 @@ LIBRARY
         UInt w5 = NVGReadPageWord(base + 5u);
         UInt w6 = NVGReadPageWord(base + 6u);
 
-        Float qx = Float(w0 & 65535u);
-        Float qy = Float((w0 >> 16u) & 65535u);
-        Float qz = Float(w1 & 65535u);
+        UInt qxU = w0 & 65535u;
+        UInt qyU = (w0 >> 16u) & 65535u;
+        UInt qzU = w1 & 65535u;
         UInt tanPack = (w1 >> 16u) & 65535u;
 
-        Vec3 posStep = header.posExtent * (1.0 / 65535.0);
-        v.position = header.posOrigin + Vec3(qx, qy, qz) * posStep;
+        if (header.useIntLattice)
+        {
+            Int3 iGlobal = header.intOrigin + Int3(
+                Int(qxU << header.lodShift),
+                Int(qyU << header.lodShift),
+                Int(qzU << header.lodShift));
+            v.position = Vec3(Float(iGlobal.x), Float(iGlobal.y), Float(iGlobal.z)) * header.posScale;
+        }
+        else
+        {
+            Vec3 posStep = header.posExtent * (1.0 / 65535.0);
+            v.position = header.posOrigin + Vec3(Float(qxU), Float(qyU), Float(qzU)) * posStep;
+        }
         v.normal   = NVGUnpackOctahedralNormal(w2);
 
         Vec3 t = Vec3(1.0, 0.0, 0.0);
@@ -305,9 +316,11 @@ LIBRARY
         UInt wordsPerPage   = NVGResources.Params.NVG_PAGE_WORD_COUNT;
         UInt baseWord       = vc.physicalPageIndex * wordsPerPage + vc.clusterWordOffset;
         UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt vertCount      = (countsAndFlags & 255u) | (((countsAndFlags >> 28u) & 1u) << 8u);
         UInt triCount       = (countsAndFlags >> 8u) & 255u;
+        Bool indexedDraw    = NVGIsClusterIndexedDraw();
 
-        if (vertexId >= (triCount * 3u))
+        if (indexedDraw ? (vertexId >= vertCount) : (vertexId >= (triCount * 3u)))
         {
             v.position    = Vec3(0.0, 0.0, 0.0);
             v.normal      = Vec3(0.0, 1.0, 0.0);
@@ -324,26 +337,29 @@ LIBRARY
         }
 
         UInt offsets     = NVGReadPageWord(baseWord + 15u);
-        UInt vtxWordOff  = offsets & 65535u;
+        UInt vtxWordOff  = offsets & 255u;
         UInt idxWordOff  = (offsets >> 16u) & 65535u;
         UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
         Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        Bool useIntLat   = ((attrFlags & 32u) != 0u);
         UInt strideWords = hasSkin ? 11u : 7u;
 
-        UInt triIdx      = vertexId / 3u;
-        UInt cornerIdx   = vertexId - triIdx * 3u;
-        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
-        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt localIdx    = vertexId;
+        if (!indexedDraw)
+        {
+            UInt triIdx    = vertexId / 3u;
+            UInt cornerIdx = vertexId - triIdx * 3u;
+            UInt packedTri = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+            localIdx       = (packedTri >> (cornerIdx * 8u)) & 255u;
+        }
         UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
 
-        Vec3 posOrigin = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 0u)),
-            AsFloat(NVGReadPageWord(baseWord + 1u)),
-            AsFloat(NVGReadPageWord(baseWord + 2u)));
-        Vec3 posExtent = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 3u)),
-            AsFloat(NVGReadPageWord(baseWord + 4u)),
-            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        UInt h0 = NVGReadPageWord(baseWord + 0u);
+        UInt h1 = NVGReadPageWord(baseWord + 1u);
+        UInt h2 = NVGReadPageWord(baseWord + 2u);
+        UInt h3 = NVGReadPageWord(baseWord + 3u);
+        UInt h4 = NVGReadPageWord(baseWord + 4u);
+        UInt h5 = NVGReadPageWord(baseWord + 5u);
         Vec2 uv0Origin = Vec2(
             AsFloat(NVGReadPageWord(baseWord + 6u)),
             AsFloat(NVGReadPageWord(baseWord + 7u)));
@@ -358,11 +374,22 @@ LIBRARY
         UInt w5 = NVGReadPageWord(vBase + 5u);
         UInt w6 = NVGReadPageWord(vBase + 6u);
 
-        Float qx = Float(w0 & 65535u);
-        Float qy = Float((w0 >> 16u) & 65535u);
-        Float qz = Float(w1 & 65535u);
-        Vec3 posStep = posExtent * (1.0 / 65535.0);
-        v.position  = posOrigin + Vec3(qx, qy, qz) * posStep;
+        UInt qxU = w0 & 65535u;
+        UInt qyU = (w0 >> 16u) & 65535u;
+        UInt qzU = w1 & 65535u;
+        if (useIntLat)
+        {
+            UInt lShift  = h4 & 31u;
+            Int3 iGlobal = Int3(AsInt(h0), AsInt(h1), AsInt(h2)) +
+                           Int3(Int(qxU << lShift), Int(qyU << lShift), Int(qzU << lShift));
+            v.position = Vec3(Float(iGlobal.x), Float(iGlobal.y), Float(iGlobal.z)) * AsFloat(h3);
+        }
+        else
+        {
+            Vec3 posOrigin = Vec3(AsFloat(h0), AsFloat(h1), AsFloat(h2));
+            Vec3 posExtent = Vec3(AsFloat(h3), AsFloat(h4), AsFloat(h5));
+            v.position = posOrigin + Vec3(Float(qxU), Float(qyU), Float(qzU)) * (posExtent * (1.0 / 65535.0));
+        }
         v.normal    = NVGUnpackOctahedralNormal(w2);
         v.tangent   = Vec3(1.0, 0.0, 0.0);
         v.bitangent = Vec3(0.0, 0.0, 1.0);
@@ -428,9 +455,11 @@ LIBRARY
         UInt wordsPerPage   = NVGResources.Params.NVG_PAGE_WORD_COUNT;
         UInt baseWord       = vc.physicalPageIndex * wordsPerPage + vc.clusterWordOffset;
         UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt vertCount      = (countsAndFlags & 255u) | (((countsAndFlags >> 28u) & 1u) << 8u);
         UInt triCount       = (countsAndFlags >> 8u) & 255u;
+        Bool indexedDraw    = NVGIsClusterIndexedDraw();
 
-        if (vertexId >= (triCount * 3u))
+        if (indexedDraw ? (vertexId >= vertCount) : (vertexId >= (triCount * 3u)))
         {
             v.position    = Vec3(0.0, 0.0, 0.0);
             v.normal      = Vec3(0.0, 1.0, 0.0);
@@ -447,36 +476,50 @@ LIBRARY
         }
 
         UInt offsets     = NVGReadPageWord(baseWord + 15u);
-        UInt vtxWordOff  = offsets & 65535u;
+        UInt vtxWordOff  = offsets & 255u;
         UInt idxWordOff  = (offsets >> 16u) & 65535u;
         UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
         Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        Bool useIntLat   = ((attrFlags & 32u) != 0u);
         UInt strideWords = hasSkin ? 11u : 7u;
 
-        UInt triIdx      = vertexId / 3u;
-        UInt cornerIdx   = vertexId - triIdx * 3u;
-        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
-        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt localIdx    = vertexId;
+        if (!indexedDraw)
+        {
+            UInt triIdx    = vertexId / 3u;
+            UInt cornerIdx = vertexId - triIdx * 3u;
+            UInt packedTri = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+            localIdx       = (packedTri >> (cornerIdx * 8u)) & 255u;
+        }
         UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
 
-        Vec3 posOrigin = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 0u)),
-            AsFloat(NVGReadPageWord(baseWord + 1u)),
-            AsFloat(NVGReadPageWord(baseWord + 2u)));
-        Vec3 posExtent = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 3u)),
-            AsFloat(NVGReadPageWord(baseWord + 4u)),
-            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        UInt h0 = NVGReadPageWord(baseWord + 0u);
+        UInt h1 = NVGReadPageWord(baseWord + 1u);
+        UInt h2 = NVGReadPageWord(baseWord + 2u);
+        UInt h3 = NVGReadPageWord(baseWord + 3u);
+        UInt h4 = NVGReadPageWord(baseWord + 4u);
+        UInt h5 = NVGReadPageWord(baseWord + 5u);
 
         UInt w0 = NVGReadPageWord(vBase + 0u);
         UInt w1 = NVGReadPageWord(vBase + 1u);
         UInt w2 = NVGReadPageWord(vBase + 2u);
 
-        Float qx = Float(w0 & 65535u);
-        Float qy = Float((w0 >> 16u) & 65535u);
-        Float qz = Float(w1 & 65535u);
-        Vec3 posStep = posExtent * (1.0 / 65535.0);
-        v.position    = posOrigin + Vec3(qx, qy, qz) * posStep;
+        UInt qxU = w0 & 65535u;
+        UInt qyU = (w0 >> 16u) & 65535u;
+        UInt qzU = w1 & 65535u;
+        if (useIntLat)
+        {
+            UInt lShift  = h4 & 31u;
+            Int3 iGlobal = Int3(AsInt(h0), AsInt(h1), AsInt(h2)) +
+                           Int3(Int(qxU << lShift), Int(qyU << lShift), Int(qzU << lShift));
+            v.position = Vec3(Float(iGlobal.x), Float(iGlobal.y), Float(iGlobal.z)) * AsFloat(h3);
+        }
+        else
+        {
+            Vec3 posOrigin = Vec3(AsFloat(h0), AsFloat(h1), AsFloat(h2));
+            Vec3 posExtent = Vec3(AsFloat(h3), AsFloat(h4), AsFloat(h5));
+            v.position = posOrigin + Vec3(Float(qxU), Float(qyU), Float(qzU)) * (posExtent * (1.0 / 65535.0));
+        }
         v.normal      = NVGUnpackOctahedralNormal(w2);
         v.tangent     = Vec3(1.0, 0.0, 0.0);
         v.bitangent   = Vec3(0.0, 0.0, 1.0);
@@ -543,34 +586,39 @@ LIBRARY
         UInt baseWord     = physPage * wordsPerPage + wordOff;
 
         UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt vertCount      = (countsAndFlags & 255u) | (((countsAndFlags >> 28u) & 1u) << 8u);
         UInt triCount       = (countsAndFlags >> 8u) & 255u;
-        if (vertexId >= (triCount * 3u))
+        Bool indexedDraw    = NVGIsClusterIndexedDraw();
+        if (indexedDraw ? (vertexId >= vertCount) : (vertexId >= (triCount * 3u)))
         {
             return false;
         }
 
         outObjectSlot    = NVGResources.VisibleClusters[visIdx].NVG_VIS_OBJECT_SLOT;
         UInt offsets     = NVGReadPageWord(baseWord + 15u);
-        UInt vtxWordOff  = offsets & 65535u;
+        UInt vtxWordOff  = offsets & 255u;
         UInt idxWordOff  = (offsets >> 16u) & 65535u;
         UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
         Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        Bool useIntLat   = ((attrFlags & 32u) != 0u);
         UInt strideWords = hasSkin ? 11u : 7u;
 
-        UInt triIdx      = vertexId / 3u;
-        UInt cornerIdx   = vertexId - triIdx * 3u;
-        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
-        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt localIdx    = vertexId;
+        if (!indexedDraw)
+        {
+            UInt triIdx    = vertexId / 3u;
+            UInt cornerIdx = vertexId - triIdx * 3u;
+            UInt packedTri = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+            localIdx       = (packedTri >> (cornerIdx * 8u)) & 255u;
+        }
         UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
 
-        Vec3 posOrigin = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 0u)),
-            AsFloat(NVGReadPageWord(baseWord + 1u)),
-            AsFloat(NVGReadPageWord(baseWord + 2u)));
-        Vec3 posExtent = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 3u)),
-            AsFloat(NVGReadPageWord(baseWord + 4u)),
-            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        UInt h0 = NVGReadPageWord(baseWord + 0u);
+        UInt h1 = NVGReadPageWord(baseWord + 1u);
+        UInt h2 = NVGReadPageWord(baseWord + 2u);
+        UInt h3 = NVGReadPageWord(baseWord + 3u);
+        UInt h4 = NVGReadPageWord(baseWord + 4u);
+        UInt h5 = NVGReadPageWord(baseWord + 5u);
         Vec2 uv0Origin = Vec2(
             AsFloat(NVGReadPageWord(baseWord + 6u)),
             AsFloat(NVGReadPageWord(baseWord + 7u)));
@@ -585,11 +633,22 @@ LIBRARY
         UInt w5 = NVGReadPageWord(vBase + 5u);
         UInt w6 = NVGReadPageWord(vBase + 6u);
 
-        Float qx = Float(w0 & 65535u);
-        Float qy = Float((w0 >> 16u) & 65535u);
-        Float qz = Float(w1 & 65535u);
-        Vec3 posStep = posExtent * (1.0 / 65535.0);
-        outVert.position = posOrigin + Vec3(qx, qy, qz) * posStep;
+        UInt qxU = w0 & 65535u;
+        UInt qyU = (w0 >> 16u) & 65535u;
+        UInt qzU = w1 & 65535u;
+        if (useIntLat)
+        {
+            UInt lShift  = h4 & 31u;
+            Int3 iGlobal = Int3(AsInt(h0), AsInt(h1), AsInt(h2)) +
+                           Int3(Int(qxU << lShift), Int(qyU << lShift), Int(qzU << lShift));
+            outVert.position = Vec3(Float(iGlobal.x), Float(iGlobal.y), Float(iGlobal.z)) * AsFloat(h3);
+        }
+        else
+        {
+            Vec3 posOrigin = Vec3(AsFloat(h0), AsFloat(h1), AsFloat(h2));
+            Vec3 posExtent = Vec3(AsFloat(h3), AsFloat(h4), AsFloat(h5));
+            outVert.position = posOrigin + Vec3(Float(qxU), Float(qyU), Float(qzU)) * (posExtent * (1.0 / 65535.0));
+        }
         outVert.normal   = NVGUnpackOctahedralNormal(w2);
 
         Float u0 = Float(w3 & 65535u) * (1.0 / 65535.0);
@@ -652,8 +711,10 @@ LIBRARY
         UInt baseWord     = physPage * wordsPerPage + wordOff;
 
         UInt countsAndFlags = NVGReadPageWord(baseWord + 14u);
+        UInt vertCount      = (countsAndFlags & 255u) | (((countsAndFlags >> 28u) & 1u) << 8u);
         UInt triCount       = (countsAndFlags >> 8u) & 255u;
-        if (vertexId >= (triCount * 3u))
+        Bool indexedDraw    = NVGIsClusterIndexedDraw();
+        if (indexedDraw ? (vertexId >= vertCount) : (vertexId >= (triCount * 3u)))
         {
             return false;
         }
@@ -663,36 +724,50 @@ LIBRARY
         outShadowPageViewIndex = (lodAndFlags >> 16u) & 65535u;
 
         UInt offsets     = NVGReadPageWord(baseWord + 15u);
-        UInt vtxWordOff  = offsets & 65535u;
+        UInt vtxWordOff  = offsets & 255u;
         UInt idxWordOff  = (offsets >> 16u) & 65535u;
         UInt attrFlags   = (countsAndFlags >> 24u) & 255u;
         Bool hasSkin     = ((attrFlags & 4u) != 0u);
+        Bool useIntLat   = ((attrFlags & 32u) != 0u);
         UInt strideWords = hasSkin ? 11u : 7u;
 
-        UInt triIdx      = vertexId / 3u;
-        UInt cornerIdx   = vertexId - triIdx * 3u;
-        UInt packedTri   = NVGReadPageWord(baseWord + idxWordOff + triIdx);
-        UInt localIdx    = (packedTri >> (cornerIdx * 8u)) & 255u;
+        UInt localIdx    = vertexId;
+        if (!indexedDraw)
+        {
+            UInt triIdx    = vertexId / 3u;
+            UInt cornerIdx = vertexId - triIdx * 3u;
+            UInt packedTri = NVGReadPageWord(baseWord + idxWordOff + triIdx);
+            localIdx       = (packedTri >> (cornerIdx * 8u)) & 255u;
+        }
         UInt vBase       = baseWord + vtxWordOff + localIdx * strideWords;
 
-        Vec3 posOrigin = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 0u)),
-            AsFloat(NVGReadPageWord(baseWord + 1u)),
-            AsFloat(NVGReadPageWord(baseWord + 2u)));
-        Vec3 posExtent = Vec3(
-            AsFloat(NVGReadPageWord(baseWord + 3u)),
-            AsFloat(NVGReadPageWord(baseWord + 4u)),
-            AsFloat(NVGReadPageWord(baseWord + 5u)));
+        UInt h0 = NVGReadPageWord(baseWord + 0u);
+        UInt h1 = NVGReadPageWord(baseWord + 1u);
+        UInt h2 = NVGReadPageWord(baseWord + 2u);
+        UInt h3 = NVGReadPageWord(baseWord + 3u);
+        UInt h4 = NVGReadPageWord(baseWord + 4u);
+        UInt h5 = NVGReadPageWord(baseWord + 5u);
 
         UInt w0 = NVGReadPageWord(vBase + 0u);
         UInt w1 = NVGReadPageWord(vBase + 1u);
         UInt w2 = NVGReadPageWord(vBase + 2u);
 
-        Float qx = Float(w0 & 65535u);
-        Float qy = Float((w0 >> 16u) & 65535u);
-        Float qz = Float(w1 & 65535u);
-        Vec3 posStep = posExtent * (1.0 / 65535.0);
-        outPosition = posOrigin + Vec3(qx, qy, qz) * posStep;
+        UInt qxU = w0 & 65535u;
+        UInt qyU = (w0 >> 16u) & 65535u;
+        UInt qzU = w1 & 65535u;
+        if (useIntLat)
+        {
+            UInt lShift  = h4 & 31u;
+            Int3 iGlobal = Int3(AsInt(h0), AsInt(h1), AsInt(h2)) +
+                           Int3(Int(qxU << lShift), Int(qyU << lShift), Int(qzU << lShift));
+            outPosition = Vec3(Float(iGlobal.x), Float(iGlobal.y), Float(iGlobal.z)) * AsFloat(h3);
+        }
+        else
+        {
+            Vec3 posOrigin = Vec3(AsFloat(h0), AsFloat(h1), AsFloat(h2));
+            Vec3 posExtent = Vec3(AsFloat(h3), AsFloat(h4), AsFloat(h5));
+            outPosition = posOrigin + Vec3(Float(qxU), Float(qyU), Float(qzU)) * (posExtent * (1.0 / 65535.0));
+        }
         outNormal   = NVGUnpackOctahedralNormal(w2);
 
         if (hasSkin)

@@ -65,7 +65,7 @@ namespace QuarkDyn
         );
         // Exact TRS inverse for rigid and uniform-scale transforms; for non-uniformly scaled
         // rotated transforms (which induce shear outside TRS), maps m_Position back to origin.
-        Vec3 invPos = (invRot * (m_Position * -1.0f)) * invScale;
+        Vec3 invPos = invRot * (invScale * (m_Position * -1.0f));
         return Transform(invPos, invRot, invScale);
     }
 

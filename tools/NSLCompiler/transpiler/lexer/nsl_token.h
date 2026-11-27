@@ -17,7 +17,9 @@ namespace NSL
         // ==================== Literals ====================
         LIT_INT,            // 42
         LIT_UINT,           // 42u, 0xFFu
+        LIT_UINT64,         // 42ull, 0x100000000ull
         LIT_FLOAT,          // 3.14f, 3.14, 1e-5
+        LIT_DOUBLE,         // 3.141592653589793238L, 3.14d
         LIT_BOOL,           // true, false
         LIT_STRING,         // "text"
 
@@ -25,7 +27,7 @@ namespace NSL
         IDENTIFIER,         // user-defined names
 
         // ==================== NSL Scalar/Vector Types ====================
-        KW_FLOAT,   KW_INT,   KW_UINT,   KW_BOOL,   KW_DOUBLE,
+        KW_FLOAT,   KW_INT,   KW_UINT,   KW_UINT64, KW_BOOL,   KW_DOUBLE,
         KW_VEC2,    KW_VEC3,  KW_VEC4,
         KW_INT2,    KW_INT3,  KW_INT4,
         KW_UINT2,   KW_UINT3, KW_UINT4,
@@ -169,13 +171,16 @@ namespace NSL
         SourceLocation location;
 
         // Typed value accessors (valid only for the respective literal kinds)
-        int64_t  intValue   = 0;
-        uint64_t uintValue  = 0;
-        double   floatValue = 0.0;
+        int64_t  intValue       = 0;
+        uint64_t uintValue      = 0;
+        double   floatValue     = 0.0;
+        bool     hasFloatSuffix = false;
 
         bool IsLiteral()    const { return kind == TokenKind::LIT_INT     ||
                                            kind == TokenKind::LIT_UINT    ||
+                                           kind == TokenKind::LIT_UINT64  ||
                                            kind == TokenKind::LIT_FLOAT   ||
+                                           kind == TokenKind::LIT_DOUBLE  ||
                                            kind == TokenKind::LIT_BOOL    ||
                                            kind == TokenKind::LIT_STRING;  }
         bool IsKeyword()    const { return kind >= TokenKind::KW_FLOAT && kind <= TokenKind::KW_RESTART_STRIP; }

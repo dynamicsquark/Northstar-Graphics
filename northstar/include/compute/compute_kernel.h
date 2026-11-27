@@ -497,7 +497,8 @@ namespace Northstar
                           UINT32 mipSlice = 0u)
         {
             if (!name) return false;
-            if (texture && texture->GetUsage() != TextureUsage::STORAGE)
+            if (texture && (texture->GetUsage() != TextureUsage::STORAGE ||
+                            (mipSlice != 0xFFFFFFFFu && mipSlice >= texture->GetMipLevels())))
                 return false;
 
             BOOL matched = false;
@@ -521,7 +522,8 @@ namespace Northstar
                           UINT32 mipSlice = 0u)
         {
             if (!group || !name) return false;
-            if (texture && texture->GetUsage() != TextureUsage::STORAGE)
+            if (texture && (texture->GetUsage() != TextureUsage::STORAGE ||
+                            (mipSlice != 0xFFFFFFFFu && mipSlice >= texture->GetMipLevels())))
                 return false;
 
             BOOL matched = false;

@@ -224,12 +224,15 @@ namespace Northstar
 
     enum class ComputeDispatchProfileGroup : UINT8
     {
-        GENERIC        = 0,
-        FEEDBACK       = 1,
-        RESIDENCY_CULL = 2,
-        NVG_HZB        = 3,
-        NVG_CULL_LOD   = 4,
-        NVG_DRAW_GEN   = 5
+        GENERIC              = 0,
+        FEEDBACK             = 1,
+        RESIDENCY_CULL       = 2,
+        NVG_HZB              = 3,
+        NVG_CULL_LOD         = 4,
+        NVG_DRAW_GEN         = 5,
+        NVG_SW_RASTER        = 6,
+        NVG_SW_RASTER_PASS1  = 7,
+        NVG_SW_RASTER_PASS2  = 8
     };
 
     struct ComputeDispatchCommand
@@ -241,7 +244,7 @@ namespace Northstar
         NativeHandle                               indirectArgsBuffer = 0;
         UINT32                                     indirectArgsOffset = 0;
         BOOL                                       useRootConstants   = false;
-        UINT32                                     rootConstants[4]   = { 0, 0, 0, 0 }; // b0, space4
+        UINT32                                     rootConstants[4]   = { 0, 0, 0, 0 }; // b0, space16
         ComputeDispatchProfileGroup                profileGroup       = ComputeDispatchProfileGroup::GENERIC;
         std::vector<NativeConstantBufferBinding>   constantBuffers;
         std::vector<NativeTextureBinding>          textures;
@@ -278,29 +281,45 @@ namespace Northstar
     struct IndirectRootBindingKey
     {
         BOOL        enabled        = false;
+        BOOL        extended       = false; // False: 3 CBVs + 1 SRV (96B NVS stride); True: 8 CBVs + 2 SRVs (144B NVG extended stride)
         UINT8       cbvCount       = 0;
-        UINT16      cbvSpace[3]    = { 0, 0, 0 };
-        UINT16      cbvSlot[3]     = { 0, 0, 0 };
-        ShaderStage cbvStage[3]    = { ShaderStage::VERTEX, ShaderStage::VERTEX, ShaderStage::VERTEX };
+        UINT8       srvCount       = 0;
+        UINT16      cbvSpace[8]    = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        UINT16      cbvSlot[8]     = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        ShaderStage cbvStage[8]    = {
+            ShaderStage::VERTEX, ShaderStage::VERTEX, ShaderStage::VERTEX, ShaderStage::VERTEX,
+            ShaderStage::VERTEX, ShaderStage::VERTEX, ShaderStage::VERTEX, ShaderStage::VERTEX
+        };
         BOOL        hasPromotedSRV = false;
         UINT16      srvSpace       = 0;
         UINT16      srvSlot        = 0;
         ShaderStage srvStage       = ShaderStage::VERTEX;
+        UINT16      srv2Space      = 0;
+        UINT16      srv2Slot       = 0;
+        ShaderStage srv2Stage      = ShaderStage::VERTEX;
 
         bool operator==(const IndirectRootBindingKey& o) const noexcept
         {
-            if (enabled != o.enabled || cbvCount != o.cbvCount || hasPromotedSRV != o.hasPromotedSRV)
+            const UINT8 effSrvA = (srvCount > 0u) ? srvCount : (hasPromotedSRV ? 1u : 0u);
+            const UINT8 effSrvB = (o.srvCount > 0u) ? o.srvCount : (o.hasPromotedSRV ? 1u : 0u);
+            if (enabled != o.enabled || extended != o.extended || cbvCount != o.cbvCount || effSrvA != effSrvB)
                 return false;
             if (!enabled)
                 return true;
-            for (UINT8 i = 0; i < 3; ++i)
+            const UINT8 maxCbv = extended ? 8u : 3u;
+            for (UINT8 i = 0; i < cbvCount && i < maxCbv; ++i)
             {
                 if (cbvSpace[i] != o.cbvSpace[i] || cbvSlot[i] != o.cbvSlot[i] || cbvStage[i] != o.cbvStage[i])
                     return false;
             }
-            if (hasPromotedSRV)
+            if (effSrvA >= 1u)
             {
                 if (srvSpace != o.srvSpace || srvSlot != o.srvSlot || srvStage != o.srvStage)
+                    return false;
+            }
+            if (effSrvA >= 2u)
+            {
+                if (srv2Space != o.srv2Space || srv2Slot != o.srv2Slot || srv2Stage != o.srv2Stage)
                     return false;
             }
             return true;
@@ -330,6 +349,7 @@ namespace Northstar
         UINT16                            instanceBindingSlot         = 0xFFFFu; // Reflected SRV register slot (tN) for Tier-1 instances
         UINT16                            instanceBindingSpace        = 0u;      // Reflected SRV register space (spaceS) for Tier-1 instances
         std::vector<InstanceData>         instances;                     // CPU payload of instances for GPU upload
+        std::vector<Mat4>                 instancePrevWorldMatrices;     // Per-instance previous world matrices (parallel to instances)
         std::vector<InstanceSkinningData> instanceSkinning;              // Per-instance skinning metadata (parallel to instances)
 
         // GPU-Driven Indirect Execution (ExecuteIndirect)
@@ -349,7 +369,7 @@ namespace Northstar
         NativeHandle                 indirectVertexPoolBuffer       = 0; // Optional GPU-decoded IA vertex pool transitioned to VERTEX_AND_CONSTANT_BUFFER
         NativeHandle                 indirectIndexPoolBuffer        = 0; // Optional GPU-decoded IA index pool transitioned to INDEX_BUFFER
         BOOL                         useGraphicsRootConstants       = false;
-        UINT32                       graphicsRootConstants[4]       = { 0, 0, 0, 0 }; // b1, space3 (Vertex Shader 32-bit root constants)
+        UINT32                       graphicsRootConstants[4]       = { 0, 0, 0, 0 }; // b0, space16 (Vertex Shader 32-bit root constants)
 
         // CPU Geometry pointers (available if not yet uploaded to GPU or for debug)
         const Vertex*        cpuVertices  = nullptr;
@@ -357,6 +377,7 @@ namespace Northstar
 
         // World transform (primary matrix / fallback if single instance)
         Mat4                 worldMatrix;
+        Mat4                 prevWorldMatrix = Mat4::Identity();
 
         // Shader native handles
         NativeHandle         vertexShader   = 0;
@@ -390,6 +411,10 @@ namespace Northstar
         Mat4                 viewMatrix;
         Mat4                 projectionMatrix;
         Mat4                 viewProjectionMatrix;
+        Mat4                 invViewProjectionMatrix = Mat4::Identity();
+        Mat4                 prevViewMatrix          = Mat4::Identity();
+        Mat4                 prevProjectionMatrix    = Mat4::Identity();
+        Mat4                 prevViewProjectionMatrix= Mat4::Identity();
         Vec3                 position;
         Quat                 rotation;
         Vec3                 direction;
@@ -429,6 +454,7 @@ namespace Northstar
         UINT32                 nvsLightId        = 0;
         UINT32                 shadowViewBase    = 0;
         UINT32                 shadowViewCount   = 0;
+        UINT32                 cullingMask       = 0xFFFFFFFFu;
     };
 
     // ==================== FRAME ENVIRONMENT DATA ====================
@@ -634,6 +660,7 @@ namespace Northstar
         std::vector<BYTE>           nvsLightViewTableCpuMirror;
 
         // Engine-Owned Northstar Virtual Geometry (NVG) Runtime Buffers & Metadata
+        NativeHandle                nvgVisibilityTexture           = 0;
         NativeHandle                nvgPagePoolBuffer              = 0;
         UINT32                      nvgPagePoolWordCount           = 0;
         NativeHandle                nvgBucketRangesBuffer          = 0;
@@ -722,6 +749,7 @@ namespace Northstar
               nvsLightViewTableCpuMirrorPtr(nullptr),
               nvsLightViewTableCpuMirrorCount(o.nvsLightViewTableCpuMirrorCount),
               nvsLightViewTableCpuMirror(o.nvsLightViewTableCpuMirror),
+              nvgVisibilityTexture(o.nvgVisibilityTexture),
               nvgPagePoolBuffer(o.nvgPagePoolBuffer),
               nvgPagePoolWordCount(o.nvgPagePoolWordCount),
               nvgBucketRangesBuffer(o.nvgBucketRangesBuffer),
@@ -812,6 +840,7 @@ namespace Northstar
                 {
                     nvsLightViewTableCpuMirrorPtr = o.nvsLightViewTableCpuMirrorPtr;
                 }
+                nvgVisibilityTexture     = o.nvgVisibilityTexture;
                 nvgPagePoolBuffer        = o.nvgPagePoolBuffer;
                 nvgPagePoolWordCount     = o.nvgPagePoolWordCount;
                 nvgBucketRangesBuffer    = o.nvgBucketRangesBuffer;
@@ -880,6 +909,7 @@ namespace Northstar
             nvsLightViewTableCpuMirrorPtr = nullptr;
             nvsLightViewTableCpuMirrorCount = 0;
             nvsLightViewTableCpuMirror.clear();
+            nvgVisibilityTexture = 0;
             nvgPagePoolBuffer = 0;
             nvgPagePoolWordCount = 0;
             nvgBucketRangesBuffer = 0;

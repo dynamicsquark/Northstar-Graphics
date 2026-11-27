@@ -19,6 +19,44 @@ namespace Northstar
         if (m_nextMeshId == 0u) m_nextMeshId = 1u;
         mesh->SetGPUSceneMeshId(assignedId);
 
+        if (desc.submeshCount > 0u)
+        {
+            if (desc.submeshes == nullptr)
+            {
+                m_lastError = "CreateMesh failed: submeshCount > 0 but submeshes pointer is nullptr.";
+                delete mesh;
+                return nullptr;
+            }
+            for (UINT32 si = 0u; si < desc.submeshCount; ++si)
+            {
+                const NVGSubmeshRange& sr = desc.submeshes[si];
+                if (sr.materialSlot >= kNVGMaxMaterialSlots)
+                {
+                    m_lastError = "CreateMesh failed: submesh materialSlot exceeds maximum slot index (255).";
+                    delete mesh;
+                    return nullptr;
+                }
+                if (sr.indexCount == 0u || (sr.indexCount % 3u) != 0u)
+                {
+                    m_lastError = "CreateMesh failed: submesh indexCount must be non-zero and a multiple of 3.";
+                    delete mesh;
+                    return nullptr;
+                }
+                if (desc.indexCount > 0u &&
+                    (static_cast<UINT64>(sr.startIndex) + static_cast<UINT64>(sr.indexCount) > static_cast<UINT64>(desc.indexCount)))
+                {
+                    m_lastError = "CreateMesh failed: submesh range [startIndex .. startIndex + indexCount] exceeds mesh indexCount.";
+                    delete mesh;
+                    return nullptr;
+                }
+            }
+            mesh->SetSubmeshes(desc.submeshes, desc.submeshCount);
+        }
+        if (desc.pageStreamProvider)
+        {
+            mesh->SetPageStreamProvider(desc.pageStreamProvider);
+        }
+
         if (desc.geometryMode == GeometryMode::VIRTUALIZED)
         {
             if (!m_nvgManager || !m_nvgManager->IsInitialized())
@@ -31,13 +69,18 @@ namespace Northstar
             NVGMeshInfo info{};
             AABB        localBounds{};
             std::string nvgErr;
-            if (!m_nvgManager->CreateAndRegisterVirtualMesh(desc, assignedId, info, localBounds, nvgErr))
+            std::shared_ptr<INVGPageStreamProvider> resolvedProvider;
+            if (!m_nvgManager->CreateAndRegisterVirtualMesh(desc, assignedId, info, localBounds, nvgErr, &resolvedProvider))
             {
                 m_lastError = nvgErr.empty() ? "CreateMesh(GeometryMode::VIRTUALIZED) failed." : nvgErr;
                 delete mesh;
                 return nullptr;
             }
 
+            if (resolvedProvider && !mesh->GetPageStreamProvider())
+            {
+                mesh->SetPageStreamProvider(std::move(resolvedProvider));
+            }
             mesh->SetBoundingBox((desc.boundingBox.Size().LengthSq() > 0.0f) ? desc.boundingBox : localBounds);
             mesh->SetVirtualGeometryMetadata(GeometryMode::VIRTUALIZED, info);
             mesh->SetGPUHandles(0, 0);

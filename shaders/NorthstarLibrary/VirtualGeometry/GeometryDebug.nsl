@@ -1,7 +1,9 @@
 // =====================================================================
 //  GeometryDebug.nsl — Northstar NSL Standard Library: Virtual Geometry Debug Visualization
 //
-//  Provides deterministic false-color visualization modes driven by Get(NVG_DEBUG_MODE):
+//  Opt-in developer library for deterministic false-color NVG diagnostics
+//  driven by Get(NVG_DEBUG_MODE):
+//    0 : NONE (returns developer's unmodified color)
 //    1 : CLUSTER_ID
 //    2 : LOD_LEVEL
 //    3 : VIRTUAL_PAGE
@@ -9,6 +11,13 @@
 //    5 : GEOMETRIC_ERROR
 //    6 : RESIDENCY_FALLBACK
 //    7 : NORMAL_CONE
+//
+//  Usage in any developer Vertex or Pixel Shader:
+//    LIBRARY_DECLARATION { Add("NorthstarLibrary/VirtualGeometry/GeometryDebug.nsl") }
+//    // In Pixel Shader (per-cluster IA / indexed-pull):
+//    finalColor = NVGApplyPixelDebugColor(finalColor, worldNormal);
+//    // Or in Vertex-Pulling Vertex Shader:
+//    outColor = NVGApplyDebugColor(v.color.rgb, input.INSTANCE_ID, worldNormal);
 // =====================================================================
 
 LIBRARY_DECLARATION
@@ -18,6 +27,11 @@ LIBRARY_DECLARATION
 
 LIBRARY
 {
+    Bool NVGIsDebugModeActive()
+    {
+        return NVGGetDebugMode() != 0u;
+    }
+
     Vec3 NVGHashColorUInt(UInt seed)
     {
         UInt h = seed * 747796405u + 2891336453u;
@@ -76,5 +90,62 @@ LIBRARY
             return worldNormal * 0.5 + Vec3(0.5, 0.5, 0.5);
         }
         return Vec3(1.0, 1.0, 1.0);
+    }
+
+    // Opt-in resolver: returns true and populates outDebugColor ONLY when NVG_DEBUG_MODE != 0
+    // and the current draw belongs to an active virtualized cluster; otherwise returns false
+    // without altering standard or non-debug draws.
+    Bool NVGTryResolveDebugColor(UInt instanceId, Vec3 worldNormal, out Vec3 outDebugColor)
+    {
+        if (NVGGetDebugMode() == 0u || !NVGIsAvailable() || !NVGHasActiveCluster(instanceId))
+        {
+            outDebugColor = Vec3(0.0, 0.0, 0.0);
+            return false;
+        }
+        Float nLenSq = Dot(worldNormal, worldNormal);
+        Vec3  safeN  = (nLenSq > 0.0001) ? (worldNormal * Rsqrt(nLenSq)) : Vec3(0.0, 1.0, 0.0);
+        NVGVisibleCluster vc = NVGLoadVisibleCluster(instanceId);
+        outDebugColor = NVGComputeDebugColor(vc, safeN);
+        return true;
+    }
+
+    // Opt-in unshaded false-color helper for Vertex-Pulling or Instanced stages (pass input.INSTANCE_ID)
+    Vec3 NVGApplyDebugColor(Vec3 baseColor, UInt instanceId, Vec3 worldNormal)
+    {
+        Vec3 dbgColor = Vec3(0.0, 0.0, 0.0);
+        if (NVGTryResolveDebugColor(instanceId, worldNormal, dbgColor))
+        {
+            return dbgColor;
+        }
+        return baseColor;
+    }
+
+    // Opt-in relief-shaded false-color helper for Vertex-Pulling or Instanced stages
+    Vec3 NVGApplyDebugShadedColor(Vec3 baseColor, UInt instanceId, Vec3 worldNormal)
+    {
+        Vec3 dbgColor = Vec3(0.0, 0.0, 0.0);
+        if (NVGTryResolveDebugColor(instanceId, worldNormal, dbgColor))
+        {
+            if (NVGGetDebugMode() == 7u)
+            {
+                return dbgColor;
+            }
+            Float nLenSq = Dot(worldNormal, worldNormal);
+            Vec3  safeN  = (nLenSq > 0.0001) ? (worldNormal * Rsqrt(nLenSq)) : Vec3(0.0, 1.0, 0.0);
+            Float ndl    = 0.32 + 0.68 * Max(Dot(safeN, Normalize(Vec3(0.45, 0.80, -0.40))), 0.0);
+            return Saturate(dbgColor * ndl);
+        }
+        return baseColor;
+    }
+
+    // Opt-in single-call Pixel Shader helpers for per-cluster IA / Indexed-Pull draws (instanceId = 0)
+    Vec3 NVGApplyPixelDebugColor(Vec3 baseColor, Vec3 worldNormal)
+    {
+        return NVGApplyDebugColor(baseColor, 0u, worldNormal);
+    }
+
+    Vec3 NVGApplyPixelDebugShadedColor(Vec3 baseColor, Vec3 worldNormal)
+    {
+        return NVGApplyDebugShadedColor(baseColor, 0u, worldNormal);
     }
 }

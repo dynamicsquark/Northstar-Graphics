@@ -28,6 +28,11 @@ PROPERTY NVGResources
         Get(NVG_OBJ_LOD_MATERIAL_FLAGS)
         Get(NVG_OBJ_BOUNDING_SPHERE)
         Get(NVG_OBJ_WORLD_MATRIX)
+        Get(NVG_OBJ_PREV_WORLD_MATRIX)
+        Get(NVG_OBJ_LAYER_MASK)
+        Get(NVG_OBJ_MATERIAL_TABLE_OFFSET)
+        Get(NVG_OBJ_MATERIAL_SLOT_COUNT)
+        Get(NVG_OBJ_SKIN_BOUNDS_OFFSET)
     }
 }
 
@@ -54,6 +59,16 @@ LIBRARY
         return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_WORLD_MATRIX;
     }
 
+    Mat4 NVGGetObjectPrevWorldMatrix(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_PREV_WORLD_MATRIX;
+    }
+
+    UInt NVGGetObjectLayerMask(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_LAYER_MASK;
+    }
+
     UInt NVGGetObjectFlags(UInt objectSlot)
     {
         return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_FLAGS;
@@ -67,6 +82,21 @@ LIBRARY
     UInt NVGGetObjectMaterialId(UInt objectSlot)
     {
         return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_MATERIAL_ID;
+    }
+
+    UInt NVGGetObjectMaterialTableOffset(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_MATERIAL_TABLE_OFFSET;
+    }
+
+    UInt NVGGetObjectMaterialSlotCount(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_MATERIAL_SLOT_COUNT;
+    }
+
+    UInt NVGGetObjectSkinBoundsOffset(UInt objectSlot)
+    {
+        return NVGResources.GPUSceneObjects[objectSlot].NVG_OBJ_SKIN_BOUNDS_OFFSET;
     }
 
     Vec3 NVGTransformPosition(Mat4 worldMatrix, Vec3 localPos)

@@ -1,4 +1,9 @@
 #include "d3d12_resource_manager.h"
+#ifdef _WIN32
+#define BOOL WIN_BOOL
+#include <dxcapi.h>
+#undef BOOL
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -139,22 +144,34 @@ namespace Northstar
             UINT32 bits = 0u;
             std::memcpy(&bits, &f, sizeof(UINT32));
             const UINT16 sign = static_cast<UINT16>((bits >> 16u) & 0x8000u);
-            const INT32  exp  = static_cast<INT32>((bits >> 23u) & 0xFFu) - 127 + 15;
+            const INT32  rawE = static_cast<INT32>((bits >> 23u) & 0xFFu);
             UINT32       mant = bits & 0x007FFFFFu;
 
+            if (rawE == 0xFF)
+            {
+                return (mant != 0u) ? static_cast<UINT16>(sign | 0x7E00u) : static_cast<UINT16>(sign | 0x7C00u);
+            }
+
+            const INT32 exp = rawE - 127 + 15;
             if (exp <= 0)
             {
                 if (exp < -10) return sign;
-                mant = (mant | 0x00800000u) >> static_cast<UINT32>(1 - exp);
-                return static_cast<UINT16>(sign | ((mant + 0x00001000u) >> 13u));
+                const UINT32 shift = static_cast<UINT32>(1 - exp);
+                const UINT32 fullM = mant | 0x00800000u;
+                const UINT32 half  = 1u << (shift + 12u);
+                const UINT32 rem   = fullM & ((half << 1u) - 1u);
+                const UINT32 tie   = (rem > half || (rem == half && ((fullM >> (shift + 13u)) & 1u) != 0u)) ? 1u : 0u;
+                return static_cast<UINT16>(sign | static_cast<UINT16>((fullM >> (shift + 13u)) + tie));
             }
             if (exp >= 31)
             {
-                if (((bits >> 23u) & 0xFFu) == 0xFFu && mant != 0u)
-                    return static_cast<UINT16>(sign | 0x7E00u); // quiet NaN
-                return static_cast<UINT16>(sign | 0x7C00u);     // Inf / clamp overflow
+                return static_cast<UINT16>(sign | 0x7C00u);
             }
-            return static_cast<UINT16>(sign | (static_cast<UINT32>(exp) << 10u) | ((mant + 0x00001000u) >> 13u));
+
+            const UINT32 rem     = mant & 0x1FFFu;
+            const UINT32 tie     = (rem > 0x1000u || (rem == 0x1000u && ((mant >> 13u) & 1u) != 0u)) ? 1u : 0u;
+            const UINT32 rounded = (static_cast<UINT32>(exp) << 10u) + (mant >> 13u) + tie;
+            return static_cast<UINT16>(sign | static_cast<UINT16>((std::min)(rounded, 0x7C00u)));
         }
 
         static float SrgbByteToLinear(BYTE v) noexcept
@@ -1476,7 +1493,6 @@ namespace Northstar
         res.dsvDescriptorIndex          = dsvDescIdx;
         res.readOnlyDsvDescriptorIndex  = readOnlyDsvDescIdx;
         res.fullArrayDsvDescriptorIndex = fullArrayDsvDescIdx;
-        res.dsvLayerNeedsClear.assign(dsvLayerDescriptors.size(), true);
         res.dsvLayerDescriptors         = std::move(dsvLayerDescriptors);
         res.sharedHandle                = sharedHandle;
 
@@ -2271,6 +2287,98 @@ namespace Northstar
 
         if (!cmdList)
         {
+            m_pendingBufferUploads.clear();
+            return;
+        }
+
+        BOOL hasGPUCopy = false;
+        for (const auto& up : m_pendingBufferUploads)
+        {
+            if (up.srcGPUHandle != 0)
+            {
+                hasGPUCopy = true;
+                break;
+            }
+        }
+
+        if (hasGPUCopy)
+        {
+            // Ordered FIFO flush preserving exact causality between CPU->GPU uploads and GPU->GPU buffer copies
+            for (auto& up : m_pendingBufferUploads)
+            {
+                auto itDst = m_gpuBuffers.find(up.targetHandle);
+                if (itDst != m_gpuBuffers.end() && itDst->second.resource && up.uploadResource)
+                {
+                    if (up.srcGPUHandle != 0)
+                    {
+                        ID3D12Resource* srcRes   = up.uploadResource.Get();
+                        const BOOL srcTracked    = stateTracker.IsResourceTracked(srcRes);
+                        auto itSrc               = m_gpuBuffers.find(up.srcGPUHandle);
+                        const GPUResourceAccess srcRestoreAccess = (itSrc != m_gpuBuffers.end())
+                            ? itSrc->second.defaultAccess
+                            : GPUResourceAccess::ALL_SHADER_RESOURCE;
+
+                        if (srcTracked)
+                        {
+                            stateTracker.TransitionResource(srcRes, GPUResourceAccess::COPY_SOURCE);
+                        }
+                        else if (up.srcFallbackState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+                        {
+                            D3D12_RESOURCE_BARRIER b = CreateTransitionBarrier(srcRes, up.srcFallbackState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                            cmdList->ResourceBarrier(1, &b);
+                        }
+                        stateTracker.TransitionResource(itDst->second.resource.Get(), GPUResourceAccess::COPY_DEST);
+                        stateTracker.FlushBarriers(cmdList);
+
+                        cmdList->CopyBufferRegion(
+                            itDst->second.resource.Get(),
+                            up.dstOffset,
+                            srcRes,
+                            up.srcOffset,
+                            up.byteSize);
+
+                        if (srcTracked)
+                        {
+                            stateTracker.TransitionResource(srcRes, srcRestoreAccess);
+                            if (itSrc != m_gpuBuffers.end())
+                            {
+                                itSrc->second.currentState = stateTracker.GetResourceState(srcRes);
+                            }
+                        }
+                        else if (up.srcFallbackState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+                        {
+                            D3D12_RESOURCE_BARRIER b = CreateTransitionBarrier(srcRes, D3D12_RESOURCE_STATE_COPY_SOURCE, up.srcFallbackState);
+                            cmdList->ResourceBarrier(1, &b);
+                        }
+                        stateTracker.TransitionResource(itDst->second.resource.Get(), itDst->second.defaultAccess);
+                        stateTracker.FlushBarriers(cmdList);
+                        itDst->second.currentState = stateTracker.GetResourceState(itDst->second.resource.Get());
+                    }
+                    else
+                    {
+                        stateTracker.TransitionResource(itDst->second.resource.Get(), GPUResourceAccess::COPY_DEST);
+                        stateTracker.FlushBarriers(cmdList);
+                        cmdList->CopyBufferRegion(
+                            itDst->second.resource.Get(),
+                            up.dstOffset,
+                            up.uploadResource.Get(),
+                            up.srcOffset,
+                            up.byteSize);
+                        m_uploadedBytesThisSubmission += up.byteSize;
+                        stateTracker.TransitionResource(itDst->second.resource.Get(), itDst->second.defaultAccess);
+                        stateTracker.FlushBarriers(cmdList);
+                        itDst->second.currentState = stateTracker.GetResourceState(itDst->second.resource.Get());
+                    }
+                }
+
+                if (up.isStandaloneUpload && up.uploadResource)
+                {
+                    D3D12RetiredResource retired{};
+                    retired.fenceValue = upcomingFenceValue;
+                    retired.resource   = std::move(up.uploadResource);
+                    m_retiredResources.push_back(std::move(retired));
+                }
+            }
             m_pendingBufferUploads.clear();
             return;
         }
@@ -3183,22 +3291,361 @@ namespace Northstar
         }
     }
 
-    NativeHandle D3D12ResourceManager::CreateShader(ShaderStage stage, const void* bytecode, SIZE_T bytecodeSize)
+    namespace
+    {
+#ifdef _WIN32
+        struct DXCRuntimeState
+        {
+            HMODULE              hDxil       = nullptr;
+            HMODULE              hDxCompiler = nullptr;
+            DxcCreateInstanceProc createFn   = nullptr;
+            BOOL                 available   = false;
+        };
+
+        static const DXCRuntimeState& GetDXCRuntimeState() noexcept
+        {
+            static std::once_flag  s_once;
+            static DXCRuntimeState s_state{};
+            std::call_once(s_once, []() {
+                s_state.hDxil       = ::LoadLibraryW(L"dxil.dll");
+                s_state.hDxCompiler = ::LoadLibraryW(L"dxcompiler.dll");
+                if (s_state.hDxil != nullptr && s_state.hDxCompiler != nullptr)
+                {
+                    s_state.createFn = reinterpret_cast<DxcCreateInstanceProc>(
+                        ::GetProcAddress(s_state.hDxCompiler, "DxcCreateInstance"));
+                    if (s_state.createFn != nullptr)
+                    {
+                        ComPtr<IDxcUtils>     testUtils;
+                        ComPtr<IDxcCompiler3> testCompiler;
+                        if (SUCCEEDED(s_state.createFn(CLSID_DxcUtils, IID_PPV_ARGS(&testUtils))) &&
+                            SUCCEEDED(s_state.createFn(CLSID_DxcCompiler, IID_PPV_ARGS(&testCompiler))) &&
+                            testUtils && testCompiler)
+                        {
+                            s_state.available = true;
+                        }
+                    }
+                }
+            });
+            return s_state;
+        }
+
+        static BOOL CompileHLSLWithDXC(
+            const void*        srcPtr,
+            SIZE_T             srcSize,
+            const wchar_t*     targetProfile,
+            const wchar_t*     entryPoint,
+            const wchar_t*     hlslVersion,
+            std::vector<BYTE>& outBytecode,
+            std::string&       outErrorText)
+        {
+            outBytecode.clear();
+            outErrorText.clear();
+            const DXCRuntimeState& dxc = GetDXCRuntimeState();
+            if (!dxc.available || !dxc.createFn || !srcPtr || srcSize == 0 || !targetProfile || !entryPoint)
+            {
+                return false;
+            }
+
+            ComPtr<IDxcUtils>     utils;
+            ComPtr<IDxcCompiler3> compiler;
+            if (FAILED(dxc.createFn(CLSID_DxcUtils, IID_PPV_ARGS(&utils))) ||
+                FAILED(dxc.createFn(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) ||
+                !utils || !compiler)
+            {
+                return false;
+            }
+
+            // Trim optional trailing NUL byte if caller passed size including '\0'
+            SIZE_T effectiveSize = srcSize;
+            while (effectiveSize > 0 && static_cast<const char*>(srcPtr)[effectiveSize - 1] == '\0')
+            {
+                --effectiveSize;
+            }
+            if (effectiveSize == 0) return false;
+
+            DxcBuffer srcBuf{};
+            srcBuf.Ptr      = srcPtr;
+            srcBuf.Size     = effectiveSize;
+            srcBuf.Encoding = DXC_CP_UTF8;
+
+            const wchar_t* args[] = {
+                L"NorthstarShader.hlsl",
+                L"-E",  entryPoint,
+                L"-T",  targetProfile,
+                L"-HV", hlslVersion,
+                L"-O3",
+                L"-Qstrip_reflect",
+                L"-Qstrip_debug"
+            };
+
+            ComPtr<IDxcResult> result;
+            if (FAILED(compiler->Compile(&srcBuf, args, _countof(args), nullptr, IID_PPV_ARGS(&result))) || !result)
+            {
+                return false;
+            }
+
+            ComPtr<IDxcBlobUtf8> errors;
+            if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) &&
+                errors && errors->GetStringLength() > 0)
+            {
+                outErrorText.assign(errors->GetStringPointer(), errors->GetStringLength());
+            }
+
+            HRESULT status = E_FAIL;
+            if (FAILED(result->GetStatus(&status)) || FAILED(status))
+            {
+                return false;
+            }
+
+            ComPtr<IDxcBlob> objBlob;
+            if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&objBlob), nullptr)) ||
+                !objBlob || objBlob->GetBufferSize() < 4u)
+            {
+                return false;
+            }
+
+            outBytecode.resize(objBlob->GetBufferSize());
+            std::memcpy(outBytecode.data(), objBlob->GetBufferPointer(), objBlob->GetBufferSize());
+            return true;
+        }
+#endif
+    }
+
+    BOOL D3D12ResourceManager::IsDXILCompilerAvailable() noexcept
+    {
+#ifdef _WIN32
+        return GetDXCRuntimeState().available;
+#else
+        return false;
+#endif
+    }
+
+    void D3D12ResourceManager::InspectDXBCContainerCapabilities(
+        const void* dxbcPtr,
+        SIZE_T      dxbcSize,
+        UINT32&     outRequiredSM,
+        BOOL&       outRequiresInt64Ops,
+        BOOL&       outRequiresInt64DescHeapAtomics) noexcept
+    {
+        outRequiredSM                   = 0x51u;
+        outRequiresInt64Ops             = false;
+        outRequiresInt64DescHeapAtomics = false;
+
+        if (!dxbcPtr || dxbcSize < 32u || std::memcmp(dxbcPtr, "DXBC", 4) != 0)
+        {
+            return;
+        }
+
+        const BYTE* bytes = static_cast<const BYTE*>(dxbcPtr);
+        UINT32 partCount = 0u;
+        std::memcpy(&partCount, bytes + 28u, sizeof(UINT32));
+        if (partCount > 64u || (32ull + static_cast<UINT64>(partCount) * 4ull) > static_cast<UINT64>(dxbcSize))
+        {
+            return;
+        }
+
+        BOOL hasDxilChunk = false;
+        for (UINT32 i = 0u; i < partCount; ++i)
+        {
+            UINT32 partOff = 0u;
+            std::memcpy(&partOff, bytes + 32u + i * 4u, sizeof(UINT32));
+            if (static_cast<UINT64>(partOff) + 8ull > static_cast<UINT64>(dxbcSize))
+            {
+                continue;
+            }
+            UINT32 partSize = 0u;
+            std::memcpy(&partSize, bytes + partOff + 4u, sizeof(UINT32));
+            if (static_cast<UINT64>(partOff) + 8ull + static_cast<UINT64>(partSize) > static_cast<UINT64>(dxbcSize))
+            {
+                continue;
+            }
+
+            if (std::memcmp(bytes + partOff, "DXIL", 4) == 0 && partSize >= 8u)
+            {
+                hasDxilChunk = true;
+                UINT32 progVer = 0u;
+                std::memcpy(&progVer, bytes + partOff + 8u, sizeof(UINT32));
+                const UINT32 smByte = progVer & 0xFFu;
+                if (smByte >= 0x60u)
+                {
+                    outRequiredSM = (std::max)(outRequiredSM, smByte);
+                }
+            }
+            else if (std::memcmp(bytes + partOff, "SFI0", 4) == 0 && partSize >= 8u)
+            {
+                UINT64 sfiFlags = 0ull;
+                std::memcpy(&sfiFlags, bytes + partOff + 8u, sizeof(UINT64));
+                // D3D_SHADER_FEATURE_INT64_OPS = 0x00008000ULL
+                if ((sfiFlags & 0x00008000ULL) != 0ull)
+                {
+                    outRequiresInt64Ops = true;
+                    outRequiredSM       = (std::max)(outRequiredSM, 0x60u);
+                }
+                // D3D_SHADER_FEATURE_ATOMIC_INT64_ON_TYPED_RESOURCE (1<<22) |
+                // D3D_SHADER_FEATURE_ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE (1<<28)
+                if ((sfiFlags & 0x10400000ULL) != 0ull)
+                {
+                    outRequiresInt64Ops             = true;
+                    outRequiresInt64DescHeapAtomics = true;
+                    outRequiredSM                   = (std::max)(outRequiredSM, 0x66u);
+                }
+            }
+        }
+
+#ifdef _WIN32
+        // DXC sets SFI0 D3D_SHADER_FEATURE_INT64_OPS (0x8000) on RWStructuredBuffer<uint64_t> : register(uN, spaceM)
+        // without setting bit 28 unless ResourceDescriptorHeap[] is indexed directly. Because NorthstarD3D12 binds
+        // compute UAVs through 64-descriptor CBV/SRV/UAV descriptor tables, inspect the DXIL module for 64-bit
+        // resource atomic opcodes whenever Int64Ops is present so descriptor-heap atomic support is strictly enforced.
+        if (hasDxilChunk && outRequiresInt64Ops && !outRequiresInt64DescHeapAtomics)
+        {
+            const DXCRuntimeState& dxc = GetDXCRuntimeState();
+            if (dxc.available && dxc.createFn)
+            {
+                ComPtr<IDxcCompiler3> compiler;
+                if (SUCCEEDED(dxc.createFn(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) && compiler)
+                {
+                    DxcBuffer binBuf{};
+                    binBuf.Ptr      = dxbcPtr;
+                    binBuf.Size     = dxbcSize;
+                    binBuf.Encoding = 0u;
+                    ComPtr<IDxcResult> disRes;
+                    if (SUCCEEDED(compiler->Disassemble(&binBuf, IID_PPV_ARGS(&disRes))) && disRes)
+                    {
+                        ComPtr<IDxcBlobUtf8> disText;
+                        if (SUCCEEDED(disRes->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(&disText), nullptr)) &&
+                            disText && disText->GetStringLength() > 0)
+                        {
+                            const char* txt = disText->GetStringPointer();
+                            if (txt && (std::strstr(txt, "dx.op.atomicBinOp.i64") != nullptr ||
+                                        std::strstr(txt, "dx.op.atomicCompareExchange.i64") != nullptr))
+                            {
+                                outRequiresInt64DescHeapAtomics = true;
+                                outRequiredSM                   = (std::max)(outRequiredSM, 0x66u);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#else
+        (void)hasDxilChunk;
+#endif
+    }
+
+    NativeHandle D3D12ResourceManager::CreateShader(ShaderStage stage, const void* bytecode, SIZE_T bytecodeSize, BOOL allowDXILSM66)
     {
         if (!bytecode || bytecodeSize == 0) return 0;
 
         D3D12ShaderResource res{};
         res.stage = stage;
+        auto populateBinaryCaps = [&]() {
+            const void* ptr = !res.bytecode.empty() ? static_cast<const void*>(res.bytecode.data())
+                                                    : (res.blob ? res.blob->GetBufferPointer() : nullptr);
+            const SIZE_T sz = !res.bytecode.empty() ? res.bytecode.size()
+                                                    : (res.blob ? res.blob->GetBufferSize() : 0u);
+            InspectDXBCContainerCapabilities(
+                ptr, sz,
+                res.requiredShaderModel,
+                res.requiresInt64Ops,
+                res.requiresInt64DescriptorHeapAtomics);
+        };
 
-        // Check if precompiled DXBC binary (starts with "DXBC")
+        // Check if precompiled DXBC / DXIL container binary (both start with "DXBC")
         if (bytecodeSize >= 4 && std::memcmp(bytecode, "DXBC", 4) == 0)
         {
             res.bytecode.resize(bytecodeSize);
             std::memcpy(res.bytecode.data(), bytecode, bytecodeSize);
+            populateBinaryCaps();
+            if (allowDXILSM66 == FALSE && res.requiredShaderModel >= 0x66u)
+            {
+                return 0;
+            }
         }
         else
         {
-            // Treat as HLSL source code and compile via D3DCompile (Shader Model 5.1 for D3D12)
+            const BOOL useDXIL66 = (allowDXILSM66 != FALSE) && IsDXILCompilerAvailable();
+            if (useDXIL66)
+            {
+#ifdef _WIN32
+                const wchar_t* wTarget = nullptr;
+                const char*    cTarget = nullptr;
+                switch (stage)
+                {
+                    case ShaderStage::VERTEX:   wTarget = L"vs_6_6"; cTarget = "vs_6_6"; break;
+                    case ShaderStage::PIXEL:    wTarget = L"ps_6_6"; cTarget = "ps_6_6"; break;
+                    case ShaderStage::COMPUTE:  wTarget = L"cs_6_6"; cTarget = "cs_6_6"; break;
+                    case ShaderStage::GEOMETRY: wTarget = L"gs_6_6"; cTarget = "gs_6_6"; break;
+                    case ShaderStage::HULL:     wTarget = L"hs_6_6"; cTarget = "hs_6_6"; break;
+                    case ShaderStage::DOMAIN:   wTarget = L"ds_6_6"; cTarget = "ds_6_6"; break;
+                    default: break;
+                }
+                if (!wTarget || !cTarget)
+                {
+                    return 0;
+                }
+
+                const UINT32 dxcSaltFlags = 0x00662021u;
+                const DXBCCacheKey cacheKey = ComputeDXBCCacheKey(cTarget, dxcSaltFlags, bytecode, bytecodeSize);
+                if (TryLoadCachedDXBC(cacheKey, res.bytecode))
+                {
+                    populateBinaryCaps();
+                    NativeHandle handle = GenerateHandle();
+                    res.generation = handle;
+                    m_shaders[handle] = std::move(res);
+                    return handle;
+                }
+
+                const wchar_t* wEntryPoints[4] = { L"Main", L"main", nullptr, nullptr };
+                if (stage == ShaderStage::VERTEX)       wEntryPoints[2] = L"VSMain";
+                else if (stage == ShaderStage::PIXEL)   wEntryPoints[2] = L"PSMain";
+                else if (stage == ShaderStage::COMPUTE) wEntryPoints[2] = L"CSMain";
+
+                BOOL        compiledOk = false;
+                std::string firstRealError;
+                for (const wchar_t* ep : wEntryPoints)
+                {
+                    if (!ep) continue;
+                    std::string err2021;
+                    if (CompileHLSLWithDXC(bytecode, bytecodeSize, wTarget, ep, L"2021", res.bytecode, err2021))
+                    {
+                        compiledOk = true;
+                        break;
+                    }
+                    std::string err2018;
+                    if (CompileHLSLWithDXC(bytecode, bytecodeSize, wTarget, ep, L"2018", res.bytecode, err2018))
+                    {
+                        compiledOk = true;
+                        break;
+                    }
+                    const std::string& candidateErr = !err2021.empty() ? err2021 : err2018;
+                    if (!candidateErr.empty() && firstRealError.empty() &&
+                        candidateErr.find("missing entry point") == std::string::npos)
+                    {
+                        firstRealError = candidateErr;
+                    }
+                }
+
+                if (compiledOk && !res.bytecode.empty())
+                {
+                    StoreCachedDXBC(cacheKey, res.bytecode.data(), res.bytecode.size());
+                    populateBinaryCaps();
+                    NativeHandle handle = GenerateHandle();
+                    res.generation = handle;
+                    m_shaders[handle] = std::move(res);
+                    return handle;
+                }
+
+                if (!firstRealError.empty())
+                {
+                    std::cerr << "[D3D12ResourceManager] DXC compile error (" << cTarget << "):\n"
+                              << firstRealError << "\n";
+                }
+                return 0;
+#endif
+            }
+
+            // Fallback: compile via D3DCompile (Shader Model 5.1) when adapter < SM 6.6 or DXC runtime is unavailable
             const char* target = nullptr;
             if (stage == ShaderStage::VERTEX)
                 target = "vs_5_1";
@@ -3219,6 +3666,7 @@ namespace Northstar
                 const DXBCCacheKey cacheKey = ComputeDXBCCacheKey(target, compileFlags, bytecode, bytecodeSize);
                 if (TryLoadCachedDXBC(cacheKey, res.bytecode))
                 {
+                    populateBinaryCaps();
                     NativeHandle handle = GenerateHandle();
                     res.generation = handle;
                     m_shaders[handle] = std::move(res);
@@ -3276,6 +3724,7 @@ namespace Northstar
                     res.blob = blob;
                     res.bytecode.resize(blob->GetBufferSize());
                     std::memcpy(res.bytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
+                    populateBinaryCaps();
                 }
                 else
                 {
@@ -3328,6 +3777,102 @@ namespace Northstar
         {
             it->second.inputLayout = inputLayout;
         }
+    }
+
+    void D3D12ResourceManager::SetShaderReflectionSpaces(NativeHandle handle, const ShaderSpaceMask& spaceMask)
+    {
+        auto it = m_shaders.find(handle);
+        if (it != m_shaders.end())
+        {
+            it->second.spaceMask = spaceMask;
+            it->second.generation = (it->second.generation * 1099511628211ULL) ^
+                                    (static_cast<UINT64>(spaceMask.cbvSrvMask) << 32) ^
+                                    (static_cast<UINT64>(spaceMask.samplerMask) << 16) ^
+                                    static_cast<UINT64>(spaceMask.uavMask);
+        }
+    }
+
+    BOOL D3D12ResourceManager::CopyGPUBufferRegion(
+        D3D12DeviceContext&        ctx,
+        ID3D12GraphicsCommandList* activeFrameCmdList,
+        D3D12ResourceStateTracker& stateTracker,
+        NativeHandle               dstHandle,
+        UINT64                     dstOffset,
+        NativeHandle               srcHandle,
+        UINT64                     srcOffset,
+        UINT64                     byteSize)
+    {
+        if (byteSize == 0 || dstHandle == 0 || srcHandle == 0 || dstHandle == srcHandle)
+        {
+            return false;
+        }
+        D3D12GPUBufferResource* dstBuf = GetGPUBuffer(dstHandle);
+        D3D12GPUBufferResource* srcBuf = GetGPUBuffer(srcHandle);
+        if (!dstBuf || !dstBuf->resource || dstBuf->pendingDestroy ||
+            !srcBuf || !srcBuf->resource || srcBuf->pendingDestroy)
+        {
+            return false;
+        }
+        if (dstOffset > dstBuf->byteSize || byteSize > (dstBuf->byteSize - dstOffset) ||
+            srcOffset > srcBuf->byteSize || byteSize > (srcBuf->byteSize - srcOffset))
+        {
+            return false;
+        }
+
+        auto recordCopy = [&](ID3D12GraphicsCommandList* cmdList) {
+            // Ensure any queued CPU->GPU uploads targeting srcBuf execute before copying from srcBuf
+            if (!m_pendingBufferUploads.empty() && activeFrameCmdList != nullptr)
+            {
+                FlushPendingGPUBufferUploads(cmdList, stateTracker, ctx.GetFrameFenceValue() + 1ULL);
+            }
+            stateTracker.TransitionResource(srcBuf->resource.Get(), GPUResourceAccess::COPY_SOURCE);
+            stateTracker.TransitionResource(dstBuf->resource.Get(), GPUResourceAccess::COPY_DEST);
+            stateTracker.FlushBarriers(cmdList);
+            srcBuf->currentState = stateTracker.GetResourceState(srcBuf->resource.Get());
+            dstBuf->currentState = stateTracker.GetResourceState(dstBuf->resource.Get());
+
+            cmdList->CopyBufferRegion(
+                dstBuf->resource.Get(),
+                dstOffset,
+                srcBuf->resource.Get(),
+                srcOffset,
+                byteSize);
+
+            stateTracker.TransitionResource(srcBuf->resource.Get(), srcBuf->defaultAccess);
+            stateTracker.TransitionResource(dstBuf->resource.Get(), dstBuf->defaultAccess);
+            stateTracker.FlushBarriers(cmdList);
+            srcBuf->currentState = stateTracker.GetResourceState(srcBuf->resource.Get());
+            dstBuf->currentState = stateTracker.GetResourceState(dstBuf->resource.Get());
+        };
+
+        if (activeFrameCmdList != nullptr)
+        {
+            recordCopy(activeFrameCmdList);
+            return true;
+        }
+
+        // Queue non-blocking GPU-to-GPU copy in FIFO upload queue (zero WaitForGPU CPU stall; preserves ComPtr lifetime!)
+        if (dstOffset <= UINT32_MAX && byteSize <= UINT32_MAX)
+        {
+            D3D12PendingBufferUpload pending{};
+            pending.targetHandle       = dstHandle;
+            pending.srcGPUHandle       = srcHandle;
+            pending.srcFallbackState   = srcBuf->currentState;
+            pending.uploadResource     = srcBuf->resource;
+            pending.isStandaloneUpload = true; // Retires ComPtr reference safely at upcomingFenceValue
+            pending.srcOffset          = srcOffset;
+            pending.dstOffset          = static_cast<UINT32>(dstOffset);
+            pending.byteSize           = static_cast<UINT32>(byteSize);
+            m_pendingBufferUploads.push_back(std::move(pending));
+            return true;
+        }
+
+        // Fallback for >4 GiB copies outside frame recording
+        ctx.ExecuteUpload([&](ID3D12GraphicsCommandList* uploadList) {
+            FlushPendingGPUBufferUploads(uploadList, stateTracker, ctx.GetFrameFenceValue());
+            recordCopy(uploadList);
+        });
+        return true;
     }
 
     void D3D12ResourceManager::DestroyShader(NativeHandle handle)
@@ -3447,10 +3992,32 @@ namespace Northstar
         return (it != m_textures.end()) ? &it->second : nullptr;
     }
 
+    BOOL D3D12ResourceManager::HasTextureSharedHandle(NativeHandle handle) const
+    {
+        const D3D12TextureResource* tex = GetTexture(handle);
+        return tex != nullptr && tex->sharedHandle != nullptr;
+    }
+
     HANDLE D3D12ResourceManager::GetTextureSharedHandle(NativeHandle handle) const
     {
         const D3D12TextureResource* tex = GetTexture(handle);
-        return tex ? tex->sharedHandle : nullptr;
+        if (!tex || !tex->sharedHandle)
+        {
+            return nullptr;
+        }
+        HANDLE duplicatedHandle = nullptr;
+        if (!::DuplicateHandle(
+                ::GetCurrentProcess(),
+                tex->sharedHandle,
+                ::GetCurrentProcess(),
+                &duplicatedHandle,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS))
+        {
+            return nullptr;
+        }
+        return duplicatedHandle;
     }
 
     D3D12_GPU_DESCRIPTOR_HANDLE D3D12ResourceManager::GetTextureGPUDescriptorHandle(

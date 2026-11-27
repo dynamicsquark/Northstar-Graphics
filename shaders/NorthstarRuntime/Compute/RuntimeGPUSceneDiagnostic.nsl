@@ -31,9 +31,14 @@ PROPERTY GPUSceneDiagParams {
         Add(aabbMin)             : Vec3
         Add(submeshIndex)        : UInt
         Add(aabbMax)             : Vec3
-        Add(lodAndMaterialFlags) : UInt
-        Add(boundingSphere)      : Vec4
-        Add(worldMatrix)         : Mat4
+        Add(lodAndMaterialFlags)  : UInt
+        Add(boundingSphere)       : Vec4
+        Add(worldMatrix)          : Mat4
+        Add(prevWorldMatrix)      : Mat4
+        Add(layerMask)            : UInt
+        Add(materialTableOffset)  : UInt
+        Add(materialSlotCount)    : UInt
+        Add(skinningBoundsOffset) : UInt
     }
     StructuredBuffer Queries {
         Add(slotIndex)          : UInt

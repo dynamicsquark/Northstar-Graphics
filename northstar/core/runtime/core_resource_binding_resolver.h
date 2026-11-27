@@ -253,9 +253,11 @@ namespace Northstar
         const Material*                   material              = nullptr;
         PassType                          passType              = PassType::GEOMETRY;
         Mat4                              worldMatrix           = Mat4::Identity();
+        Mat4                              prevWorldMatrix       = Mat4::Identity();
         UINT32                            gpuSceneObjectSlot    = kInvalidGPUSceneSlot;
         UINT32                            geometryMode          = kNVGInvalidIndex; // 0 = STANDARD, 1 = VIRTUALIZED, 0xFFFFFFFF = non-draw (e.g. Compute)
         UINT32                            nvgDrawBucketId       = kNVGInvalidIndex;
+        UINT32                            nvgDrawContextId      = kNVGInvalidIndex;
         UINT32                            nvgVisibleClusterOff  = kNVGInvalidIndex;
         UINT32                            nvgVisibleClusterCnt  = 0u;
         UINT32                            nvgDebugMode          = 0u;

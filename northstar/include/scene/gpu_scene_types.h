@@ -270,7 +270,7 @@ namespace Northstar
     }
 
     // =====================================================================
-    //  GPU Scene Object Metadata Record (160 Bytes, 16-Byte Aligned)
+    //  GPU Scene Object Metadata Record (240 Bytes, 16-Byte Aligned)
     //  Matches NSL StructuredBuffer<GPUSceneObjectData> 1:1 with zero
     //  CPU pointers or transient backend handles.
     // =====================================================================
@@ -307,28 +307,50 @@ namespace Northstar
 
         // Rows 6..9 (Offsets 96..159): Column-Major World Matrix (4x4 FLOAT32)
         Mat4   worldMatrix         = Mat4::Identity();
+
+        // Rows 10..13 (Offsets 160..223): Column-Major Previous-Frame World Matrix (4x4 FLOAT32)
+        Mat4   prevWorldMatrix     = Mat4::Identity();
+
+        // Row 14 (Offsets 224..239): Layer Mask, Multi-Material Table & Skinned Bounds Addressing
+        UINT32 layerMask            = 0x00000001u;
+        UINT32 materialTableOffset  = 0u;
+        UINT32 materialSlotCount    = 1u;
+        UINT32 skinningBoundsOffset = 0xFFFFFFFFu;
     };
 
-    static_assert(sizeof(GPUSceneObjectData) == 160, "GPUSceneObjectData must be exactly 160 bytes (10 x 16B).");
+    static_assert(sizeof(GPUSceneObjectData) == 240, "GPUSceneObjectData must be exactly 240 bytes (15 x 16B).");
     static_assert(alignof(GPUSceneObjectData) == 16, "GPUSceneObjectData must be 16-byte aligned.");
-    static_assert(offsetof(GPUSceneObjectData, slotIndex)           == 0,   "slotIndex offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, generation)          == 4,   "generation offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, objectFlags)         == 8,   "objectFlags offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, renderObjectFlags)   == 12,  "renderObjectFlags offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, meshId)              == 16,  "meshId offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, materialId)          == 20,  "materialId offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, lodGroupId)          == 24,  "lodGroupId offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, batchGroupId)        == 28,  "batchGroupId offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, vertexCount)         == 32,  "vertexCount offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, indexCount)          == 36,  "indexCount offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, startIndex)          == 40,  "startIndex offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, baseVertex)          == 44,  "baseVertex offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, aabbMin)             == 48,  "aabbMin offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, submeshIndex)        == 60,  "submeshIndex offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, aabbMax)             == 64,  "aabbMax offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, lodAndMaterialFlags) == 76,  "lodAndMaterialFlags offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, boundingSphere)      == 80,  "boundingSphere offset mismatch");
-    static_assert(offsetof(GPUSceneObjectData, worldMatrix)         == 96,  "worldMatrix offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, slotIndex)            == 0,   "slotIndex offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, generation)           == 4,   "generation offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, objectFlags)          == 8,   "objectFlags offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, renderObjectFlags)    == 12,  "renderObjectFlags offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, meshId)               == 16,  "meshId offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, materialId)           == 20,  "materialId offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, lodGroupId)           == 24,  "lodGroupId offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, batchGroupId)         == 28,  "batchGroupId offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, vertexCount)          == 32,  "vertexCount offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, indexCount)           == 36,  "indexCount offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, startIndex)           == 40,  "startIndex offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, baseVertex)           == 44,  "baseVertex offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, aabbMin)              == 48,  "aabbMin offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, submeshIndex)         == 60,  "submeshIndex offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, aabbMax)              == 64,  "aabbMax offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, lodAndMaterialFlags)  == 76,  "lodAndMaterialFlags offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, boundingSphere)       == 80,  "boundingSphere offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, worldMatrix)          == 96,  "worldMatrix offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, prevWorldMatrix)      == 160, "prevWorldMatrix offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, layerMask)            == 224, "layerMask offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, materialTableOffset)  == 228, "materialTableOffset offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, materialSlotCount)    == 232, "materialSlotCount offset mismatch");
+    static_assert(offsetof(GPUSceneObjectData, skinningBoundsOffset) == 236, "skinningBoundsOffset offset mismatch");
+
+    // 32-byte conservative local-space bone displacement & scale envelope for skinned objects
+    struct alignas(16) GPUSceneSkinningBoundsData
+    {
+        Vec4 localDeltaMin = Vec4(0.0f, 0.0f, 0.0f, 1.0f); // xyz = min local bone displacement, w = maxBoneAxisScale
+        Vec4 localDeltaMax = Vec4(0.0f, 0.0f, 0.0f, 0.0f); // xyz = max local bone displacement, w = reserved
+    };
+    static_assert(sizeof(GPUSceneSkinningBoundsData) == 32, "GPUSceneSkinningBoundsData must be 32 bytes.");
 
     // =====================================================================
     //  Coalesced Incremental Upload Range & Frame Update Telemetry

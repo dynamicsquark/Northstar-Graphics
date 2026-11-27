@@ -11,7 +11,7 @@ namespace NSL
 //  Type conversion table
 // =====================================================================
 
-static std::string TypeIDToHLSL(DataTypeID typeID)
+static std::string TypeIDToHLSL(DataTypeID typeID, TargetAPI api)
 {
     switch (typeID)
     {
@@ -20,6 +20,7 @@ static std::string TypeIDToHLSL(DataTypeID typeID)
         case DataTypeID::BOOL:   return "bool";
         case DataTypeID::INT:    return "int";
         case DataTypeID::UINT:   return "uint";
+        case DataTypeID::UINT64: return (api == TargetAPI::HLSL12) ? "uint64_t" : "uint2";
         case DataTypeID::VEC2:   return "float2";
         case DataTypeID::VEC3:   return "float3";
         case DataTypeID::VEC4:   return "float4";
@@ -39,6 +40,9 @@ static std::string TypeIDToHLSL(DataTypeID typeID)
 
 std::string HLSLBackend::ToHLSLType(const std::string& nsl)
 {
+    if (nsl == "UInt64")
+        return (m_api == TargetAPI::HLSL12) ? "uint64_t" : "uint2";
+
     static const std::unordered_map<std::string, std::string> kMap =
     {
         { "Float",  "float"    }, { "Double",  "double"    },
@@ -84,6 +88,8 @@ std::string HLSLBackend::Generate(
     m_groupNames.clear();
     m_aliasMap.clear();
     m_structuredAliasMap.clear();
+    m_doubleVarNames.clear();
+    m_preferDoubleLiteral = false;
     m_depthOnlyPixel = false;
     if (program.stage == ShaderStage::PIXEL)
     {
@@ -221,7 +227,7 @@ void HLSLBackend::EmitCBuffer(
 
     for (const auto& field : alignedBuf.paddedFields)
     {
-        std::string hlslType = TypeIDToHLSL(field.typeID);
+        std::string hlslType = TypeIDToHLSL(field.typeID, m_api);
         if (hlslType.empty() || (hlslType == "float" && field.typeID != DataTypeID::FLOAT))
         {
             if (field.isPadding) hlslType = "float";
@@ -307,12 +313,15 @@ void HLSLBackend::EmitTextureGroup(
         std::string resType = hlslResType;
         if (entry.kind == PropertyEntryKind::GET)
         {
-            const EngineProperty* ep = FindEngineProperty(entry.name);
-            if (ep)
+            if (entry.name == "NVG_VISIBILITY_BUFFER")
             {
-                if (ep->typeID == DataTypeID::TEXTURE_CUBE)       resType = "TextureCube";
-                else if (ep->typeID == DataTypeID::TEXTURE_2D_ARRAY) resType = "Texture2DArray";
-                else if (ep->typeID == DataTypeID::TEXTURE_CUBE_ARRAY) resType = "TextureCubeArray";
+                resType = "Texture2D<uint2>";
+            }
+            else if (const EngineProperty* ep = FindEngineProperty(entry.name))
+            {
+                if (ep->typeID == DataTypeID::TEXTURE_CUBE)             resType = "TextureCube";
+                else if (ep->typeID == DataTypeID::TEXTURE_2D_ARRAY)    resType = "Texture2DArray";
+                else if (ep->typeID == DataTypeID::TEXTURE_CUBE_ARRAY)  resType = "TextureCubeArray";
             }
         }
 
@@ -383,12 +392,12 @@ void HLSLBackend::EmitStructuredBufferGroup(
         {
             if (const EngineProperty* ep = FindEngineProperty(entry.name))
             {
-                out << "    " << TypeIDToHLSL(ep->typeID) << " " << entry.name << ";\n";
+                out << "    " << TypeIDToHLSL(ep->typeID, m_api) << " " << entry.name << ";\n";
                 continue;
             }
         }
 
-        std::string hlslType = TypeIDToHLSL(entry.typeID);
+        std::string hlslType = TypeIDToHLSL(entry.typeID, m_api);
         if (hlslType.empty() || (hlslType == "float" && entry.typeID != DataTypeID::FLOAT))
         {
             hlslType = ToHLSLType(entry.typeName);
@@ -440,12 +449,12 @@ void HLSLBackend::EmitUAVGroup(
             {
                 if (const EngineProperty* ep = FindEngineProperty(entry.name))
                 {
-                    out << "    " << TypeIDToHLSL(ep->typeID) << " " << entry.name << ";\n";
+                    out << "    " << TypeIDToHLSL(ep->typeID, m_api) << " " << entry.name << ";\n";
                     continue;
                 }
             }
 
-            std::string hlslType = TypeIDToHLSL(entry.typeID);
+            std::string hlslType = TypeIDToHLSL(entry.typeID, m_api);
             if (hlslType.empty() || (hlslType == "float" && entry.typeID != DataTypeID::FLOAT))
             {
                 hlslType = ToHLSLType(entry.typeName);
@@ -496,6 +505,9 @@ void HLSLBackend::EmitGlobals(std::ostringstream& out, const Program& program)
 {
     for (const auto& gv : program.globals)
     {
+        if (gv.typeName == "Double")
+            m_doubleVarNames.insert(gv.name);
+
         if (gv.isGroupShared) out << "groupshared ";
         if (gv.isStatic)      out << "static ";
         if (gv.isConst)       out << "const ";
@@ -505,7 +517,10 @@ void HLSLBackend::EmitGlobals(std::ostringstream& out, const Program& program)
 
         if (gv.initializer)
         {
+            const bool prevDouble = m_preferDoubleLiteral;
+            if (gv.typeName == "Double") m_preferDoubleLiteral = true;
             out << " = " << EmitExpr(gv.initializer.get(), {});
+            m_preferDoubleLiteral = prevDouble;
         }
         out << ";\n";
     }
@@ -685,6 +700,9 @@ void HLSLBackend::EmitStatement(
     }
     else if (auto* vd = dynamic_cast<const VarDeclStmt*>(stmt))
     {
+        if (vd->typeName == "Double")
+            m_doubleVarNames.insert(vd->name);
+
         out << ind;
         if (vd->isGroupShared) out << "groupshared ";
         if (vd->isStatic)      out << "static ";
@@ -692,7 +710,12 @@ void HLSLBackend::EmitStatement(
         out << ToHLSLType(vd->typeName) << " " << vd->name;
         if (!vd->arraySizeExpr.empty()) out << "[" << vd->arraySizeExpr << "]";
         if (vd->initializer)
+        {
+            const bool prevDouble = m_preferDoubleLiteral;
+            if (vd->typeName == "Double") m_preferDoubleLiteral = true;
             out << " = " << EmitExpr(vd->initializer.get(), props);
+            m_preferDoubleLiteral = prevDouble;
+        }
         else if (m_depthOnlyPixel && vd->typeName == "STAGE_OUTPUT" && vd->arraySizeExpr.empty())
             out << " = (STAGE_OUTPUT)0";
         out << ";\n";
@@ -773,10 +796,19 @@ std::string HLSLBackend::EmitExpr(const Expression* expr, const ParsedProperties
                 return std::to_string(lit->intValue);
             case LiteralExpr::Kind::UInt:
                 return std::to_string(lit->uintValue) + "u";
+            case LiteralExpr::Kind::UInt64:
+                if (m_api == TargetAPI::HLSL12)
+                    return std::to_string(lit->uintValue) + "ull";
+                return "uint2(" + std::to_string(static_cast<uint32_t>(lit->uintValue)) + "u, " +
+                       std::to_string(static_cast<uint32_t>(lit->uintValue >> 32u)) + "u)";
+            case LiteralExpr::Kind::Double:
             case LiteralExpr::Kind::Float:
             {
+                const bool emitAsDouble =
+                    (lit->litKind == LiteralExpr::Kind::Double) ||
+                    (!lit->hasFloatSuffix && m_preferDoubleLiteral);
                 std::ostringstream ss;
-                ss << std::setprecision(9) << lit->floatValue;
+                ss << std::setprecision(emitAsDouble ? 17 : 9) << lit->floatValue;
                 std::string s = ss.str();
                 if (s.find('.') == std::string::npos &&
                     s.find('e') == std::string::npos &&
@@ -784,7 +816,7 @@ std::string HLSLBackend::EmitExpr(const Expression* expr, const ParsedProperties
                 {
                     s += ".0";
                 }
-                s += "f";
+                s += emitAsDouble ? "L" : "f";
                 return s;
             }
             case LiteralExpr::Kind::Bool:
@@ -929,6 +961,23 @@ std::string HLSLBackend::EmitExpr(const Expression* expr, const ParsedProperties
             { "F16ToF32",   "f16tof32"   }, { "F32ToF16",   "f32tof16"    },
             { "IsNaN",      "isnan"      }, { "IsInf",      "isinf"       },
             { "IsFinite",   "isfinite"   },
+            { "WaveIsFirstLane",     "WaveIsFirstLane"     },
+            { "WaveGetLaneIndex",    "WaveGetLaneIndex"    },
+            { "WaveGetLaneCount",    "WaveGetLaneCount"    },
+            { "WaveActiveBallot",    "WaveActiveBallot"    },
+            { "WavePrefixCountBits", "WavePrefixCountBits" },
+            { "WaveActiveCountBits", "WaveActiveCountBits" },
+            { "WaveActiveSum",       "WaveActiveSum"       },
+            { "WaveActiveMax",       "WaveActiveMax"       },
+            { "WaveActiveMin",       "WaveActiveMin"       },
+            { "WaveActiveBitOr",     "WaveActiveBitOr"     },
+            { "WaveActiveBitAnd",    "WaveActiveBitAnd"    },
+            { "WaveActiveBitXor",    "WaveActiveBitXor"    },
+            { "WaveActiveAllTrue",   "WaveActiveAllTrue"   },
+            { "WaveActiveAnyTrue",   "WaveActiveAnyTrue"   },
+            { "WaveActiveAllEqual",  "WaveActiveAllEqual"  },
+            { "WaveReadLaneFirst",   "WaveReadLaneFirst"   },
+            { "WaveReadLaneAt",      "WaveReadLaneAt"      },
         };
 
         auto funcIt = kFuncMap.find(callee);
@@ -1005,6 +1054,8 @@ std::string HLSLBackend::EmitExpr(const Expression* expr, const ParsedProperties
 
     if (auto* cast = dynamic_cast<const CastExpr*>(expr))
     {
+        const bool prevDouble = m_preferDoubleLiteral;
+        if (cast->typeName == "Double") m_preferDoubleLiteral = true;
         std::string hlslType = ToHLSLType(cast->typeName);
         std::string result = hlslType + "(";
         for (size_t i = 0; i < cast->args.size(); ++i)
@@ -1013,6 +1064,7 @@ std::string HLSLBackend::EmitExpr(const Expression* expr, const ParsedProperties
             result += EmitExpr(cast->args[i].get(), props);
         }
         result += ")";
+        m_preferDoubleLiteral = prevDouble;
         return result;
     }
 
@@ -1025,9 +1077,21 @@ std::string HLSLBackend::EmitExpr(const Expression* expr, const ParsedProperties
 
     if (auto* be = dynamic_cast<const BinaryExpr*>(expr))
     {
-        std::string left  = EmitExpr(be->left.get(), props);
+        bool rhsPreferDouble = false;
+        if (be->op >= BinaryExpr::Op::Assign && be->op <= BinaryExpr::Op::DivAssign)
+        {
+            if (const auto* lhsId = dynamic_cast<const IdentifierExpr*>(be->left.get()))
+            {
+                if (m_doubleVarNames.count(lhsId->name) > 0)
+                    rhsPreferDouble = true;
+            }
+        }
+        std::string left = EmitExpr(be->left.get(), props);
+        const bool prevDouble = m_preferDoubleLiteral;
+        if (rhsPreferDouble) m_preferDoubleLiteral = true;
         std::string right = EmitExpr(be->right.get(), props);
-        std::string op    = EmitBinaryOp(be->op);
+        m_preferDoubleLiteral = prevDouble;
+        std::string op = EmitBinaryOp(be->op);
         return left + " " + op + " " + right;
     }
 

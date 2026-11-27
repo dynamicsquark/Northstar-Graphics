@@ -39,64 +39,75 @@ namespace Northstar
         struct CoreDXBCCacheFileHeader
         {
             UINT32 magic    = 0x4344534Eu; // "NSDC"
-            UINT32 version  = 2u;          // v2: includes d3dcompiler_47.dll binary version salt
+            UINT32 version  = 3u;          // v3: salted with DXC (dxcompiler.dll + dxil.dll) + FXC + active ShaderModel (6.6 vs 5.1)
             UINT64 h1       = 0;
             UINT64 h2       = 0;
             UINT32 dxbcSize = 0;
             UINT32 reserved = 0;
         };
 
-        const char* StageToHLSL12Target(ShaderStage stage) noexcept
+        const char* StageToHLSL12Target(ShaderStage stage, UINT32 shaderModel) noexcept
         {
+            const bool sm66 = (shaderModel >= 0x66u);
             switch (stage)
             {
-            case ShaderStage::VERTEX:   return "vs_5_1";
-            case ShaderStage::PIXEL:    return "ps_5_1";
-            case ShaderStage::COMPUTE:  return "cs_5_1";
-            case ShaderStage::GEOMETRY: return "gs_5_1";
-            case ShaderStage::HULL:     return "hs_5_1";
-            case ShaderStage::DOMAIN:   return "ds_5_1";
+            case ShaderStage::VERTEX:   return sm66 ? "vs_6_6" : "vs_5_1";
+            case ShaderStage::PIXEL:    return sm66 ? "ps_6_6" : "ps_5_1";
+            case ShaderStage::COMPUTE:  return sm66 ? "cs_6_6" : "cs_5_1";
+            case ShaderStage::GEOMETRY: return sm66 ? "gs_6_6" : "gs_5_1";
+            case ShaderStage::HULL:     return sm66 ? "hs_6_6" : "hs_5_1";
+            case ShaderStage::DOMAIN:   return sm66 ? "ds_6_6" : "ds_5_1";
             default:                    return nullptr;
             }
+        }
+
+        void MixModuleFileAttributes(const wchar_t* dllName, UINT64& ioSalt) noexcept
+        {
+#ifdef _WIN32
+            wchar_t dllPath[MAX_PATH]{};
+            HMODULE hMod  = ::GetModuleHandleW(dllName);
+            DWORD pathLen = 0;
+            if (hMod)
+            {
+                pathLen = ::GetModuleFileNameW(hMod, dllPath, MAX_PATH);
+            }
+            if (pathLen == 0 || pathLen >= MAX_PATH)
+            {
+                pathLen = ::SearchPathW(nullptr, dllName, nullptr, MAX_PATH, dllPath, nullptr);
+            }
+            if (pathLen > 0 && pathLen < MAX_PATH)
+            {
+                WIN32_FILE_ATTRIBUTE_DATA fad{};
+                if (::GetFileAttributesExW(dllPath, GetFileExInfoStandard, &fad))
+                {
+                    const UINT64 fSize = (static_cast<UINT64>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+                    const UINT64 fTime = (static_cast<UINT64>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+                                         fad.ftLastWriteTime.dwLowDateTime;
+                    ioSalt ^= fSize * 1099511628211ULL;
+                    ioSalt ^= fTime + 0x9E3779B97F4A7C15ULL + (ioSalt << 6) + (ioSalt >> 2);
+                }
+            }
+#else
+            (void)dllName;
+            (void)ioSalt;
+#endif
         }
 
         UINT64 GetD3DCompilerBinarySalt() noexcept
         {
             static std::once_flag s_once;
-            static UINT64 s_salt = 0xD3DC047000000001ULL;
+            static UINT64 s_salt = 0xD3DC066000000003ULL;
             std::call_once(s_once, []() {
-#ifdef _WIN32
-                wchar_t dllPath[MAX_PATH]{};
-                HMODULE hMod = ::GetModuleHandleW(L"d3dcompiler_47.dll");
-                DWORD pathLen = 0;
-                if (hMod)
-                {
-                    pathLen = ::GetModuleFileNameW(hMod, dllPath, MAX_PATH);
-                }
-                if (pathLen == 0 || pathLen >= MAX_PATH)
-                {
-                    pathLen = ::SearchPathW(nullptr, L"d3dcompiler_47.dll", nullptr, MAX_PATH, dllPath, nullptr);
-                }
-                if (pathLen > 0 && pathLen < MAX_PATH)
-                {
-                    WIN32_FILE_ATTRIBUTE_DATA fad{};
-                    if (::GetFileAttributesExW(dllPath, GetFileExInfoStandard, &fad))
-                    {
-                        const UINT64 fSize = (static_cast<UINT64>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-                        const UINT64 fTime = (static_cast<UINT64>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
-                                             fad.ftLastWriteTime.dwLowDateTime;
-                        s_salt ^= fSize * 1099511628211ULL;
-                        s_salt ^= fTime + 0x9E3779B97F4A7C15ULL + (s_salt << 6) + (s_salt >> 2);
-                    }
-                }
-#endif
+                MixModuleFileAttributes(L"dxcompiler.dll",     s_salt);
+                MixModuleFileAttributes(L"dxil.dll",           s_salt);
+                MixModuleFileAttributes(L"d3dcompiler_47.dll", s_salt);
             });
             return s_salt;
         }
 
-        CoreDXBCCacheKey ComputeCoreDXBCCacheKey(ShaderStage stage, const std::string& sourceCode) noexcept
+        CoreDXBCCacheKey ComputeCoreDXBCCacheKey(ShaderStage stage, const std::string& sourceCode, UINT32 targetShaderModel) noexcept
         {
-            const char* target = StageToHLSL12Target(stage);
+            const char* target = StageToHLSL12Target(stage, targetShaderModel);
             if (!target || sourceCode.empty())
             {
                 return {};
@@ -111,10 +122,12 @@ namespace Northstar
             };
             for (const char* p = target; *p; ++p) mixByte(static_cast<BYTE>(*p));
             mixByte(0xFFu);
+            const UINT32 compileFlags = (targetShaderModel >= 0x66u)
+                ? 0x00662021u
 #ifdef _WIN32
-            const UINT32 compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+                : static_cast<UINT32>(D3DCOMPILE_OPTIMIZATION_LEVEL1);
 #else
-            const UINT32 compileFlags = (1u << 14);
+                : (1u << 14);
 #endif
             for (UINT32 i = 0; i < 4u; ++i) mixByte(static_cast<BYTE>((compileFlags >> (i * 8u)) & 0xFFu));
             const UINT64 sz64 = static_cast<UINT64>(sourceCode.size());
@@ -149,7 +162,7 @@ namespace Northstar
         }
     }
 
-    BOOL ShaderLoader::TryPopulateCachedDXBC(Shader& ioShader)
+    BOOL ShaderLoader::TryPopulateCachedDXBC(Shader& ioShader, UINT32 targetShaderModel)
     {
         if (ioShader.GetTargetAPI() != TargetAPI::HLSL12 ||
             ioShader.HasBytecode() ||
@@ -158,7 +171,7 @@ namespace Northstar
             return false;
         }
 
-        const CoreDXBCCacheKey key = ComputeCoreDXBCCacheKey(ioShader.GetStage(), ioShader.GetSourceCode());
+        const CoreDXBCCacheKey key = ComputeCoreDXBCCacheKey(ioShader.GetStage(), ioShader.GetSourceCode(), targetShaderModel);
         if (key.h1 == 0 && key.h2 == 0)
             return false;
 
@@ -186,7 +199,7 @@ namespace Northstar
         CoreDXBCCacheFileHeader hdr{};
         if (!ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr)))
             return false;
-        if (hdr.magic != 0x4344534Eu || hdr.version != 2u || hdr.h1 != key.h1 || hdr.h2 != key.h2)
+        if (hdr.magic != 0x4344534Eu || hdr.version != 3u || hdr.h1 != key.h1 || hdr.h2 != key.h2)
             return false;
         if (static_cast<std::streamoff>(sizeof(hdr) + hdr.dxbcSize) != totalSize || hdr.dxbcSize < 4u)
             return false;
@@ -201,7 +214,7 @@ namespace Northstar
         return true;
     }
 
-    void ShaderLoader::StoreCachedDXBC(const Shader& shader, const void* dxbcData, SIZE_T dxbcSize)
+    void ShaderLoader::StoreCachedDXBC(const Shader& shader, const void* dxbcData, SIZE_T dxbcSize, UINT32 targetShaderModel)
     {
         if (shader.GetTargetAPI() != TargetAPI::HLSL12 ||
             !shader.HasSourceCode() ||
@@ -214,7 +227,7 @@ namespace Northstar
         if (std::memcmp(dxbcData, "DXBC", 4) != 0)
             return;
 
-        const CoreDXBCCacheKey key = ComputeCoreDXBCCacheKey(shader.GetStage(), shader.GetSourceCode());
+        const CoreDXBCCacheKey key = ComputeCoreDXBCCacheKey(shader.GetStage(), shader.GetSourceCode(), targetShaderModel);
         if (key.h1 == 0 && key.h2 == 0)
             return;
 
@@ -291,8 +304,6 @@ namespace Northstar
             outShader.SetReflection(*desc.preloadedReflection);
             if (desc.initialData && desc.initialDataSize > 0)
                 outShader.SetBytecode(desc.initialData, desc.initialDataSize);
-            else
-                TryPopulateCachedDXBC(outShader);
             if (!desc.name.empty())
                 outShader.SetName(desc.name);
             return outShader.IsValid();
@@ -317,7 +328,6 @@ namespace Northstar
         outShader.SetReflection(std::move(shaderData));
         if (!name.empty())
             outShader.SetName(name);
-        TryPopulateCachedDXBC(outShader);
         return outShader.IsValid();
     }
 }

@@ -141,10 +141,18 @@ PROPERTY NVSIndirectDrawParams {
         Add(aabbMax)             : Vec3
         Add(lodAndMaterialFlags) : UInt
         Add(boundingSphere)      : Vec4
-        Add(worldCol0)           : Vec4
-        Add(worldCol1)           : Vec4
-        Add(worldCol2)           : Vec4
-        Add(worldCol3)           : Vec4
+        Add(worldCol0)            : Vec4
+        Add(worldCol1)            : Vec4
+        Add(worldCol2)            : Vec4
+        Add(worldCol3)            : Vec4
+        Add(prevWorldCol0)        : Vec4
+        Add(prevWorldCol1)        : Vec4
+        Add(prevWorldCol2)        : Vec4
+        Add(prevWorldCol3)        : Vec4
+        Add(layerMask)            : UInt
+        Add(materialTableOffset)  : UInt
+        Add(materialSlotCount)    : UInt
+        Add(skinningBoundsOffset) : UInt
     }
     StructuredBuffer InMeshDescriptors {
         Add(meshId)              : UInt
@@ -447,6 +455,10 @@ SHADER {
         Vec4 w1           = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol1;
         Vec4 w2           = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol2;
         Vec4 w3           = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].worldCol3;
+        Vec4 pw0          = isPretransformed ? Vec4(1.0, 0.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].prevWorldCol0;
+        Vec4 pw1          = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].prevWorldCol1;
+        Vec4 pw2          = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].prevWorldCol2;
+        Vec4 pw3          = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[sSlot].prevWorldCol3;
 
         for (UInt pIdx = patchFirst; pIdx < patchEnd; pIdx = pIdx + 1u) {
             UInt tSlot = NVSIndirectDrawParams.InDrawGroupFieldPatches[pIdx].targetSlot;
@@ -465,6 +477,11 @@ SHADER {
                 if (reqWords > 4u)  { WriteInstanceVec4(instElemWordBase, relWord + 4u,  strideWords, reqWords - 4u,  w1); }
                 if (reqWords > 8u)  { WriteInstanceVec4(instElemWordBase, relWord + 8u,  strideWords, reqWords - 8u,  w2); }
                 if (reqWords > 12u) { WriteInstanceVec4(instElemWordBase, relWord + 12u, strideWords, reqWords - 12u, w3); }
+            } else if (semId == 37u) {
+                WriteInstanceVec4(instElemWordBase, relWord + 0u,  strideWords, reqWords, pw0);
+                if (reqWords > 4u)  { WriteInstanceVec4(instElemWordBase, relWord + 4u,  strideWords, reqWords - 4u,  pw1); }
+                if (reqWords > 8u)  { WriteInstanceVec4(instElemWordBase, relWord + 8u,  strideWords, reqWords - 8u,  pw2); }
+                if (reqWords > 12u) { WriteInstanceVec4(instElemWordBase, relWord + 12u, strideWords, reqWords - 12u, pw3); }
             } else if (semId == 33u) {
                 NVSIndirectDrawParams.OutPerBatchInstanceWords[instElemWordBase + relWord].word = instOrd;
             } else if (semId == 34u) {
@@ -1175,10 +1192,14 @@ SHADER {
                     // Patch Engine Get() CBV fields on GPU
                     Bool isPretransformed = ((drawFlags & 256u) != 0u);
                     if (totalCBVW > 0u && patchCnt > 0u) {
-                        Vec4 w0 = isPretransformed ? Vec4(1.0, 0.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol0;
-                        Vec4 w1 = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol1;
-                        Vec4 w2 = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol2;
-                        Vec4 w3 = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol3;
+                        Vec4 w0  = isPretransformed ? Vec4(1.0, 0.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol0;
+                        Vec4 w1  = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol1;
+                        Vec4 w2  = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol2;
+                        Vec4 w3  = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].worldCol3;
+                        Vec4 pw0 = isPretransformed ? Vec4(1.0, 0.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].prevWorldCol0;
+                        Vec4 pw1 = isPretransformed ? Vec4(0.0, 1.0, 0.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].prevWorldCol1;
+                        Vec4 pw2 = isPretransformed ? Vec4(0.0, 0.0, 1.0, 0.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].prevWorldCol2;
+                        Vec4 pw3 = isPretransformed ? Vec4(0.0, 0.0, 0.0, 1.0) : NVSIndirectDrawParams.InGPUSceneObjects[slotIdx].prevWorldCol3;
                         UInt boneOff0 = ((objFlags & 1024u) != 0u) ? objBatchGrp : 0u;
                         UInt boneCnt0 = (renderFlags >> 16u) & 65535u;
                         UInt skinRev0 = (boneCnt0 > 0u) ? 1u : 0u;
@@ -1275,6 +1296,18 @@ SHADER {
                                 NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(fovApprox);
                             } else if (semId == 26u) {
                                 NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = asuint(1.0);
+                            } else if (semId == 30u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = slotIdx;
+                            } else if (semId == 31u) {
+                                NVSIndirectDrawParams.OutPerDrawCBVWords[slotBase + relWord].word = 4294967295u;
+                            } else if (semId == 40u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, pw0, pw1, pw2, pw3);
+                            } else if (semId == 41u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, lv0, lv1, lv2, lv3);
+                            } else if (semId == 42u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, pr0, pr1, pr2, pr3);
+                            } else if (semId == 43u) {
+                                WriteCBVMat4(slotBase, relWord, slotMaxW, reqWords, vp0, vp1, vp2, vp3);
                             }
                         }
                     }

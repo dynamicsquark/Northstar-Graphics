@@ -160,6 +160,8 @@ namespace NSL
         NSC_FLAG_USES_DISCARD           = (1 << 1),
         NSC_FLAG_WRITES_DEPTH           = (1 << 2),
         NSC_FLAG_HAS_COMPUTE_NUMTHREADS = (1 << 3),
+        NSC_FLAG_USES_INT64             = (1 << 4),
+        NSC_FLAG_USES_INT64_ATOMIC      = (1 << 5),
     };
 
     // ========================= SHADER DATA ===========================
@@ -317,6 +319,8 @@ namespace NSL
         bool WritesDepth()             const { return (flags & NSC_FLAG_WRITES_DEPTH) != 0; }
         bool ModifiesCoverageOrDepth() const { return UsesDiscard() || WritesDepth(); }
         bool HasValidNumThreads()      const { return numThreadsX > 0 && numThreadsY > 0 && numThreadsZ > 0; }
+        bool UsesInt64()               const { return (flags & NSC_FLAG_USES_INT64) != 0; }
+        bool UsesInt64Atomic()         const { return (flags & NSC_FLAG_USES_INT64_ATOMIC) != 0; }
 
         void RebuildPropertyBlockGroupPointers()
         {
