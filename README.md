@@ -28,13 +28,13 @@ Its integrated Complex Structure Technology extends these capabilities to comple
 
 ### Northstar Shading Language
 
-A dedicated shader language and compilation toolchain designed specifically for Northstar Graphics.
+A dedicated shader language, standard library (`NorthstarLibrary`), and compilation toolchain designed specifically for Northstar Graphics.
 
-NSL empowers developers to create custom shaders while maintaining seamless integration with the engine's rendering technologies through Universal Reflection.
+NSL empowers developers to author custom shaders once while maintaining seamless integration with the engine's rendering technologies through Universal Reflection — demonstrated by the built-in `StandardLit` package (4 unified `IA + NVG` geometry variants, 4 unified `IA + NVG` shadow variants, and 1 physically-based pixel shader).
 
 ### Northstar Geometry Processing Pipeline
 
-A unified geometry processing infrastructure designed to support conventional and advanced GPU-driven rendering techniques.
+A unified geometry processing infrastructure supporting conventional Input-Assembler (`IA`) streams, hardware instancing, static batching, 4-bone skeletal skinning, and GPU-driven virtualized cluster rendering through a single shared `ShaderSet` and `Material`.
 
 ### Tile-Based Shadow Mapping
 
@@ -42,28 +42,27 @@ A scalable shadow resource management technology that provides the physical foun
 
 ### Northstar Virtual Shadows
 
-An advanced virtualized shadow technology designed to deliver high-detail, scalable, and resource-efficient shadows across complex environments.
+An advanced virtualized shadow technology designed to deliver high-detail, scalable, and resource-efficient shadows across complex environments, supporting both conventional and virtualized shadow casters.
 
 ### Northstar Virtual Geometry
 
-A virtualized geometry technology designed to enable scalable rendering of highly detailed 3D environments through GPU-driven geometry processing.
+A cluster-DAG virtualized geometry architecture (`NVG2`) featuring boundary-locked QEM simplification, 32 KiB compressed streaming pages, two-phase HZB occlusion culling, and a unified **Compute Software Micropolygon + Hardware Rasterizer** (`Atomic64` single-pass / `2×Atomic32` two-pass capability-gated execution) with full developer pixel-shader sovereignty.
 
 ## Capabilities
 
-- Universal shader reflection
-- Dedicated shader language and compiler
-- Virtualized geometry
-- Virtualized shadows
-- GPU-driven rendering
-- Hardware instancing
-- Custom rendering pipelines
-- Flexible material systems
-- Compute shader execution
-- Programmable post-processing
-- Render-to-texture
-- Shared GPU resources
+- Universal shader reflection & Complex Structure Technology (`CST`)
+- Dedicated shader language (`NSL`), standard library (`NorthstarLibrary`), and compiler (`NSLCompiler`)
+- Virtualized cluster-DAG geometry (`NVG`) with streaming page residency
+- Hybrid compute software micropolygon & hardware `ExecuteIndirect` rasterization
+- Unified `IA + NVG` shader sets (`STANDARD`, `INSTANCED`, `SKINNED`, `INSTANCED_SKINNED`)
+- Virtualized shadows (`NVS`) with software + hardware shadow page rasterization
+- GPU-driven persistent scene & 3-tier buffer architecture
+- Hardware instancing, real static batching & GPU skeletal skinning
+- Custom rendering pipelines & flexible material systems
+- Compute shader execution & programmable post-processing
+- Render-to-texture & shared GPU resources
 - Multiple scenes and cameras
-- Modular rendering architecture
+- Modular, backend-isolated rendering architecture
 
 ## Design Philosophy
 
@@ -98,7 +97,7 @@ Northstar Graphics is an independent graphics engine. While developed as part of
 - **OS:** Windows 10 / 11 (x64)
 - **Compiler:** Visual Studio 2022 or newer with the **Desktop development with C++** workload (C++20)
 - **Build System:** CMake 3.20+
-- **GPU:** Direct3D 12 feature level 12_0+ hardware
+- **GPU:** Direct3D 12 feature level 12_0+ hardware (Shader Model 6.6; capability-gated 64-bit / 2×32-bit atomic software rasterization)
 
 ### 1. Generate IDE Solution
 
@@ -107,8 +106,6 @@ Run `setup.bat` to verify your developer toolchain and generate the Visual Studi
 ```bat
 setup.bat
 ```
-
-`setup.bat` configures the project tree only and does not emit compiled `.nsc` shader binaries into the source repository.
 
 ### 2. Build Runtime, Shader Toolchain & Examples
 
