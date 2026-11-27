@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Northstar Graphics Documentation — Overview & Setup</title>
     <link rel="stylesheet" href="assets/style.css">
 </head>
+
 <body>
     <aside class="sidebar">
         <div class="brand">Northstar <span>Graphics</span></div>
@@ -28,25 +30,31 @@
         </p>
 
         <div class="callout restricted">
-            <strong>Proprietary Inspection-Only License:</strong> Source code in this repository is provided strictly for viewing and technical evaluation. Copying, modification, redistribution, and unauthorized commercial or internal use are prohibited. Refer to <code>LICENSE.md</code> in the repository root.
+            <strong>Proprietary Inspection-Only License:</strong> Source code in this repository is provided strictly
+            for viewing and technical evaluation. Copying, modification, redistribution, and unauthorized commercial or
+            internal use are prohibited. Refer to <code>LICENSE.md</code> in the repository root.
         </div>
 
         <div class="grid">
             <div class="card">
                 <h3>Virtual Geometry (NVG)</h3>
-                <p>128-triangle cluster DAGs, 32 KiB compressed virtual page streaming, two-phase HZB occlusion culling, and continuous sub-pixel LOD selection.</p>
+                <p>128-triangle cluster DAGs, 32 KiB compressed virtual page streaming, two-phase HZB occlusion culling,
+                    and continuous sub-pixel LOD selection.</p>
             </div>
             <div class="card">
                 <h3>Virtual Shadows (NVS)</h3>
-                <p>Demand-driven 2-level sparse page hierarchy supporting 60,000+ shadow views across directional clipmaps, spot cones, and point cubemaps.</p>
+                <p>Demand-driven 2-level sparse page hierarchy supporting 60,000+ shadow views across directional
+                    clipmaps, spot cones, and point cubemaps.</p>
             </div>
             <div class="card">
                 <h3>NSL Toolchain</h3>
-                <p>Custom shader transpiler and reflection compiler emitting self-contained <code>.nsc</code> binary shader packages during build.</p>
+                <p>Custom shader transpiler and reflection compiler emitting self-contained <code>.nsc</code> binary
+                    shader packages during build.</p>
             </div>
             <div class="card">
                 <h3>Clean Host C++20 API</h3>
-                <p>Single-include <code>&lt;northstar.h&gt;</code> SDK with <code>RuntimeSession</code> ABI validation, Win32 macro guards, and RAII handles.</p>
+                <p>Single-include <code>&lt;northstar.h&gt;</code> SDK with <code>RuntimeSession</code> ABI validation,
+                    Win32 macro guards, and RAII handles.</p>
             </div>
         </div>
 
@@ -63,11 +71,15 @@
             <tbody>
                 <tr>
                     <td><code>setup.bat</code></td>
-                    <td>Verifies CMake 3.20+, Visual Studio x64 C++20 tools, and vendored third-party SDKs, then generates <code>build\NorthstarGraphics.sln</code>. Does not compile binary shader outputs.</td>
+                    <td>Verifies CMake 3.20+, Visual Studio x64 C++20 tools, and vendored third-party SDKs, then
+                        generates <code>build\NorthstarGraphics.sln</code>. Does not compile binary shader outputs.</td>
                 </tr>
                 <tr>
                     <td><code>build.bat [release|debug|all|clean]</code></td>
-                    <td>Compiles <code>QuarkDynMath</code>, <code>NSLCompiler</code>, all <code>.nsl</code> &rarr; <code>.nsc</code> shader packages directly into <code>build\</code>, <code>NorthstarCore.dll</code>, <code>NorthstarD3D12.dll</code>, and the example applications.</td>
+                    <td>Compiles <code>QuarkDynMath</code>, <code>NSLCompiler</code>, all <code>.nsl</code> &rarr;
+                        <code>.nsc</code> shader packages directly into <code>build\</code>,
+                        <code>NorthstarCore.dll</code>, <code>NorthstarD3D12.dll</code>, and the example applications.
+                    </td>
                 </tr>
             </tbody>
         </table>
@@ -79,18 +91,27 @@ setup.bat
 build.bat</code></pre>
 
         <div class="callout">
-            <strong>Clean Source Tree Guarantee:</strong> Compiled <code>.nsc</code> shader containers are build artifacts. They are never stored in <code>shaders/</code> or tracked in Git; <code>build.bat</code> and CMake custom targets emit them exclusively under <code>build/generated/</code> and deploy them next to the built binaries.
+            <strong>Clean Source Tree Guarantee:</strong> Compiled <code>.nsc</code> shader containers are build
+            artifacts. They are never stored in <code>shaders/</code> or tracked in Git; <code>build.bat</code> and
+            CMake custom targets emit them exclusively under <code>build/generated/</code> and deploy them next to the
+            built binaries.
         </div>
 
         <h2>Example Applications</h2>
         <ul>
-            <li><strong><code>01_HelloPBR</code> (<code>HelloPBR.exe</code>):</strong> Minimal, self-contained C++20 application demonstrating window creation, <code>RuntimeSession</code> bootstrap, metallic-roughness <code>StandardLit</code> materials, and multi-light Virtual Shadows.</li>
-            <li><strong><code>02_VirtualGeometryStudio</code> (<code>VirtualGeometryStudio.exe</code>):</strong> Interactive Dear ImGui inspection studio showcasing 1.6M+ triangle procedural Virtual Geometry, HZB culling telemetry, cluster/LOD/page debug visualizations, NVS softness presets, and Assimp 3D model import.</li>
+            <li><strong><code>01_HelloPBR</code> (<code>HelloPBR.exe</code>):</strong> Minimal, self-contained C++20
+                application demonstrating window creation, <code>RuntimeSession</code> bootstrap, metallic-roughness
+                <code>StandardLit</code> materials, and multi-light Virtual Shadows.</li>
+            <li><strong><code>02_VirtualGeometryStudio</code> (<code>VirtualGeometryStudio.exe</code>):</strong>
+                Interactive Dear ImGui inspection studio showcasing 1.6M+ triangle procedural Virtual Geometry, HZB
+                culling telemetry, cluster/LOD/page debug visualizations, NVS softness presets, and Assimp 3D model
+                import.</li>
         </ul>
 
         <footer>
-            Copyright &copy; 2026 DynamicsQuark. All Rights Reserved.
+            Copyright &copy; 2026 Quark Dynamics. All Rights Reserved.
         </footer>
     </main>
 </body>
+
 </html>

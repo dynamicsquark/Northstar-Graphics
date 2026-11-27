@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Northstar Graphics Documentation — NSL Shading Language</title>
     <link rel="stylesheet" href="assets/style.css">
 </head>
+
 <body>
     <aside class="sidebar">
         <div class="brand">Northstar <span>Graphics</span></div>
@@ -28,7 +30,8 @@
         </p>
 
         <h2>1. Anatomy of an NSL Shader</h2>
-        <p>Every standalone NSL shader file declares its stage, optional library imports, stage I/O contracts, resource property blocks, and entry function:</p>
+        <p>Every standalone NSL shader file declares its stage, optional library imports, stage I/O contracts, resource
+            property blocks, and entry function:</p>
         <pre><code>STAGE PIXEL
 
 LIBRARY_DECLARATION
@@ -100,24 +103,32 @@ SHADER
                 <tr>
                     <td><code>Get(SEMANTIC)</code></td>
                     <td>Engine</td>
-                    <td>Automatically populated by <code>NorthstarCore</code> from active camera, transform, light array, NVS shadow tables, or NVG cluster buffers. Immutable from host material setters.</td>
+                    <td>Automatically populated by <code>NorthstarCore</code> from active camera, transform, light
+                        array, NVS shadow tables, or NVG cluster buffers. Immutable from host material setters.</td>
                 </tr>
                 <tr>
                     <td><code>Add(name)</code></td>
                     <td>Host Application</td>
-                    <td>Exposed on <code>Material</code> and <code>ComputeKernel</code> for host C++ configuration via <code>SetFloat</code>, <code>SetVec4</code>, <code>SetTexture</code>, <code>SetSampler</code>, and <code>SetGPUBuffer</code>.</td>
+                    <td>Exposed on <code>Material</code> and <code>ComputeKernel</code> for host C++ configuration via
+                        <code>SetFloat</code>, <code>SetVec4</code>, <code>SetTexture</code>, <code>SetSampler</code>,
+                        and <code>SetGPUBuffer</code>.</td>
                 </tr>
             </tbody>
         </table>
 
         <h2>3. Standard Shader Libraries (<code>shaders/NorthstarLibrary/</code>)</h2>
         <ul>
-            <li><code>NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl</code> — Umbrella library for decoding compressed virtual geometry cluster headers, vertex attributes, world transforms, and debug visualization modes.</li>
-            <li><code>NorthstarLibrary/VirtualShadows/VirtualShadows.nsl</code> — Virtual shadow view resolution, toroidal/sparse page lookup, Receiver-Plane Depth Bias, tent PCF, and 16-tap Vogel disk soft shadow sampling.</li>
+            <li><code>NorthstarLibrary/VirtualGeometry/VirtualGeometry.nsl</code> — Umbrella library for decoding
+                compressed virtual geometry cluster headers, vertex attributes, world transforms, and debug
+                visualization modes.</li>
+            <li><code>NorthstarLibrary/VirtualShadows/VirtualShadows.nsl</code> — Virtual shadow view resolution,
+                toroidal/sparse page lookup, Receiver-Plane Depth Bias, tent PCF, and 16-tap Vogel disk soft shadow
+                sampling.</li>
         </ul>
 
         <h2>4. Command-Line Compilation (<code>NSLCompiler</code>)</h2>
-        <p>During <code>build.bat</code>, CMake invokes <code>NSLCompiler</code> automatically. You can also invoke it directly:</p>
+        <p>During <code>build.bat</code>, CMake invokes <code>NSLCompiler</code> automatically. You can also invoke it
+            directly:</p>
         <pre><code>build\bin\win64-release\NSLCompiler.exe ^
     --input shaders\StandardLit\StandardLitPS.nsl ^
     --target hlsl12 ^
@@ -125,8 +136,9 @@ SHADER
     -I shaders</code></pre>
 
         <footer>
-            Copyright &copy; 2026 DynamicsQuark. All Rights Reserved.
+            Copyright &copy; 2026 Quark Dynamics. All Rights Reserved.
         </footer>
     </main>
 </body>
+
 </html>
