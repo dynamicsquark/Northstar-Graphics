@@ -4,8 +4,6 @@
 
 Developed by **Quark Dynamics**.
 
-*Your shaders. Your rendering. Our technology.*
-
 ---
 
 ## Overview
